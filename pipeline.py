@@ -599,11 +599,11 @@ def run(
     # same reason as the ATS write-back: a --limit run would mark every
     # unvisited company FALSE, which would be a lie rather than a gap.
     if write_back and not output_prefix:
-        statuses = {
-            result.company: bool(result.success and result.jobs)
+        counts = {
+            result.company: (len(result.jobs) if result.success else 0)
             for result in results
         }
         companies_path = resolve_companies_path(cfg, excel_path)
-        write_run_status(companies_path, statuses)
+        write_run_status(companies_path, counts)
 
     return summary, final_jobs, results

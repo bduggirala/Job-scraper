@@ -109,22 +109,28 @@ def write_discovered_urls(
 
 def write_run_status(
     companies_path: Path | str,
-    statuses: dict[str, bool],
+    counts: dict[str, int],
     *,
     company_column: str = "Company",
     status_column: str = "Data Retrieved",
+    count_column: str = "Jobs Found",
 ) -> dict[str, Any]:
-    """Record whether each company yielded jobs on the latest full run.
+    """Record each company's retrieval outcome from the latest full run.
 
-    Unlike :func:`write_discovered_urls`, this **overwrites** the cell every
+    Writes two columns, both derived from the same job count so they can
+    never disagree: ``Data Retrieved`` (TRUE/FALSE) and ``Jobs Found`` (the
+    number). The count is the more useful of the two - 2 jobs and 2,500 jobs
+    both read as TRUE - but the boolean is what you filter on.
+
+    Unlike :func:`write_discovered_urls`, this **overwrites** the cells every
     run: it reports the outcome of the most recent run, not a value the user
     curated, so a stale TRUE from three runs ago would be worse than useless.
-    The column is created if the workbook does not already have it.
+    Either column is created if the workbook does not already have it.
 
     Args:
         companies_path: path to the workbook to update in place.
-        statuses: ``{company_name: True_if_jobs_were_collected}``.
-        company_column / status_column: header names to match.
+        counts: ``{company_name: jobs_collected_this_run}``.
+        company_column / status_column / count_column: header names to match.
 
     Returns:
         ``{"updated": int, "backup_path": Path | None}``.
@@ -132,7 +138,7 @@ def write_run_status(
     Best-effort, like the ATS write-back: a failure here never fails the run.
     """
     path = Path(companies_path)
-    if not statuses or not path.exists():
+    if not counts or not path.exists():
         return {"updated": 0, "backup_path": None}
 
     try:
@@ -153,17 +159,24 @@ def write_run_status(
             status_col = sheet.max_column + 1
             sheet.cell(row=1, column=status_col, value=status_column)
 
+        count_col = headers.get(count_column)
+        if not count_col:
+            count_col = sheet.max_column + 1
+            sheet.cell(row=1, column=count_col, value=count_column)
+
         updated = 0
         for row in sheet.iter_rows(min_row=2):
             company_cell = row[company_col - 1]
             company_name = str(company_cell.value).strip() if company_cell.value else ""
-            if not company_name or company_name not in statuses:
+            if not company_name or company_name not in counts:
                 continue
+            found = int(counts[company_name])
             sheet.cell(
                 row=company_cell.row,
                 column=status_col,
-                value="TRUE" if statuses[company_name] else "FALSE",
+                value="TRUE" if found else "FALSE",
             )
+            sheet.cell(row=company_cell.row, column=count_col, value=found)
             updated += 1
 
         if updated == 0:
@@ -172,7 +185,7 @@ def write_run_status(
         backup_path = _backup_path(path)
         shutil.copy2(path, backup_path)
         workbook.save(path)
-        log.info("Wrote retrieval status for %s company row(s) to %s (backup: %s)",
+        log.info("Wrote retrieval status + job counts for %s company row(s) to %s (backup: %s)",
                  updated, path.name, backup_path.name)
         return {"updated": updated, "backup_path": backup_path}
 
