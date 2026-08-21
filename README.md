@@ -8,6 +8,10 @@ search, but the roles, locations and freshness window are all configurable.
 > SQLite database and output directory. It never reads, merges with, or
 > deduplicates against JobSpy results.
 
+> **New here?** Jump to the [Codebase map](#codebase-map) to find the right
+> file fast, or [How it works](#how-it-works) for the routing model. Design
+> rationale lives in [`docs/superpowers/`](docs/superpowers/README.md).
+
 ---
 
 ## How it works
@@ -26,6 +30,10 @@ companies.xlsx
   fetch career page ──▶ ATS embedded/redirected? ──▶ Direct ATS API ────┤
       │                                                                 │
       │  still unknown                                                  │
+      ▼                                                                 │
+  JSON-LD tier ──▶ page embeds schema.org JobPosting? ──▶ harvest ──────┤
+      │                                                                 │
+      │  still nothing                                                  │
       ▼                                                                 │
   Playwright ──▶ extract job links                                      │
       ├──▶ nothing? type "Data Engineer" into the page's search box     │
@@ -134,6 +142,7 @@ clobber a full run's results.
 | Lever | `api.lever.co/v0/postings` | Documented public API |
 | Ashby | `api.ashbyhq.com/posting-api` | Documented public API |
 | SmartRecruiters | `api.smartrecruiters.com` | Documented public API |
+| Paylocity | `recruiting.paylocity.com` | Tenant + board GUID from the URL |
 | Eightfold | `/api/apply/v2/jobs` | Uses `?domain=` when present |
 | UKG Pro | `JobBoardView/LoadSearchResults` | `ultipro.com` and `*.ukg.net` hosts |
 | Phenom | `phApp.ddo` on `/search-results` | Page-embedded JSON, not the dead `/widgets` endpoint |
@@ -141,11 +150,21 @@ clobber a full run's results.
 | Taleo (legacy) | HTML via browser | REST API needs session/CSRF state; browser path used instead |
 | iCIMS | HTML + JSON-LD | No public API |
 | SuccessFactors | HTML + JSON-LD | OData requires tenant auth |
-| Avature | HTML + JSON-LD | No public API |
+| Avature | HTML + JSON-LD | No public API; self-hosted portals detected via `avature.portal` fingerprint |
 | Radancy (TalentBrew) | `/search-jobs/results` JSON fragment | Runs on the company's own domain; detected by HTML fingerprint, not host |
+| Amazon | `amazon.jobs/search.json` | Amazon's own careers API, not a third-party ATS |
+| Jobvite | `jobs.jobvite.com/{tenant}` | Server-rendered list; tenant is the first path segment |
+| Cornerstone (CSOD) | `career-site/v1/search` | Token-gated; JWT lifted from the careersite home page |
+| Jibe (iCIMS) | `{tenant}.jibeapply.com/api/jobs` | Public JSON search API |
+
+Beyond these host/fingerprint-matched providers, a **generic JSON-LD tier**
+(`ats/jsonld.py`) harvests any page's `schema.org/JobPosting` structured data
+over a single HTTP GET before the browser fallback runs — so an unknown
+provider that embeds JobPosting markup is still collected cheaply.
 
 Any collector that cannot serve a tenant raises `CollectorUnavailable`, and the
-router falls back to Playwright rather than failing the company.
+router falls back to the next tier (JSON-LD, then Playwright) rather than
+failing the company.
 
 ---
 
@@ -239,20 +258,78 @@ the other silently costs coverage.
 
 ---
 
-## Project layout
+## Codebase map
 
-```
-company_job_scraper/
-├── config/          settings.yaml, companies.xlsx
-├── ats/             detector, resolver, url_repair, router + 14 collectors
-├── browser/         playwright_scraper.py (search, hop, stealth, discovery)
-├── tools/           probe_site.py, canary.py (diagnostics, not the pipeline)
-├── tests/           pytest suite (normalize, filters, extraction, traversal)
-├── normalize.py filters.py deduplicate.py enrich.py job_identity.py
-├── database.py logger.py http_client.py settings.py export_ats_urls.py
-├── pipeline.py main.py
-└── requirements.txt
-```
+Start here to find the right file without reading the whole tree. The pipeline
+splits cleanly into **routing/collection** (how a company's jobs are reached)
+and the **post-scrape tail** (normalize → filter → dedupe → store → output).
+
+### Entry points & orchestration
+
+| File | Responsibility |
+|------|----------------|
+| `main.py` | CLI: arg parsing, `--dry-run`/`--test-*` modes, wiring to `pipeline.run()` |
+| `pipeline.py` | Run orchestration — load workbook → route → execute (2 thread pools) → filter/dedupe/store → write outputs & workbook write-back |
+| `settings.py` | Loads `config/settings.yaml`; path resolution and config access |
+| `logger.py` | Logging setup |
+| `http_client.py` | Shared `requests` session, retries/backoff, `get_json`/`get_text`/`post_json` |
+
+### Routing & detection (`ats/`)
+
+| File | Responsibility |
+|------|----------------|
+| `ats/router.py` | The ladder: `plan_route()` (decide provider+method) and `fetch_company_jobs()` (API → JSON-LD → Playwright, with mid-run self-heal). `COLLECTORS` dict = supported providers |
+| `ats/detector.py` | Lexical ATS detection from a URL, plus HTML fingerprints and embedded-URL extraction. **Add a new provider's host/fingerprint here** |
+| `ats/resolver.py` | One HTTP GET on a branded page → identify the ATS behind it (redirect/fingerprint/embedded URL); 403→browser-UA retry |
+| `ats/url_repair.py` | Swaps a dead `careers.*` subdomain for a live careers page before routing |
+| `ats/base.py` | `ATSCollector` base class + `CollectorUnavailable`; `record()`/`finalize()` helpers every collector uses |
+| `ats/html_utils.py` | Shared HTML/JSON-LD parsing helpers for collectors |
+| `ats/discovery.py` | On-demand ATS-URL discovery engine (used by `tools/find_ats_urls.py`, **not** the live pipeline) |
+
+### Collectors (`ats/`, one per provider — 18 + generic tier)
+
+| File | Provider |
+|------|----------|
+| `workday.py` `greenhouse.py` `lever.py` `ashby.py` `smartrecruiters.py` | documented public APIs |
+| `paylocity.py` `ukg.py` `taleo.py` `icims.py` `phenom.py` | |
+| `successfactors.py` `avature.py` `eightfold.py` `radancy.py` | |
+| `amazon.py` `jobvite.py` `cornerstone.py` `jibe.py` | added in the coverage-expansion branch |
+| `jsonld.py` | **generic** schema.org JobPosting tier — provider-agnostic fallback |
+
+To add a provider: register its host/fingerprint in `detector.py`, write
+`ats/<provider>.py` subclassing `ATSCollector`, add it to `COLLECTORS` in
+`router.py`, and add an offline test. Ship it only once a real workbook company
+returns real jobs through it.
+
+### Browser fallback (`browser/`)
+
+| File | Responsibility |
+|------|----------------|
+| `browser/playwright_scraper.py` | Keyword-search + best-first hop traversal, JSON-LD extraction, cookie dismissal, network sniffing for ATS discovery, stealth, retry with rotated fingerprint |
+
+### Post-scrape tail (the part you said won't change)
+
+| File | Responsibility |
+|------|----------------|
+| `normalize.py` | Build the canonical job record; clean text, parse dates, join locations |
+| `filters.py` | Role match (per title segment), DFW/remote match, freshness window |
+| `enrich.py` | Fill coarse locations (e.g. Workday detail fetch) |
+| `deduplicate.py` | Collapse duplicate postings within a run |
+| `job_identity.py` | Stable per-job id derived from the posting URL |
+| `database.py` | SQLite tracking — upsert, per-company removal sync, new/first-seen |
+| `export_ats_urls.py` | Write verified discovered ATS URLs and run status back into the workbook |
+
+### Config, tools, tests, docs
+
+| Path | Responsibility |
+|------|----------------|
+| `config/settings.yaml` | All tunables (freshness, roles, DFW cities, HTTP, Playwright, concurrency) |
+| `config/companies.xlsx` | Input workbook (Company / ATS URL / Live Jobs Page) |
+| `tools/canary.py` | ~2-min smoke test: one company per collection path (run before a full run) |
+| `tools/find_ats_urls.py` | Crawl + verify missing ATS URLs, write suggestions into the workbook |
+| `tools/probe_site.py` | Diagnostic: dump what a single page actually contains |
+| `tests/` | Offline pytest suite (network mocked) |
+| `docs/superpowers/` | Design specs + implementation plans — see `docs/superpowers/README.md` for the index |
 
 ## Before trusting a full run
 
