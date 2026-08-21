@@ -218,6 +218,14 @@ class TaleoCollector(ATSCollector):
             return self._collect_oracle_cloud()
         try:
             return self._collect_legacy_taleo()
-        except CollectorUnavailable:
+        except CollectorUnavailable as legacy_exc:
             # Some tenants sit on oraclecloud behind a taleo.net vanity host.
-            return self._collect_oracle_cloud()
+            try:
+                return self._collect_oracle_cloud()
+            except CollectorUnavailable as orc_exc:
+                # Report both: the legacy failure is usually the real reason
+                # (e.g. careerSectionUnAvailable), and surfacing only the ORC
+                # 404 sends debugging down the wrong path.
+                raise CollectorUnavailable(
+                    f"legacy Taleo: {legacy_exc}; Oracle Cloud fallback: {orc_exc}"
+                ) from legacy_exc
