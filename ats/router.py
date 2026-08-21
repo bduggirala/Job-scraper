@@ -14,13 +14,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from ats.amazon import AmazonJobsCollector
 from ats.ashby import AshbyCollector
 from ats.avature import AvatureCollector
 from ats.base import ATSCollector, CollectorUnavailable, SCRAPING_METHOD_BROWSER
+from ats.cornerstone import CornerstoneCollector
 from ats.detector import UNKNOWN, detect_ats
 from ats.eightfold import EightfoldCollector
 from ats.greenhouse import GreenhouseCollector
 from ats.icims import ICIMSCollector
+from ats.jibe import JibeCollector
+from ats.jobvite import JobviteCollector
+from ats.jsonld import JSONLDCollector
 from ats.lever import LeverCollector
 from ats.paylocity import PaylocityCollector
 from ats.phenom import PhenomCollector
@@ -54,6 +59,10 @@ COLLECTORS: dict[str, type[ATSCollector]] = {
     "avature": AvatureCollector,
     "eightfold": EightfoldCollector,
     "radancy": RadancyCollector,
+    "amazon": AmazonJobsCollector,
+    "jobvite": JobviteCollector,
+    "cornerstone": CornerstoneCollector,
+    "jibe": JibeCollector,
 }
 
 METHOD_API = "direct_api"
@@ -204,6 +213,22 @@ def collect_via_api(plan: RoutePlan) -> list[dict]:
     return collector.collect()
 
 
+def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
+    """Try harvesting schema.org JobPosting JSON-LD from the planned page.
+
+    A generic, provider-agnostic tier that sits between page resolution and the
+    Playwright fallback: many career pages embed JobPosting structured data for
+    SEO, which we can read over a single HTTP GET instead of driving a browser.
+
+    Raises:
+        CollectorUnavailable: the page carries no JobPosting JSON-LD (or the
+            fetch failed), signalling the router to escalate to Playwright.
+    """
+    detection = dict(plan.detection or {})
+    detection.setdefault("url", plan.url)
+    return JSONLDCollector(plan.company, detection).collect()
+
+
 def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None]:
     """Run the Playwright fallback for a planned company.
 
@@ -302,6 +327,25 @@ def fetch_company_jobs(
             return CompanyResult(
                 company=company, jobs=[], plan=plan, success=False,
                 error_type=type(exc).__name__, error_message=str(exc),
+            )
+
+    # JSON-LD tier: for pages with no recognised provider, try harvesting
+    # schema.org JobPosting structured data over HTTP before paying for a
+    # browser. If the page carries none, CollectorUnavailable drops us through
+    # to the Playwright fallback unchanged.
+    if plan.provider == UNKNOWN and plan.url:
+        try:
+            jsonld_jobs = collect_via_jsonld(plan)
+        except CollectorUnavailable:
+            jsonld_jobs = []
+        except Exception as exc:  # a parser hiccup must not sink the company
+            log.debug("%s -> JSON-LD tier errored (%s)", company, exc)
+            jsonld_jobs = []
+        if jsonld_jobs:
+            log.info("%s -> %s jobs via JSON-LD fallback", company, len(jsonld_jobs))
+            return CompanyResult(
+                company=company, jobs=jsonld_jobs, plan=plan, success=True,
+                fell_back=fell_back,
             )
 
     log.info("%s -> Playwright fallback", company)

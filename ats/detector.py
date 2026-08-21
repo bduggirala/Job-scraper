@@ -39,10 +39,15 @@ SUCCESSFACTORS = "successfactors"
 AVATURE = "avature"
 EIGHTFOLD = "eightfold"
 RADANCY = "radancy"
+AMAZON = "amazon"
+JOBVITE = "jobvite"
+CORNERSTONE = "cornerstone"
+JIBE = "jibe"
 
 SUPPORTED_PROVIDERS = (
     WORKDAY, GREENHOUSE, LEVER, ASHBY, SMARTRECRUITERS, PAYLOCITY, UKG,
     TALEO, ICIMS, PHENOM, SUCCESSFACTORS, AVATURE, EIGHTFOLD, RADANCY,
+    AMAZON, JOBVITE, CORNERSTONE, JIBE,
 )
 
 # Host-substring -> provider. Checked in order; first match wins.
@@ -78,6 +83,16 @@ HOST_PATTERNS: tuple[tuple[str, str], ...] = (
     ("sapsf.eu", SUCCESSFACTORS),
     ("avature.net", AVATURE),
     ("eightfold.ai", EIGHTFOLD),
+    # Amazon's own careers site, backed by a public search.json endpoint.
+    ("amazon.jobs", AMAZON),
+    # Jobvite shares one host across all tenants; the tenant is the first path
+    # segment (jobs.jobvite.com/{tenant}/), read in detect_ats below.
+    ("jobs.jobvite.com", JOBVITE),
+    ("jobvite.com", JOBVITE),
+    # Cornerstone OnDemand careersites live at {tenant}.csod.com.
+    ("csod.com", CORNERSTONE),
+    # Jibe (iCIMS-owned) branded careersites at {tenant}.jibeapply.com.
+    ("jibeapply.com", JIBE),
 )
 
 # HTML/script fingerprints used when the host alone is inconclusive.
@@ -125,6 +140,15 @@ BODY_FINGERPRINTS: tuple[tuple[str, str], ...] = (
     ("data-search-filters-module-name", RADANCY),
     ("data-search-results-module-name", RADANCY),
     ("radancy.net", RADANCY),
+    ("amazon.jobs", AMAZON),
+    # Jobvite boards embedded in a company's own careers site (e.g. Tyler
+    # Technologies) reference jobs.jobvite.com and the jv-job-list markup.
+    ("jobs.jobvite.com", JOBVITE),
+    ("jv-job-list", JOBVITE),
+    # Cornerstone careersites bootstrap an anonymous JWT into csod.context.
+    (".csod.com", CORNERSTONE),
+    ("csod.context", CORNERSTONE),
+    ("jibeapply.com", JIBE),
 )
 
 _WORKDAY_HOST_RE = re.compile(r"^(?P<tenant>[^.]+)\.(?P<pod>wd\d+)\.(?P<domain>myworkdayjobs\.com|myworkdaysite\.com)$", re.I)
@@ -311,7 +335,20 @@ def detect_ats(url: Any) -> dict[str, Any]:
         result["identifier"] = tenant
         result["site"] = _first_meaningful_segment(segments)
 
-    elif provider in (PHENOM, SUCCESSFACTORS, AVATURE):
+    elif provider == JOBVITE:
+        # Every Jobvite tenant shares jobs.jobvite.com; the tenant slug is the
+        # first path segment (jobs.jobvite.com/{tenant}/), not a subdomain.
+        token = _first_meaningful_segment(segments, skip={"careers", "jobs"})
+        result["tenant"] = token
+        result["identifier"] = token
+
+    elif provider == AMAZON:
+        # Amazon's collector always targets www.amazon.jobs/search.json, so the
+        # tenant is nominal - recorded for telemetry only.
+        result["tenant"] = "amazon"
+        result["identifier"] = "amazon"
+
+    elif provider in (PHENOM, SUCCESSFACTORS, AVATURE, CORNERSTONE, JIBE):
         result["tenant"] = subdomain
         result["identifier"] = subdomain
         result["site"] = _first_meaningful_segment(segments)
@@ -399,6 +436,11 @@ _EMBEDDED_URL_PATTERNS = {
     PAYLOCITY: r"https?://recruiting\.paylocity\.com/[^\s\"'<>\\]*",
     SUCCESSFACTORS: r"https?://[\w.-]*\.(?:successfactors|sapsf)\.(?:com|eu)/[^\s\"'<>\\]*",
     EIGHTFOLD: r"https?://[\w.-]*\.eightfold\.ai/[^\s\"'<>\\]*",
+    # Branded pages that embed a Jobvite board (jobs.jobvite.com/{tenant}) or a
+    # Jibe / Cornerstone careersite let the resolver recover the real tenant.
+    JOBVITE: r"https?://jobs\.jobvite\.com/[\w-]+",
+    JIBE: r"https?://[\w.-]*\.jibeapply\.com/[^\s\"'<>\\]*",
+    CORNERSTONE: r"https?://[\w.-]*\.csod\.com/[^\s\"'<>\\]*",
 }
 
 

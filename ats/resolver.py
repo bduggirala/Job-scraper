@@ -23,6 +23,7 @@ from ats.detector import (
     extract_embedded_ats_url,
 )
 from logger import get_logger
+from settings import load_settings
 
 log = get_logger("ats.resolver")
 
@@ -48,6 +49,24 @@ def resolve_from_page(company: str, url: str) -> dict[str, Any]:
 
     try:
         response = http_client.request(url, method="GET", allow_redirects=True, stream=True)
+    except http_client.HTTPError as exc:
+        # The bare default UA (see requests.user_agent) is deliberate - a full
+        # Chrome UA trips AWS WAF captcha on some iCIMS tenants - but it draws a
+        # 403 on sites like Ericsson/Cognizant/FedEx that never reach the ATS
+        # fingerprint below. Retry this single GET once with the browser UA;
+        # the default session UA is left untouched so iCIMS collection is safe.
+        if exc.status_code != 403:
+            log.debug("%s: page resolution failed for %s (%s)", company, url, exc)
+            return empty
+        browser_ua = load_settings().get("playwright.user_agent", "Mozilla/5.0")
+        try:
+            response = http_client.request(
+                url, method="GET", allow_redirects=True, stream=True,
+                headers={"User-Agent": browser_ua},
+            )
+        except Exception as exc:
+            log.debug("%s: page resolution failed for %s after 403 retry (%s)", company, url, exc)
+            return empty
     except Exception as exc:
         log.debug("%s: page resolution failed for %s (%s)", company, url, exc)
         return empty
