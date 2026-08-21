@@ -34,7 +34,7 @@ from ats.router import (
 from database import JobDatabase
 from deduplicate import deduplicate
 from enrich import enrich_records
-from export_ats_urls import write_discovered_urls
+from export_ats_urls import write_discovered_urls, write_run_status
 from filters import DATE_UNAVAILABLE, WITHIN_WINDOW, apply_filters
 from job_identity import extract_stable_job_id
 from logger import get_logger
@@ -593,5 +593,17 @@ def run(
         companies_path = resolve_companies_path(cfg, excel_path)
         export_result = write_discovered_urls(companies_path, discoveries)
         summary.ats_urls_written = export_result["updated"]
+
+    # Per-company retrieval outcome, so the workbook itself shows which
+    # companies this pipeline can actually reach. Scoped to full runs for the
+    # same reason as the ATS write-back: a --limit run would mark every
+    # unvisited company FALSE, which would be a lie rather than a gap.
+    if write_back and not output_prefix:
+        statuses = {
+            result.company: bool(result.success and result.jobs)
+            for result in results
+        }
+        companies_path = resolve_companies_path(cfg, excel_path)
+        write_run_status(companies_path, statuses)
 
     return summary, final_jobs, results
