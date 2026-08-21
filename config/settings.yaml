@@ -16,7 +16,7 @@ columns:
   live_jobs_url: Live Jobs Page (if ATS URL unavailable)
 
 # --- Date filtering --------------------------------------------------------
-hours_old: 72
+hours_old: 168
 
 # --- Location filtering ----------------------------------------------------
 locations:
@@ -98,9 +98,13 @@ requests:
   timeout_seconds: 30
   retries: 3
   backoff_factor: 2
-  user_agent: >-
-    Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
-    (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36
+  # A full Chrome/122 UA string trips AWS WAF Bot Control's captcha
+  # challenge on several iCIMS tenants (confirmed directly against
+  # events-statefarm.icims.com, careers-realpagepms.icims.com,
+  # fmglobal.icims.com: full UA -> HTTP 405 + captcha, bare UA -> HTTP 200,
+  # reproduced 6/6). A generic UA doesn't match the bot signatures WAF
+  # blocklists.
+  user_agent: "Mozilla/5.0"
   max_pages_per_company: 25   # pagination guard for API collectors
 
 # --- Concurrency -----------------------------------------------------------

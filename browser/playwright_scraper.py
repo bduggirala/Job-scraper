@@ -216,6 +216,30 @@ _EXTRACT_JS = """
     return null;
   };
 
+  const dateRe = /(date|posted|time|age)/i;
+
+  const nearbyDate = (el) => {
+    let node = el.parentElement;
+    for (let depth = 0; depth < 3 && node; depth++) {
+      // A <time datetime> attribute is the most reliable signal.
+      const t = node.querySelector('time[datetime]');
+      if (t) {
+        const dt = t.getAttribute('datetime');
+        if (dt) return dt;
+      }
+      for (const cand of node.querySelectorAll('[class],[data-ph-at-id]')) {
+        const marker = (cand.className || '') + ' ' +
+                       (cand.getAttribute('data-ph-at-id') || '');
+        if (dateRe.test(marker)) {
+          const text = (cand.innerText || '').trim();
+          if (text && text.length < 60) return text;
+        }
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
+
   for (const selector of selectors) {
     let nodes = [];
     try { nodes = document.querySelectorAll(selector); } catch (e) { continue; }
@@ -227,7 +251,7 @@ _EXTRACT_JS = """
       const key = href + '|' + title;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ title, href, location: nearbyLocation(el) });
+      out.push({ title, href, location: nearbyLocation(el), date: nearbyDate(el) });
     }
   }
   return out;
@@ -484,7 +508,7 @@ def _extract_job_rows(page) -> list[dict[str, Any]]:
             "title": title,
             "location": _clean_location(row.get("location")),
             "job_url": absolute,
-            "date_posted": None,
+            "date_posted": row.get("date"),
         })
     return results
 

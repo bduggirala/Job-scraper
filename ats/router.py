@@ -73,6 +73,13 @@ class RoutePlan:
     detection: dict[str, Any] = field(default_factory=dict)
     resolved_via_page: bool = False
     note: str | None = None
+    #: The branded careers page a human would actually visit, captured before
+    #: page resolution may overwrite ``url`` with a discovered ATS link. Some
+    #: discovered links are wrong (e.g. a "My Submissions" login link on a
+    #: Taleo tenant, picked up because it merely matches the provider's URL
+    #: pattern) - the browser fallback should render the real page rather
+    #: than repeat the same bad guess the API attempt already failed on.
+    original_url: str | None = None
 
     @property
     def uses_browser(self) -> bool:
@@ -146,6 +153,11 @@ def plan_route(
         if repaired:
             url = repaired
 
+    # Captured before page resolution can overwrite ``url`` below - this is
+    # the page a browser fallback should land on, not whatever ATS link the
+    # resolver guesses.
+    original_url = url
+
     detection = detect_ats(url)
     provider = detection["provider"]
 
@@ -153,7 +165,7 @@ def plan_route(
     if provider in COLLECTORS:
         return RoutePlan(
             company=company, url=url, provider=provider, method=METHOD_API,
-            source=source, detection=detection,
+            source=source, detection=detection, original_url=original_url,
         )
 
     # Unknown from the URL alone: probe the page for an embedded/redirected ATS.
@@ -163,14 +175,14 @@ def plan_route(
             return RoutePlan(
                 company=company, url=resolved.get("url") or url,
                 provider=resolved["provider"], method=METHOD_API, source=source,
-                detection=resolved, resolved_via_page=True,
+                detection=resolved, resolved_via_page=True, original_url=original_url,
             )
 
     method = METHOD_BROWSER if playwright_enabled else METHOD_API
     note = None if playwright_enabled else "Playwright disabled; no direct collector available"
     return RoutePlan(
         company=company, url=url, provider=UNKNOWN, method=method,
-        source=source, detection=detection, note=note,
+        source=source, detection=detection, note=note, original_url=original_url,
     )
 
 
@@ -203,10 +215,20 @@ def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | 
     """
     from browser.playwright_scraper import scrape_with_playwright
 
-    if not plan.url:
+    # When the plan's URL came from resolver-guessed ATS discovery (not the
+    # workbook's own ATS URL), that guess may be wrong - e.g. a Taleo tenant's
+    # "My Submissions" login link matches the provider's URL pattern but has
+    # no job search on it. The direct-API attempt on that guess already
+    # failed to get here; render the real branded page instead of repeating
+    # the same bad guess in the browser.
+    browser_url = plan.url
+    if plan.resolved_via_page and plan.original_url:
+        browser_url = plan.original_url
+
+    if not browser_url:
         raise CollectorUnavailable("No URL to open in the browser")
 
-    result = scrape_with_playwright(plan.company, plan.url)
+    result = scrape_with_playwright(plan.company, browser_url)
 
     records = [
         build_record(
