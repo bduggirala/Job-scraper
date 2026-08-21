@@ -68,6 +68,11 @@ JOB_LINK_SELECTORS = (
     'a[href*="/opportunity/"]',
     'a[href*="/position/"]',
     'a[href*="/careers/job"]',
+    # Goldman Sachs' higher.gs.com lists every posting as /roles/{id}; the
+    # diagnostic in tools/probe_site.py already treated /role/ as job-like,
+    # but the scraper's selectors did not, so 1,119 matches extracted as zero.
+    'a[href*="/roles/"]',
+    'a[href*="/role/"]',
     'a[data-ph-at-id="job-link"]',
     'a[data-automation-id*="jobTitle"]',
     "a.job-title-link",
@@ -643,8 +648,14 @@ def _navigate_to_job_list(
         page.wait_for_timeout(settle_ms)
         _dismiss_cookie_banner(page)
 
-        _click_load_more(page, max_pages, timeout_ms)
-        rows = _extract_job_rows(page) or _extract_jsonld_rows(page)
+        # Same ordering rule as the landing page: paginate only once a list
+        # is actually present.
+        rows = _extract_job_rows(page)
+        if rows:
+            if _click_load_more(page, max_pages, timeout_ms):
+                rows = _extract_job_rows(page) or rows
+        else:
+            rows = _extract_jsonld_rows(page)
         if len(rows) >= good_enough:
             log.info("%s: found %s jobs at depth %s -> %s",
                      company, len(rows), depth, target[:90])
@@ -700,7 +711,7 @@ def _find_search_input(page):
                 'input[type="text"], input[type="search"], input:not([type])'
             )
             count = min(candidates.count(), 20)
-        except Exception:
+        except Exception as e:
             continue
 
         for index in range(count):
@@ -718,7 +729,7 @@ def _find_search_input(page):
                     continue
                 if _SEARCH_INPUT_HINT_RE.search(haystack):
                     return frame, locator
-            except Exception:
+            except Exception as e:
                 continue
     return None
 
@@ -933,10 +944,6 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
 
         _dismiss_cookie_banner(page)
 
-        clicks = _click_load_more(page, max_pages, timeout_ms)
-        if clicks:
-            log.debug("%s: expanded results with %s pagination action(s)", company, clicks)
-
         good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
         # Landing pages routinely show a handful of "featured" roles. Taking
         # those and stopping would report 3 jobs for a company with
@@ -944,8 +951,18 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         # search and hop paths look for the real list.
         best = PlaywrightResult()
 
+        # Extract before paginating. "Load more"/"next" only mean something
+        # once a list exists; clicking them on a page with no jobs is blind
+        # clicking that can navigate away and destroy the very search box the
+        # fallback needs next - observed on Goldman Sachs, where four such
+        # clicks left the page with no search input at all.
         jobs = _extract_job_rows(page)
-        if not jobs:
+        if jobs:
+            clicks = _click_load_more(page, max_pages, timeout_ms)
+            if clicks:
+                log.debug("%s: expanded results with %s pagination action(s)", company, clicks)
+                jobs = _extract_job_rows(page) or jobs
+        else:
             # JSON-LD is often present even when the visible list is
             # client-rendered, and it carries real posting dates.
             jobs = _extract_jsonld_rows(page)
