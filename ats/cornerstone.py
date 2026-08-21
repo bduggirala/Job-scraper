@@ -58,13 +58,45 @@ CORNERSTONE = "cornerstone"
 PAGE_SIZE = 100
 MAX_PAGES = 60
 
+# A tenant can host several numbered career sites; when the URL names none we
+# probe this many, keeping every site that returns requisitions. JPS Health, for
+# example, splits its openings across sites 2/3/4.
+MAX_SITES = 12
+
 # The anonymous career-site JWT the SPA bootstraps with, embedded in the
-# careersite home page as ``if(!csod.context...) csod.context={...}``.
-_CONTEXT_RE = re.compile(r"csod\.context\s*=\s*(\{.*?\})\s*;", re.S)
+# careersite home page as ``csod.context = {...};``. The object contains nested
+# braces (endpoints, theming, ...), so a non-greedy ``\{.*?\}`` stops at the
+# first inner ``}``; we locate the opening brace and match it balanced instead.
+_CONTEXT_START_RE = re.compile(r"csod\.context\s*=\s*\{")
 
 # The numeric career-site id in a careersite URL:
 # ``/ux/ats/careersite/{siteId}/home`` or ``/.../job/{reqId}``.
 _SITE_ID_RE = re.compile(r"/careersite/(\d+)(?:/|$)")
+
+
+def _extract_context(body: str) -> dict[str, Any] | None:
+    """Pull the ``csod.context = {...}`` object via balanced-brace matching.
+
+    Returns the parsed dict, or ``None`` when the marker is absent or the
+    braces never balance (truncated page).
+    """
+    match = _CONTEXT_START_RE.search(body)
+    if not match:
+        return None
+    start = match.end() - 1  # position of the opening '{'
+    depth = 0
+    for i in range(start, len(body)):
+        char = body[i]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(body[start:i + 1])
+                except (ValueError, TypeError):
+                    return None
+    return None
 
 
 class CornerstoneCollector(ATSCollector):
@@ -100,38 +132,39 @@ class CornerstoneCollector(ATSCollector):
         return None
 
     # -- careersite bootstrap --------------------------------------------
-    def _bootstrap(self, host: str, corp: str, site_id: int | None) -> tuple[str, int]:
-        """Fetch the careersite home once to lift the JWT and (if needed) the
-        numeric site id.
+    def _bootstrap(self, host: str, corp: str, site_id: int | None) -> str:
+        """Fetch a careersite home once to lift the anonymous JWT.
 
         The token is an anonymous career-site JWT the SPA needs to call the
-        search service; without it the endpoint answers ``401``.
+        search service; without it the endpoint answers ``401``. Not every
+        numbered site renders the context object (inactive sites serve a stub),
+        so if the requested site carries no token we retry site 1, which always
+        does on a live tenant.
         """
-        home_site = site_id if site_id is not None else 1
-        home_url = f"https://{host}/ux/ats/careersite/{home_site}/home"
-        try:
-            body = http_client.get_text(home_url, params={"c": corp})
-        except Exception as exc:  # network / HTTP failure
-            raise CollectorUnavailable(
-                f"Cornerstone careersite home unavailable: {exc}"
-            ) from exc
+        # Try the URL's site first, then a handful of low-numbered sites - not
+        # every site renders the context object (JPS site 1 is a tokenless stub
+        # while site 4 carries it), so we probe until one yields a token.
+        candidate_sites = [site_id] if site_id is not None else []
+        candidate_sites += list(range(1, 6))
+        seen: list[int] = []
+        for s in candidate_sites:
+            if s is not None and s not in seen:
+                seen.append(s)
 
-        match = _CONTEXT_RE.search(body)
-        if not match:
-            raise CollectorUnavailable("Cornerstone careersite carried no context token")
-        try:
-            context = json.loads(match.group(1))
-        except (ValueError, TypeError) as exc:
-            raise CollectorUnavailable(f"Cornerstone context unparseable: {exc}") from exc
+        last_error = "no context token"
+        for home_site in seen:
+            home_url = f"https://{host}/ux/ats/careersite/{home_site}/home"
+            try:
+                body = http_client.get_text(home_url, params={"c": corp})
+            except Exception as exc:  # network / HTTP failure
+                last_error = str(exc)
+                continue
+            context = _extract_context(body)
+            if context and context.get("token"):
+                return str(context["token"])
+            last_error = "careersite carried no context token"
 
-        token = context.get("token")
-        if not token:
-            raise CollectorUnavailable("Cornerstone context carried no token")
-
-        # If the caller never gave us a site id, fall back to the home site we
-        # just successfully loaded.
-        resolved_site = site_id if site_id is not None else home_site
-        return str(token), int(resolved_site)
+        raise CollectorUnavailable(f"Cornerstone bootstrap failed: {last_error}")
 
     # -- record building --------------------------------------------------
     @staticmethod
@@ -152,20 +185,16 @@ class CornerstoneCollector(ATSCollector):
             f"https://{host}/ux/ats/careersite/{site_id}/job/{req_id}?c={corp}"
         )
 
-    # -- interface --------------------------------------------------------
-    def collect(self) -> list[dict]:
-        host = self._host()
-        corp = self._corp(host)
-        site_id = self._site_id_from_url()
+    def _collect_site(
+        self, endpoint: str, headers: dict[str, str], host: str, corp: str,
+        site_id: int, *, strict: bool,
+    ) -> list[dict | None]:
+        """Paginate one career site's search endpoint.
 
-        token, site_id = self._bootstrap(host, corp, site_id)
-
-        endpoint = f"https://{host}/services/x/career-site/v1/search"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json, text/plain, */*",
-        }
-
+        ``strict`` (used when the URL named an explicit site) raises
+        :class:`CollectorUnavailable` on a first-page failure; discovery mode
+        treats a dead/empty site as simply "no jobs here" and returns ``[]``.
+        """
         records: list[dict | None] = []
         total: int | None = None
 
@@ -186,16 +215,18 @@ class CornerstoneCollector(ATSCollector):
             try:
                 data = http_client.post_json(endpoint, payload, headers=headers)
             except Exception as exc:
-                if page == 1:
+                if page == 1 and strict:
                     raise CollectorUnavailable(
                         f"Cornerstone search endpoint unavailable: {exc}"
                     ) from exc
-                self.log.warning("%s: Cornerstone page %s failed (%s)", self.company, page, exc)
+                if page > 1:
+                    self.log.warning("%s: Cornerstone site %s page %s failed (%s)",
+                                     self.company, site_id, page, exc)
                 break
 
             body = data.get("data") if isinstance(data, dict) else None
             if not isinstance(body, dict):
-                if page == 1:
+                if page == 1 and strict:
                     raise CollectorUnavailable("Cornerstone returned no data envelope")
                 break
 
@@ -222,6 +253,38 @@ class CornerstoneCollector(ATSCollector):
 
             if total is not None and page * PAGE_SIZE >= int(total):
                 break
+
+        return records
+
+    # -- interface --------------------------------------------------------
+    def collect(self) -> list[dict]:
+        host = self._host()
+        corp = self._corp(host)
+        explicit_site = self._site_id_from_url()
+
+        token = self._bootstrap(host, corp, explicit_site)
+
+        endpoint = f"https://{host}/services/x/career-site/v1/search"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        records: list[dict | None] = []
+        if explicit_site is not None:
+            # The URL named a site: trust it and fail loudly if it is broken.
+            records = self._collect_site(
+                endpoint, headers, host, corp, explicit_site, strict=True,
+            )
+        else:
+            # No site in the URL: probe the numbered sites and keep every one
+            # that returns requisitions (a tenant may split roles across sites).
+            for site_id in range(1, MAX_SITES + 1):
+                records.extend(
+                    self._collect_site(
+                        endpoint, headers, host, corp, site_id, strict=False,
+                    )
+                )
 
         if not records:
             raise CollectorUnavailable("Cornerstone search returned zero requisitions")

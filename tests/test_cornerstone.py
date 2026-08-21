@@ -86,11 +86,22 @@ def _patch_search(monkeypatch, pages):
     return calls
 
 
-def test_bootstrap_lifts_token_and_site_id(monkeypatch):
+def test_bootstrap_lifts_token(monkeypatch):
     _patch_home(monkeypatch)
-    token, site_id = _collector()._bootstrap("jpshealthnet.csod.com", "jpshealthnet", 4)
+    token = _collector()._bootstrap("jpshealthnet.csod.com", "jpshealthnet", 4)
     assert token == "eyJhbGciOiJIUzUxMiJ9.TESTTOKEN.sig"
-    assert site_id == 4
+
+
+def test_bootstrap_handles_nested_braces_in_context(monkeypatch):
+    # The real context object nests {endpoints:{...}} before the token; a
+    # non-greedy brace match would stop early and miss it.
+    _patch_home(monkeypatch)
+    token = _collector()._bootstrap("jpshealthnet.csod.com", "jpshealthnet", None)
+    assert token.endswith(".sig")
+
+
+def test_site_id_read_from_url():
+    assert _collector()._site_id_from_url() == 4
 
 
 def test_parses_title_location_date_and_absolute_url(monkeypatch):

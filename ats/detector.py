@@ -131,6 +131,12 @@ BODY_FINGERPRINTS: tuple[tuple[str, str], ...] = (
     ("successfactors.com", SUCCESSFACTORS),
     ("sapsf.com", SUCCESSFACTORS),
     ("avature.net", AVATURE),
+    # Self-hosted Avature portals (apply.deloitte.com) never mention avature.net
+    # in their HTML - they run on the company's own domain - but their SPA
+    # bootstraps a global "avature.portal" config object. Driving the standard
+    # Avature /careers/SearchJobs/ endpoint from the branded host returns real
+    # jobs (confirmed against Deloitte: 100+ jobs).
+    ("avature.portal", AVATURE),
     # Radancy TalentBrew (formerly TMP Worldwide) powers many enterprise
     # careers sites on the company's *own* domain (careers.7-eleven.com), so
     # there is no vendor HOST_PATTERN to match - only these HTML fingerprints.

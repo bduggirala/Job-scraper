@@ -192,6 +192,50 @@ does). Agents do **not** edit `ats/detector.py` or `ats/router.py`; they return
 the exact snippets, which are applied in a single serial integration pass to
 avoid merge conflicts on those shared files.
 
+## Implementation outcome (2026-08-21, live-verified)
+
+The integration pass plus live verification against the real workbook tenants
+settled the worklist as follows.
+
+**Shipped and verified (return real jobs):**
+
+| Provider | Verified against | Result |
+|----------|------------------|--------|
+| Amazon.jobs | Amazon | 10,000 jobs (search.json) |
+| Jobvite | FirstCash Holdings | 381 jobs |
+| Jibe | Concentra tenant | 1,206 jobs |
+| Cornerstone (CSOD) | JPS Health tenant | search API works with the balanced-brace token fix; the branded host `www.jobs.jpshealthnet.org` is unreachable from CI, so it is driven by tenant coordinates |
+| JSON-LD tier | (future-proofing) | offline fixtures only — no cohort company emits JobPosting |
+| **Avature (self-hosted)** | **Deloitte** | **100 jobs** — new `avature.portal` body fingerprint; `apply.deloitte.com` never mentions `avature.net`, so the SPA's `avature.portal` global is the signal. Resolves end-to-end (branded page → avature → direct API). |
+
+**Verified board, workbook data-fix (no server-side fingerprint to detect):**
+Boingo Wireless → `https://boards.greenhouse.io/boingo` (7 jobs, DAS roles —
+matches the company). Its marketing page (`www.boingo.com/careers/`) is an SPA
+that never references greenhouse server-side, so detection cannot recover it;
+the verified board URL was written into `config/companies.xlsx` instead.
+
+**Not viable — stays on Playwright/JSON-LD:**
+
+- **Dayforce (FinThrive).** The endpoint was fully reverse-engineered
+  (`jobs.dayforcehcm.com/api/geo/{clientNamespace}/jobposting/search`, POST),
+  but it is bot-protected: GET → 405, POST → **403 Forbidden** even with a
+  bootstrapped session, cookies, Referer/Origin and the JS's payload shape
+  (reCAPTCHA site key present in runtimeConfig). No collector shipped — shipping
+  one we cannot verify would violate the project's verification discipline.
+- **Parkland → Phenom.** Parkland runs Phenom's newer `/api/mcp/jobs` API, not
+  the `phApp.ddo` server object the existing PhenomCollector drives; the
+  collector raises `CollectorUnavailable`. Would need a new Phenom-MCP path.
+- **Cardinal Health → Radancy.** `jobs.cardinalhealth.com/search-jobs/results`
+  returns zero jobs (not a TalentBrew endpoint / different shape) — SPA.
+- **Aveanna → Workday, Lockheed → Eightfold, FedEx → Phenom.** All
+  client-rendered SPAs (or WAF-blocked, Lockheed serves a 160-byte stub) with no
+  server-side ATS host or fingerprint in the one-GET HTML.
+
+**Net effect:** Amazon, Jobvite, Jibe, Cornerstone and Deloitte move off
+Playwright to direct APIs; Boingo becomes a direct Greenhouse company via the
+workbook. The remaining unknowns are genuine client-rendered SPAs / hardened
+endpoints that correctly remain on the browser fallback.
+
 ## Risks
 
 - **Public APIs change / rate-limit.** Mitigated by `CollectorUnavailable`
