@@ -137,7 +137,11 @@ requests:
 # --- Concurrency -----------------------------------------------------------
 concurrency:
   http_workers: 10
-  playwright_workers: 5
+  # Measured, not guessed: raising this to 5 dropped a full run from 137/171
+  # to 105/171, with 51 companies failing on net::ERR_INTERNET_DISCONNECTED -
+  # five concurrent Chromium instances saturate this machine's network. Three
+  # is the tested ceiling here.
+  playwright_workers: 3
 
   # Hard wall-clock budget per phase. Playwright can block inside its own
   # event loop with no timeout of its own (a page whose overlay intercepts
