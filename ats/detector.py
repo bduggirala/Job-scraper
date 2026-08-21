@@ -372,6 +372,22 @@ def _clean_extracted_url(raw: str) -> str:
     return cleaned.rstrip("\\\"'),;>")
 
 
+_EMBEDDED_URL_PATTERNS = {
+    WORKDAY: r"https?://[\w.-]*\.wd\d+\.myworkday(?:jobs|site)\.com/[^\s\"'<>\\]+",
+    GREENHOUSE: r"https?://(?:boards|job-boards)\.greenhouse\.io/[\w-]+",
+    LEVER: r"https?://jobs\.lever\.co/[\w-]+",
+    ASHBY: r"https?://jobs\.ashbyhq\.com/[\w-]+",
+    SMARTRECRUITERS: r"https?://(?:careers|jobs)\.smartrecruiters\.com/[\w-]+",
+    ICIMS: r"https?://[\w.-]*\.icims\.com/[^\s\"'<>\\]*",
+    TALEO: r"https?://[\w.-]*\.taleo\.net/[^\s\"'<>\\]*",
+    AVATURE: r"https?://[\w.-]*\.avature\.net/[^\s\"'<>\\]*",
+    UKG: r"https?://(?:recruiting\.ultipro\.com|[\w.-]+\.ukg\.net)/[^\s\"'<>\\]*",
+    PAYLOCITY: r"https?://recruiting\.paylocity\.com/[^\s\"'<>\\]*",
+    SUCCESSFACTORS: r"https?://[\w.-]*\.(?:successfactors|sapsf)\.(?:com|eu)/[^\s\"'<>\\]*",
+    EIGHTFOLD: r"https?://[\w.-]*\.eightfold\.ai/[^\s\"'<>\\]*",
+}
+
+
 def extract_embedded_ats_url(html_text: str, provider: str) -> str | None:
     """Pull the concrete ATS URL a branded page embeds for ``provider``.
 
@@ -386,20 +402,7 @@ def extract_embedded_ats_url(html_text: str, provider: str) -> str | None:
     if not html_text:
         return None
 
-    patterns = {
-        WORKDAY: r"https?://[\w.-]*\.wd\d+\.myworkday(?:jobs|site)\.com/[^\s\"'<>\\]+",
-        GREENHOUSE: r"https?://(?:boards|job-boards)\.greenhouse\.io/[\w-]+",
-        LEVER: r"https?://jobs\.lever\.co/[\w-]+",
-        ASHBY: r"https?://jobs\.ashbyhq\.com/[\w-]+",
-        SMARTRECRUITERS: r"https?://(?:careers|jobs)\.smartrecruiters\.com/[\w-]+",
-        ICIMS: r"https?://[\w.-]*\.icims\.com/[^\s\"'<>\\]*",
-        TALEO: r"https?://[\w.-]*\.taleo\.net/[^\s\"'<>\\]*",
-        AVATURE: r"https?://[\w.-]*\.avature\.net/[^\s\"'<>\\]*",
-        UKG: r"https?://(?:recruiting\.ultipro\.com|[\w.-]+\.ukg\.net)/[^\s\"'<>\\]*",
-        PAYLOCITY: r"https?://recruiting\.paylocity\.com/[^\s\"'<>\\]*",
-        SUCCESSFACTORS: r"https?://[\w.-]*\.(?:successfactors|sapsf)\.(?:com|eu)/[^\s\"'<>\\]*",
-        EIGHTFOLD: r"https?://[\w.-]*\.eightfold\.ai/[^\s\"'<>\\]*",
-    }
+    patterns = _EMBEDDED_URL_PATTERNS
 
     pattern = patterns.get(provider)
     if not pattern:
@@ -408,6 +411,37 @@ def extract_embedded_ats_url(html_text: str, provider: str) -> str | None:
     for match in re.finditer(pattern, html_text, re.I):
         candidate = _clean_extracted_url(match.group(0))
         if candidate and _is_plausible_job_url(candidate):
+            return candidate
+    return None
+
+
+def extract_any_embedded_ats_url(html_text: str, provider: str) -> str | None:
+    """First reference to ``provider``'s domain, job board or not.
+
+    A last resort for branded pages that name their ATS only through a login
+    or profile link - confirmed against careers.frostbank.com, whose static
+    HTML references ``frostbank.wd5.myworkdayjobs.com`` exclusively via
+    ``/external/login``. :func:`extract_embedded_ats_url` rightly rejects
+    that as a job board, but the host still carries the tenant and site the
+    collector needs, and driving the API from them returns the real jobs.
+
+    Prefers a plausible job URL when one exists, so callers get the better
+    signal whenever it is available.
+    """
+    if not html_text:
+        return None
+
+    plausible = extract_embedded_ats_url(html_text, provider)
+    if plausible:
+        return plausible
+
+    pattern = _EMBEDDED_URL_PATTERNS.get(provider)
+    if not pattern:
+        return None
+
+    for match in re.finditer(pattern, html_text, re.I):
+        candidate = _clean_extracted_url(match.group(0))
+        if candidate:
             return candidate
     return None
 
@@ -425,20 +459,7 @@ def extract_all_embedded_ats_urls(html_text: str, provider: str) -> list[str]:
     if not html_text:
         return []
 
-    patterns = {
-        WORKDAY: r"https?://[\w.-]*\.wd\d+\.myworkday(?:jobs|site)\.com/[^\s\"'<>\\]+",
-        GREENHOUSE: r"https?://(?:boards|job-boards)\.greenhouse\.io/[\w-]+",
-        LEVER: r"https?://jobs\.lever\.co/[\w-]+",
-        ASHBY: r"https?://jobs\.ashbyhq\.com/[\w-]+",
-        SMARTRECRUITERS: r"https?://(?:careers|jobs)\.smartrecruiters\.com/[\w-]+",
-        ICIMS: r"https?://[\w.-]*\.icims\.com/[^\s\"'<>\\]*",
-        TALEO: r"https?://[\w.-]*\.taleo\.net/[^\s\"'<>\\]*",
-        AVATURE: r"https?://[\w.-]*\.avature\.net/[^\s\"'<>\\]*",
-        UKG: r"https?://(?:recruiting\.ultipro\.com|[\w.-]+\.ukg\.net)/[^\s\"'<>\\]*",
-        PAYLOCITY: r"https?://recruiting\.paylocity\.com/[^\s\"'<>\\]*",
-        SUCCESSFACTORS: r"https?://[\w.-]*\.(?:successfactors|sapsf)\.(?:com|eu)/[^\s\"'<>\\]*",
-        EIGHTFOLD: r"https?://[\w.-]*\.eightfold\.ai/[^\s\"'<>\\]*",
-    }
+    patterns = _EMBEDDED_URL_PATTERNS
 
     pattern = patterns.get(provider)
     if not pattern:

@@ -19,6 +19,7 @@ from ats.detector import (
     UNKNOWN,
     detect_ats,
     detect_from_html,
+    extract_any_embedded_ats_url,
     extract_embedded_ats_url,
 )
 from logger import get_logger
@@ -82,6 +83,19 @@ def resolve_from_page(company: str, url: str) -> dict[str, Any]:
         detection = detect_ats(embedded)
         if detection["provider"] != UNKNOWN:
             log.debug("%s: resolved via embedded URL -> %s (%s)", company, provider, embedded)
+            return detection
+
+    # No job-board URL, but the page may still name the ATS host through a
+    # login or profile link. That host carries the tenant/site coordinates the
+    # collector needs - careers.frostbank.com references its Workday tenant
+    # only via /external/login, and driving the API from it returns 195 jobs
+    # where the branded host yields "Incomplete Workday coordinates".
+    any_url = extract_any_embedded_ats_url(html_text, provider)
+    if any_url:
+        detection = detect_ats(any_url)
+        if detection["provider"] != UNKNOWN and detection.get("tenant"):
+            log.debug("%s: resolved coordinates via %s reference -> %s",
+                      company, provider, any_url)
             return detection
 
     # Fingerprint matched but no explicit URL: keep the branded host, which is
