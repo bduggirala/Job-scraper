@@ -114,6 +114,31 @@ class LocationMatcher:
     def _has_non_us_signal(text: str) -> bool:
         return any(re.search(rf"\b{re.escape(token)}\b", text) for token in _NON_US_TOKENS)
 
+    @staticmethod
+    def _has_us_signal(text: str) -> bool:
+        """True when the text names something recognizably American.
+
+        A curated non-US blocklist (``_NON_US_TOKENS``) can never be
+        exhaustive - confirmed live: an Accenture posting listing only
+        Brazilian states/cities (Pernambuco, Recife, Maranhão, Porto
+        Alegre...) named none of our blocked tokens (only the country name
+        "brazil" is blocked, not its city names) and slipped through as
+        "remote_us". This is the positive-evidence counterpart: a detailed,
+        non-generic location listing is only trusted as U.S.-eligible when
+        it actually names a U.S. state, "United States"/"USA", or a bare
+        remote marker.
+        """
+        if re.search(r"\bunited states\b|\bu\.s\.a?\.?\b", text):
+            return True
+        for abbrev, name in _STATE_TOKENS.items():
+            if re.search(rf"\b{re.escape(name)}\b", text):
+                return True
+            if re.search(rf",\s*{abbrev}\b", text, re.I):
+                return True
+            if re.search(rf"\bremote[\s-]*{abbrev}\b", text, re.I):
+                return True
+        return any(token in text for token in _REMOTE_TOKENS)
+
     def is_remote_us(self, record: dict[str, Any]) -> bool:
         """True when the record is a U.S.-eligible remote role."""
         if not self.include_remote:
@@ -129,6 +154,12 @@ class LocationMatcher:
         if explicit_remote is not True and not has_token:
             return False
         if self._has_non_us_signal(haystack):
+            return False
+        # A blank/generic location carries no evidence either way and is
+        # trusted as-is (this is a US-focused job search tool). A specific,
+        # detailed location listing needs positive US evidence, not just the
+        # absence of a blocklisted non-US one.
+        if location and not self._has_us_signal(haystack):
             return False
         return True
 
