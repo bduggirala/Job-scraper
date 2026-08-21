@@ -30,3 +30,6 @@ config/*.bak-*
 .DS_Store
 Thumbs.db
 *.swp
+
+# Ad-hoc full-run logs
+run_output*.log
