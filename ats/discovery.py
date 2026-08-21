@@ -28,6 +28,7 @@ from ats.detector import (
 )
 from ats.html_utils import make_soup
 from ats.router import COLLECTORS
+import http_client
 from logger import get_logger
 
 log = get_logger("ats.discovery")
@@ -156,3 +157,158 @@ def careers_links(html: str, base_url: str, limit: int = 5) -> list[str]:
             break
 
     return links
+
+
+#: Pages fetched per company in the HTTP stage: two seeds plus their
+#: careers-ish links. Small on purpose - this stage is the cheap filter, the
+#: browser stage is the thorough one.
+MAX_HTTP_PAGES = 8
+
+
+def _fetch(url: str) -> str:
+    """One HTTP GET returning body text. Separated so tests can stub it."""
+    return http_client.get_text(url, headers={"Accept": "text/html"})
+
+
+def _seeds(seed_url: str | None) -> list[str]:
+    seeds: list[str] = []
+    if seed_url:
+        seeds.append(seed_url)
+        root = root_domain_url(seed_url)
+        if root and root not in seeds:
+            seeds.append(root)
+    return seeds
+
+
+def discover(company: str, seed_url: str | None, *, use_browser: bool = True) -> Discovery:
+    """Find and verify an ATS URL or job-search page for one company.
+
+    Never raises: every failure becomes a Discovery with ``method="none"``
+    and the reason in ``note``, so one bad company cannot stop a sweep.
+    """
+    result = Discovery(company=company)
+
+    seeds = _seeds(seed_url)
+    if not seeds:
+        result.note = "no seed URL in the workbook"
+        return result
+
+    visited: set[str] = set()
+    queue = list(seeds)
+    last_note = "nothing found in page HTML"
+
+    while queue and len(visited) < MAX_HTTP_PAGES:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+
+        try:
+            html = _fetch(url)
+        except Exception as exc:
+            last_note = f"fetch failed for {url}: {exc}"
+            continue
+
+        for candidate in candidates_from_html(html, url):
+            jobs_found, note = verify_ats_url(company, candidate)
+            if jobs_found:
+                result.ats_url = candidate
+                result.provider = detect_ats(candidate).get("provider")
+                result.jobs_found = jobs_found
+                result.method = "http"
+                result.note = note
+                return result
+            last_note = note
+
+        for link in careers_links(html, url):
+            if link not in visited:
+                queue.append(link)
+
+    if use_browser:
+        browser_result = _discover_via_browser(company, seeds[0])
+        if browser_result.jobs_found:
+            return browser_result
+        last_note = browser_result.note or last_note
+
+    result.note = last_note
+    return result
+
+
+def _discover_via_browser(company: str, seed_url: str) -> Discovery:
+    """Render the seed and crawl it, verifying whatever the traversal finds.
+
+    Reuses the pipeline's own traversal rather than reimplementing it. The hop
+    budget is raised because this tool is off the critical path - a normal run
+    must stay inside its 360s per-company limit, a discovery sweep need not.
+    """
+    from browser.playwright_scraper import (
+        _dismiss_cookie_banner,
+        _extract_job_rows,
+        _get_browser,
+        _navigate_to_job_list,
+        shutdown_thread_browser,
+    )
+    from settings import load_settings
+
+    result = Discovery(company=company)
+    cfg = load_settings()
+    good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
+    timeout_ms = int(cfg.get("playwright.timeout_ms", 30000))
+    user_agent = cfg.get("playwright.user_agent") or cfg.get("requests.user_agent")
+
+    context = page = None
+    try:
+        browser = _get_browser()
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=user_agent,
+            ignore_https_errors=True,
+            locale="en-US",
+        )
+        context.set_default_timeout(timeout_ms)
+        page = context.new_page()
+        page.goto(seed_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(int(cfg.get("playwright.wait_after_load_ms", 2500)))
+        _dismiss_cookie_banner(page)
+
+        traversal = _navigate_to_job_list(company, page, timeout_ms, max_hops=6)
+
+        if traversal.discovered_ats_url:
+            jobs_found, note = verify_ats_url(company, traversal.discovered_ats_url)
+            if jobs_found:
+                result.ats_url = traversal.discovered_ats_url
+                result.provider = traversal.discovered_provider
+                result.jobs_found = jobs_found
+                result.method = "browser"
+                result.note = note
+                return result
+            result.note = note
+
+        # No usable ATS, but the page the traversal landed on may itself be a
+        # real job list. Only a substantial list counts: a landing page's
+        # three featured roles is not a job search page.
+        rows = traversal.jobs or _extract_job_rows(page)
+        if len(rows) >= good_enough:
+            result.jobs_page = page.url
+            result.jobs_found = len(rows)
+            result.method = "browser"
+            result.note = f"rendered job list with {len(rows)} rows"
+            return result
+
+        result.note = result.note or f"browser found only {len(rows)} row(s)"
+        return result
+
+    except Exception as exc:
+        result.note = f"browser stage failed: {exc}"
+        return result
+    finally:
+        for closeable in (page, context):
+            try:
+                if closeable is not None:
+                    closeable.close()
+            except Exception:
+                pass
+        try:
+            shutdown_thread_browser()
+        except Exception:
+            pass
