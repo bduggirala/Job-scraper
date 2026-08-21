@@ -71,6 +71,33 @@ playwright:
   max_pages: 5              # pagination / "Load More" click limit per company
   wait_after_load_ms: 2500  # settle time for client-side rendering
 
+  # The browser needs a DIFFERENT User-Agent than requests.user_agent below.
+  # A bare "Mozilla/5.0" defeats AWS WAF on iCIMS hosts, but Cloudflare
+  # rejects it outright in a real browser context (a genuine Chrome never
+  # sends a UA that short), which silently costs every Cloudflare-protected
+  # careers site - confirmed against jobs.centene.com, which serves a
+  # challenge page with the bare UA and the real page with this one.
+  user_agent: >-
+    Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+    (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36
+
+  # Careers landing pages often bury the real job list several links deep
+  # ("Career Areas" -> "Jobs" -> "Search Jobs"). Traversal is best-first by
+  # link score and bounded three ways so one sprawling site cannot consume
+  # the 240s per-company limit: max_hops caps depth, max_hop_visits caps
+  # total pages rendered, hop_budget_seconds caps wall-clock.
+  max_hops: 5
+  max_hop_visits: 12
+  hop_budget_seconds: 100
+  # A landing page often shows 1-3 "featured" roles. Returning those as if
+  # they were the job list hides thousands of real openings, so traversal
+  # only stops early on a page that looks like a genuine list; anything
+  # smaller is remembered as a fallback while the search continues.
+  hop_good_enough_rows: 10
+  # Try the page's own search box at each level, not only at the end. Many
+  # job lists render only after a keyword is submitted.
+  search_at_each_hop: true
+
   # Navigation failures are usually transient (Chromium's DNS resolver
   # buckling under concurrent browser instances, or a site resetting a
   # repeat fingerprint) rather than a genuinely dead site. Retries use a

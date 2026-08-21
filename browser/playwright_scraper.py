@@ -542,6 +542,15 @@ _JOBS_LINK_JS = """
 """
 
 
+def _hop_key(url: str) -> str:
+    """Normalized identity for visit-deduplication during traversal.
+
+    Case and a trailing slash must not make the same page look new, or the
+    traversal can loop between "/jobs" and "/jobs/" until the budget expires.
+    """
+    return url.split("#")[0].rstrip("/").lower()
+
+
 def _find_jobs_page_links(page) -> list[dict[str, Any]]:
     """Rank links on a careers landing page that lead to the actual job list."""
     try:
@@ -553,28 +562,56 @@ def _find_jobs_page_links(page) -> list[dict[str, Any]]:
         return []
 
 
-def _navigate_to_job_list(company: str, page, timeout_ms: int, max_hops: int = 2) -> PlaywrightResult:
-    """Follow "Search jobs"-style links until a page yields jobs or an ATS.
+def _navigate_to_job_list(
+    company: str, page, timeout_ms: int, max_hops: int | None = None
+) -> PlaywrightResult:
+    """Traverse a careers site until a page yields jobs or reveals an ATS.
 
     Many workbook URLs point at a marketing careers page whose openings live
-    one hop away (IBM -> /careers/search) or on a different ATS host entirely
-    (GameStop -> gamestop.rec.pro.ukg.net). Because the second case is so
-    common, each candidate link is checked against :func:`detect_ats` *before*
-    navigating: recognising the ATS is strictly better than scraping its HTML,
-    so the URL is handed straight back as a discovery for the router to
-    collect properly.
+    one or more links away (IBM -> /careers/search, Centene -> /us/en/jobs ->
+    the list) or on a different ATS host entirely (GameStop ->
+    gamestop.rec.pro.ukg.net). Because the ATS case is so valuable, every
+    candidate link is checked with :func:`detect_ats` *before* navigating:
+    recognising the ATS is strictly better than scraping its HTML, so the URL
+    is handed straight back as a discovery for the router to collect properly.
+
+    Traversal is best-first on the link scores from
+    :func:`_find_jobs_page_links` and bounded by depth, total visits and a
+    wall-clock budget, so a sprawling site cannot consume the per-company
+    timeout.
     """
-    settle_ms = int(load_settings().get("playwright.wait_after_load_ms", 2500))
-    visited: set[str] = {page.url}
+    cfg = load_settings()
+    if max_hops is None:
+        max_hops = int(cfg.get("playwright.max_hops", 5))
+    max_visits = int(cfg.get("playwright.max_hop_visits", 12))
+    budget_s = float(cfg.get("playwright.hop_budget_seconds", 100))
+    settle_ms = int(cfg.get("playwright.wait_after_load_ms", 2500))
+    max_pages = int(cfg.get("playwright.max_pages", 5))
+    search_each = bool(cfg.get("playwright.search_at_each_hop", True))
+    good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
 
-    for hop in range(max_hops):
-        candidates = _find_jobs_page_links(page)
-        if not candidates:
-            return PlaywrightResult()
+    deadline = time.monotonic() + budget_s
+    visited: set[str] = {_hop_key(page.url)}
+    visits = 0
+    # Best partial result seen so far. A page showing three featured roles
+    # is worth keeping, but not worth stopping the search for.
+    best = PlaywrightResult()
 
-        # An ATS link anywhere in the candidate set beats scraping HTML.
-        for candidate in candidates:
+    # Frontier entries are (depth, url, score); higher score explored first.
+    frontier: list[tuple[int, str, int]] = []
+
+    def _enqueue(depth: int) -> None:
+        for candidate in _find_jobs_page_links(page):
             target = urljoin(page.url, candidate["href"])
+            if _hop_key(target) in visited:
+                continue
+            frontier.append((depth, target, int(candidate.get("score", 0))))
+
+    _enqueue(1)
+
+    while frontier and visits < max_visits and time.monotonic() < deadline:
+        # An ATS link anywhere in the frontier beats scraping any HTML.
+        for _depth, target, _score in frontier:
             detection = detect_ats(target)
             if detection["provider"] != UNKNOWN:
                 log.info("%s: careers page links to %s -> %s",
@@ -584,35 +621,56 @@ def _navigate_to_job_list(company: str, page, timeout_ms: int, max_hops: int = 2
                     discovered_provider=detection["provider"],
                 )
 
-        for candidate in candidates:
-            target = urljoin(page.url, candidate["href"])
-            if target in visited:
-                continue
-            visited.add(target)
+        frontier.sort(key=lambda entry: (-entry[2], entry[0]))
+        depth, target, _score = frontier.pop(0)
 
-            try:
-                page.goto(target, wait_until="domcontentloaded", timeout=timeout_ms)
-            except Exception as exc:
-                log.debug("%s: hop to %s failed (%s)", company, target[:80], exc)
-                continue
+        key = _hop_key(target)
+        if key in visited:
+            continue
+        visited.add(key)
 
-            try:
-                page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
-            except Exception:
-                pass
-            page.wait_for_timeout(settle_ms)
-            _dismiss_cookie_banner(page)
+        try:
+            page.goto(target, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            log.debug("%s: hop to %s failed (%s)", company, target[:80], exc)
+            continue
+        visits += 1
 
-            _click_load_more(page, int(load_settings().get("playwright.max_pages", 5)), timeout_ms)
-            rows = _extract_job_rows(page)
-            if rows:
-                log.info("%s: found %s jobs after hop %s -> %s",
-                         company, len(rows), hop + 1, target[:90])
-                return PlaywrightResult(jobs=rows)
-            # No rows here, but this page may itself link deeper; loop again.
-            break
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 10000))
+        except Exception:
+            pass
+        page.wait_for_timeout(settle_ms)
+        _dismiss_cookie_banner(page)
 
-    return PlaywrightResult()
+        _click_load_more(page, max_pages, timeout_ms)
+        rows = _extract_job_rows(page) or _extract_jsonld_rows(page)
+        if len(rows) >= good_enough:
+            log.info("%s: found %s jobs at depth %s -> %s",
+                     company, len(rows), depth, target[:90])
+            return PlaywrightResult(jobs=rows)
+        if len(rows) > len(best.jobs):
+            best = PlaywrightResult(jobs=rows)
+
+        # This page may be search-driven: the list renders only after a
+        # keyword is submitted. Cheap relative to another navigation.
+        if search_each and time.monotonic() < deadline:
+            searched = _search_fallback(company, page, timeout_ms)
+            if searched.discovered_provider:
+                return searched
+            if len(searched.jobs) >= good_enough:
+                log.info("%s: found %s jobs via search at depth %s -> %s",
+                         company, len(searched.jobs), depth, target[:90])
+                return searched
+            if len(searched.jobs) > len(best.jobs):
+                best = searched
+
+        if depth < max_hops:
+            _enqueue(depth + 1)
+
+    if best.jobs:
+        log.info("%s: traversal settled on %s job(s)", company, len(best.jobs))
+    return best
 
 
 def _dismiss_cookie_banner(page) -> None:
@@ -834,7 +892,7 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
 
     # Rotate the fingerprint on retries: several sites reset the connection
     # for a repeat visitor with an identical UA/viewport.
-    user_agent = cfg.get("requests.user_agent")
+    user_agent = cfg.get("playwright.user_agent") or cfg.get("requests.user_agent")
     viewport = {"width": 1440, "height": 900}
     if attempt > 0:
         user_agent = random.choice(RETRY_USER_AGENTS)
@@ -879,6 +937,13 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         if clicks:
             log.debug("%s: expanded results with %s pagination action(s)", company, clicks)
 
+        good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
+        # Landing pages routinely show a handful of "featured" roles. Taking
+        # those and stopping would report 3 jobs for a company with
+        # thousands, so a small result is kept only as a fallback while the
+        # search and hop paths look for the real list.
+        best = PlaywrightResult()
+
         jobs = _extract_job_rows(page)
         if not jobs:
             # JSON-LD is often present even when the visible list is
@@ -887,25 +952,43 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
 
         log.debug("%s: Playwright extracted %s job rows", company, len(jobs))
 
-        if jobs:
+        if len(jobs) >= good_enough:
             return PlaywrightResult(jobs=jobs)
+        if len(jobs) > len(best.jobs):
+            best = PlaywrightResult(jobs=jobs)
 
-        # Nothing on the landing page: try the search box here first (cheap,
-        # no navigation), then hop to a dedicated job-list page.
+        # Try the search box here first (cheap, no navigation), then hop to a
+        # dedicated job-list page.
+        landing_url = page.url
         if search_enabled:
             result = _search_fallback(company, page, timeout_ms)
-            if result.jobs or result.discovered_provider:
+            if result.discovered_provider:
                 return result
+            if len(result.jobs) >= good_enough:
+                return result
+            if len(result.jobs) > len(best.jobs):
+                best = result
+
+        # A failed search leaves the page filtered or navigated elsewhere, so
+        # its links no longer describe the careers site. Traversal must start
+        # from the landing page it was meant to explore.
+        if page.url != landing_url:
+            try:
+                page.goto(landing_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                page.wait_for_timeout(settle_ms)
+                _dismiss_cookie_banner(page)
+            except Exception as exc:
+                log.debug("%s: could not return to %s (%s)", company, landing_url[:80], exc)
 
         hopped = _navigate_to_job_list(company, page, timeout_ms)
-        if hopped.jobs or hopped.discovered_provider:
+        if hopped.discovered_provider:
             return hopped
+        if len(hopped.jobs) >= good_enough:
+            return hopped
+        if len(hopped.jobs) > len(best.jobs):
+            best = hopped
 
-        # The hop may have landed on a search-driven page; try searching there.
-        if search_enabled:
-            return _search_fallback(company, page, timeout_ms)
-
-        return PlaywrightResult()
+        return best
 
     finally:
         for closeable in (page, context):
