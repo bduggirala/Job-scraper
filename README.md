@@ -197,6 +197,33 @@ Engineer` do not.
 DFW matching rejects same-named cities in other states, so `Westlake Village, CA`
 and `Richardson, UT` do not pass as DFW.
 
+### Careers-site traversal
+
+Most workbook rows give a branded careers page, not an ATS URL, and the real
+job list is often several links deep (`Career Areas` → `Jobs` → `Search Jobs`).
+The browser fallback explores best-first by link score, bounded three ways so
+one sprawling site cannot burn the per-company timeout:
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `playwright.max_hops` | 5 | How many links deep to follow |
+| `playwright.max_hop_visits` | 12 | Total pages rendered per company |
+| `playwright.hop_budget_seconds` | 100 | Wall-clock ceiling for traversal |
+| `playwright.search_at_each_hop` | true | Try each page's own search box, not just the last |
+| `playwright.hop_good_enough_rows` | 10 | Rows that count as a real list, not "featured" roles |
+
+The last one matters: landing pages routinely show three featured roles.
+Returning those would report 3 jobs for a company with thousands, so a small
+result is kept only as a fallback while the search continues.
+
+### Two User-Agents, deliberately
+
+`requests.user_agent` is a bare `Mozilla/5.0` because a full Chrome UA trips
+AWS WAF's bot captcha on several iCIMS tenants. `playwright.user_agent` is a
+full Chrome string because Cloudflare rejects the bare one outright in a real
+browser context. Neither value works for both paths — changing either to match
+the other silently costs coverage.
+
 ---
 
 ## Reliability
@@ -218,9 +245,23 @@ company_job_scraper/
 ├── config/          settings.yaml, companies.xlsx
 ├── ats/             detector, resolver, url_repair, router + 13 collectors
 ├── browser/         playwright_scraper.py (search, hop, stealth, discovery)
-├── tools/           probe_site.py (diagnostic, not part of the pipeline)
+├── tools/           probe_site.py, canary.py (diagnostics, not the pipeline)
+├── tests/           pytest suite (normalize, filters, extraction, traversal)
 ├── normalize.py filters.py deduplicate.py enrich.py job_identity.py
 ├── database.py logger.py http_client.py settings.py export_ats_urls.py
 ├── pipeline.py main.py
 └── requirements.txt
 ```
+
+## Before trusting a full run
+
+A full run takes ~15 minutes. `tools/canary.py` checks one company per
+collection path in about two minutes and exits non-zero if any path returns
+zero jobs — it catches the case where a whole provider (or the browser path)
+breaks silently:
+
+```bash
+python tools/canary.py
+```
+
+Unit tests: `python -m pytest tests/ -v`
