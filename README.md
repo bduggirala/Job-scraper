@@ -265,3 +265,23 @@ python tools/canary.py
 ```
 
 Unit tests: `python -m pytest tests/ -v`
+
+## Finding missing ATS URLs
+
+`tools/find_ats_urls.py` crawls a company's careers page and corporate
+homepage looking for a real ATS, verifies every candidate by driving it
+through the actual collector, and records what it proves:
+
+```bash
+python tools/find_ats_urls.py --only-failures
+```
+
+Verified findings land in `Suggested ATS URL` / `Suggested Jobs Page`, with a
+`Discovery Notes` column explaining each. Anything it cannot verify is written
+as `NOT FOUND` — deliberately, so those can be fixed by hand rather than
+filled with a guess. Your existing `ATS URL` and `Live Jobs Page` values are
+never overwritten unless you pass `--apply` (and even then, only for rows
+already marked `Data Retrieved = FALSE`). Blank `ATS URL` cells are filled
+directly, as they already are during a normal run.
+
+Do not run it while a full run is in progress — both write the workbook.
