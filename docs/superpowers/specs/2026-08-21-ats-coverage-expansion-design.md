@@ -146,6 +146,52 @@ touch-points, integrated and de-conflicted in the final pass.
 - Dry-run provider summary shows named platforms in place of `unknown` for the
   detection-only additions.
 
+## Diagnostic outcome (2026-08-21) & revised worklist
+
+The Step-1 sweep (`output/ats_diagnostic.csv`) reshaped the plan:
+
+- **The dominant blocker is a WAF/UA 403 during resolution**, not missing
+  fingerprints. The bare `Mozilla/5.0` HTTP UA is 403-blocked on ~9 sites, so
+  resolution never sees the fingerprint. This adds **Prong 0**: on a 403 during
+  resolution, retry that single GET once with a browser UA — scoped per-request
+  so iCIMS keeps the bare UA (README documents that a Chrome UA trips AWS WAF
+  captcha on some iCIMS tenants). A test must assert iCIMS resolution still uses
+  the bare UA.
+- **No company in the 42 emits `JobPosting` JSON-LD.** Prong 2 helps none of
+  this cohort; it is still built as future-proofing for later additions, wired
+  between resolution and Playwright.
+
+**Prong 3 — collectors to build (fetchable endpoints confirmed):**
+
+| Collector | Verify against | Endpoint hint |
+|-----------|----------------|---------------|
+| Amazon.jobs | Amazon | `https://www.amazon.jobs/en/search.json` (public JSON, paginate by `offset`/`hits`) |
+| Jobvite | FirstCash Holdings | `jobs.jobvite.com/firstcash-holdings-inc/` (per-tenant feed) |
+| Cornerstone (CSOD) | JPS Health Network | `{tenant}.csod.com` careersite API (discover tenant) |
+| Dayforce (Ceridian) | FinThrive | `{tenant}.dayforcehcm.com/CandidatePortal` JSON |
+| Jibe (iCIMS) | Concentra | `concentrahealthservices.jibeapply.com` job search API |
+
+**Detection-gap — existing collectors, need routing fingerprints (no new collector):**
+Cardinal Health → Radancy (`jobs.cardinalhealth.com/search-jobs/results`); Parkland
+(`jobs.parklandcareers.com`, public `/api/mcp/jobs`) & FedEx → Phenom; Lockheed
+Martin → Eightfold; Deloitte (`apply.deloitte.com`) → Avature; Aveanna
+(`jobs.aveanna.com`) → Workday; Boingo → Greenhouse (`boards-api.greenhouse.io/v1/boards/boingo`).
+
+**Deferred:** Oracle SelectMinds (Energy Transfer is also Phenom, covered by the
+Phenom fix). **Out of scope (stay on Playwright):** custom SPAs and hard-WAF
+hosts with no server-side fingerprint and no public endpoint — Goldman, Google,
+IBM, HCA, TCS, Kimberly-Clark, Capgemini, ICE, Slalom, Ryan, CHRISTUS, CBRE,
+Globe Life, Addus, Texas Oncology, NTT DATA, Ericsson, Cognizant, KPMG, Infosys,
+American Airlines. `FM`'s host is dead (NXDOMAIN) — needs a separate live-host
+lookup.
+
+**Isolation for parallel build:** each collector agent creates only its own
+`ats/<provider>.py` + `tests/test_<provider>.py` and verifies by constructing
+the collector directly against the real tenant (as `tests/test_radancy.py`
+does). Agents do **not** edit `ats/detector.py` or `ats/router.py`; they return
+the exact snippets, which are applied in a single serial integration pass to
+avoid merge conflicts on those shared files.
+
 ## Risks
 
 - **Public APIs change / rate-limit.** Mitigated by `CollectorUnavailable`
