@@ -49,10 +49,14 @@ class PhenomCollector(ATSCollector):
             raise CollectorUnavailable("Unparseable Phenom URL")
 
         segments = [s for s in parts.path.split("/") if s]
-        # Keep a leading locale pair such as /us/en, drop deeper paths.
+        # Keep the leading locale prefix and drop deeper paths. Phenom sites
+        # use both country codes (/us/en) and region words (/global/en on
+        # careers.rtx.com) - matching only two-letter codes dropped the
+        # /global part and requested /search-results from the wrong root,
+        # which is why RTX, Collins Aerospace and BCG all returned nothing.
         locale: list[str] = []
         for segment in segments[:2]:
-            if re.fullmatch(r"[a-z]{2}", segment, re.I):
+            if re.fullmatch(r"[a-z]{2}|global|intl|international", segment, re.I):
                 locale.append(segment)
             else:
                 break

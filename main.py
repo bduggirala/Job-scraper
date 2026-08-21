@@ -12,6 +12,8 @@ writes its own outputs, and deduplicates only against itself.
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import sys
 from pathlib import Path
 
@@ -227,4 +229,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+
+    # A Playwright worker can wedge inside its own event loop with no timeout.
+    # The pipeline already records such a company as a Timeout failure and
+    # moves on, but the thread itself survives - and ThreadPoolExecutor threads
+    # are non-daemon, so the interpreter would refuse to exit while one lingers.
+    # All outputs are flushed by this point, so leave abruptly rather than hang.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logging.shutdown()
+    os._exit(exit_code)

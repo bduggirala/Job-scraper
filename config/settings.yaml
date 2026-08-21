@@ -108,6 +108,21 @@ concurrency:
   http_workers: 10
   playwright_workers: 3
 
+  # Hard wall-clock budget per phase. Playwright can block inside its own
+  # event loop with no timeout of its own (a page whose overlay intercepts
+  # every click will spin in an actionability retry loop forever), which
+  # would otherwise stall the entire run. Anything unfinished when the
+  # budget expires is recorded as a Timeout failure and the run continues.
+  # Per-company limits, measured from when a company actually starts (not
+  # when it was queued). This is the bound that matters: without it, one
+  # wedged page costs the entire phase budget.
+  api_company_timeout_seconds: 300      # 5 min
+  browser_company_timeout_seconds: 240  # 4 min
+
+  # Phase-wide backstops.
+  api_phase_timeout_seconds: 1800      # 30 min
+  browser_phase_timeout_seconds: 2400  # 40 min
+
 # --- Storage / output ------------------------------------------------------
 database_path: data/jobs.db
 

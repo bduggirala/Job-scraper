@@ -17,6 +17,7 @@ tells the router to try page-level resolution and then Playwright.
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -358,6 +359,19 @@ def _is_plausible_job_url(url: str) -> bool:
     return True
 
 
+def _clean_extracted_url(raw: str) -> str:
+    """Tidy a URL pulled straight out of page HTML.
+
+    Entities must be unescaped: a URL scraped from markup arrives as
+    ``...External_Careers&amp;foo=1``, and feeding that to the collector
+    produces a 404 (observed on Genpact and PepsiCo, both of which failed
+    with a literal ``&amp;`` in the requested URL).
+    """
+    cleaned = html.unescape(raw).strip()
+    # Trailing punctuation from the surrounding markup.
+    return cleaned.rstrip("\\\"'),;>")
+
+
 def extract_embedded_ats_url(html_text: str, provider: str) -> str | None:
     """Pull the concrete ATS URL a branded page embeds for ``provider``.
 
@@ -392,7 +406,7 @@ def extract_embedded_ats_url(html_text: str, provider: str) -> str | None:
         return None
 
     for match in re.finditer(pattern, html_text, re.I):
-        candidate = match.group(0).rstrip("\\\"'),;")
+        candidate = _clean_extracted_url(match.group(0))
         if candidate and _is_plausible_job_url(candidate):
             return candidate
     return None
@@ -432,7 +446,7 @@ def extract_all_embedded_ats_urls(html_text: str, provider: str) -> list[str]:
 
     seen: list[str] = []
     for match in re.finditer(pattern, html_text, re.I):
-        candidate = match.group(0).rstrip("\\\"'),;")
+        candidate = _clean_extracted_url(match.group(0))
         if candidate and _is_plausible_job_url(candidate) and candidate not in seen:
             seen.append(candidate)
     return seen

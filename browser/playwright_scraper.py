@@ -42,6 +42,7 @@ from ats.detector import (
     detect_from_html,
     extract_all_embedded_ats_urls,
 )
+from ats.html_utils import iter_jsonld_jobs, jsonld_location
 from logger import get_logger
 from settings import load_settings
 
@@ -159,6 +160,38 @@ _NAV_NOISE = {
     "sign in", "login", "home", "view all jobs", "see all jobs", "more",
     "all jobs", "browse jobs", "job search",
 }
+
+# Call-to-action phrases that appear *inside* an anchor's text. The broadened
+# job-link selectors otherwise promote site navigation into "jobs" - observed
+# live: CBRE returned "Join Our Community", Globe Life "Search Jobs", Liberty
+# Mutual "Current Employees" and L3Harris "HIRING EVENT" as their only
+# results. A company reporting one junk row is worse than a clean failure,
+# because it looks like success.
+_NAV_PHRASES = (
+    "join our", "join the", "search career", "search job", "search open",
+    "view open", "view opportunit", "view job", "browse job", "explore job",
+    "explore opportunit", "current employee", "hiring event", "job alert",
+    "create profile", "create account", "sign up", "talent network",
+    "talent community", "life at", "why work", "our culture", "benefits",
+    "meet our", "learn about", "see open", "find your", "start your",
+    "all locations", "all departments", "view all", "see all", "show all",
+    "career website", "career site", "jobs by", "job openings", "saved job",
+    "view more", "load more", "show more", "our jobs", "job categor",
+    "search our", "back to", "go to", "read our", "follow us",
+)
+
+
+def _is_nav_text(title: str) -> bool:
+    """True when anchor text reads as site navigation rather than a posting."""
+    lowered = title.strip().lower()
+    if lowered in _NAV_NOISE:
+        return True
+    if any(phrase in lowered for phrase in _NAV_PHRASES):
+        return True
+    # Short all-caps CTAs ("VIEW OPPORTUNITIES", "HIRING EVENT").
+    if title.isupper() and len(title.split()) <= 3:
+        return True
+    return False
 
 # Extracts (title, href, nearby-location) triples from the rendered DOM.
 _EXTRACT_JS = """
@@ -348,7 +381,9 @@ def _is_job_row(title: str | None, href: str | None) -> bool:
     if not title or not href:
         return False
     lowered = title.strip().lower()
-    if lowered in _NAV_NOISE or len(lowered) < 3 or len(lowered) > 200:
+    if len(lowered) < 6 or len(lowered) > 250:
+        return False
+    if _is_nav_text(title):
         return False
     if href.startswith(("#", "javascript:", "mailto:", "tel:")):
         return False
@@ -387,6 +422,42 @@ def _click_load_more(page, max_clicks: int, timeout_ms: int) -> int:
             except Exception:
                 break
     return clicks
+
+
+def _extract_jsonld_rows(page) -> list[dict[str, Any]]:
+    """Read schema.org JobPosting data embedded in the rendered page.
+
+    Many career sites emit JSON-LD for SEO even when their visible job list is
+    client-rendered behind a search box - and unlike scraped anchors, JSON-LD
+    carries a real ``datePosted``, which the freshness filter needs.
+    """
+    try:
+        html_text = page.content()
+    except Exception:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for node in iter_jsonld_jobs(html_text):
+        title = _clean(node.get("title"))
+        url = node.get("url") or node.get("@id")
+        if not title or not url:
+            continue
+        absolute = urljoin(page.url, str(url))
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        rows.append({
+            "title": title,
+            "location": jsonld_location(node),
+            "job_url": absolute,
+            "date_posted": node.get("datePosted"),
+        })
+
+    if rows:
+        log.debug("Extracted %s job(s) from embedded JSON-LD", len(rows))
+    return rows
 
 
 def _extract_job_rows(page) -> list[dict[str, Any]]:
@@ -785,6 +856,11 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
             log.debug("%s: expanded results with %s pagination action(s)", company, clicks)
 
         jobs = _extract_job_rows(page)
+        if not jobs:
+            # JSON-LD is often present even when the visible list is
+            # client-rendered, and it carries real posting dates.
+            jobs = _extract_jsonld_rows(page)
+
         log.debug("%s: Playwright extracted %s job rows", company, len(jobs))
 
         if jobs:

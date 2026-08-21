@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -222,6 +223,120 @@ def _teardown_pool_browsers(pool: ThreadPoolExecutor, workers: int, timeout: flo
             log.debug("Browser teardown task failed: %s", exc)
 
 
+def _run_pool(
+    runner: Callable[[RoutePlan], CompanyResult],
+    plans: list[RoutePlan],
+    *,
+    workers: int,
+    prefix: str,
+    budget_seconds: float,
+    company_timeout: float = 0.0,
+    teardown_browsers: bool = False,
+) -> list[CompanyResult]:
+    """Run plans in a thread pool under per-company and per-phase time limits.
+
+    A single wedged company must never stall the whole run. Playwright can
+    block inside its own event loop with no timeout of its own - observed
+    live: a career page whose overlay intercepted every click left one worker
+    spinning in an actionability retry loop forever, and the main thread sat
+    in ``as_completed`` indefinitely with ~100 orphaned Chromium processes.
+
+    Two bounds, because one is not enough:
+
+    * ``company_timeout`` is measured from when a company actually *starts*
+      (not when it was submitted - with 3 workers and 70 companies most
+      futures sit queued for a long time, and timing those from submission
+      would fail them spuriously). This is what stops one bad page costing
+      the whole phase.
+    * ``budget_seconds`` caps the phase overall as a backstop.
+
+    Anything unfinished at either bound is recorded as a Timeout failure, and
+    the pool is abandoned without waiting (``shutdown(wait=False)``) so a
+    stuck worker cannot block the process either.
+    """
+    results: list[CompanyResult] = []
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix)
+
+    started: dict[str, float] = {}
+    started_lock = threading.Lock()
+
+    def _tracked(plan: RoutePlan) -> CompanyResult:
+        with started_lock:
+            started[plan.company] = time.monotonic()
+        return runner(plan)
+
+    futures = {pool.submit(_tracked, plan): plan for plan in plans}
+    pending = set(futures)
+    deadline = time.monotonic() + budget_seconds
+    timed_out: set = set()
+
+    while pending and time.monotonic() < deadline:
+        finished, pending = wait(pending, timeout=5.0, return_when=FIRST_COMPLETED)
+
+        for future in finished:
+            plan = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:  # pragma: no cover - runner is defensive
+                log.error("%s: unexpected executor error: %s", plan.company, exc)
+                results.append(CompanyResult(
+                    company=plan.company, jobs=[], plan=plan, success=False,
+                    error_type=type(exc).__name__, error_message=str(exc),
+                ))
+
+        if not company_timeout:
+            continue
+
+        now = time.monotonic()
+        overdue = set()
+        with started_lock:
+            for future in pending:
+                begin = started.get(futures[future].company)
+                if begin is not None and (now - begin) > company_timeout:
+                    overdue.add(future)
+
+        for future in overdue:
+            plan = futures[future]
+            log.error("%s: exceeded the %.0fs per-company limit; abandoning it",
+                      plan.company, company_timeout)
+            results.append(CompanyResult(
+                company=plan.company, jobs=[], plan=plan, success=False,
+                error_type="Timeout",
+                error_message=f"Exceeded the {company_timeout:.0f}s per-company limit",
+            ))
+        pending -= overdue
+        timed_out |= overdue
+
+    done = set(futures) - pending - timed_out
+    not_done = pending
+
+    if not_done:
+        log.error(
+            "%s phase hit its %.0fs budget with %s company(ies) unfinished; "
+            "recording them as timeouts and moving on",
+            prefix, budget_seconds, len(not_done),
+        )
+        for future in not_done:
+            plan = futures[future]
+            future.cancel()
+            log.error("%s: timed out after %.0fs", plan.company, budget_seconds)
+            results.append(CompanyResult(
+                company=plan.company, jobs=[], plan=plan, success=False,
+                error_type="Timeout",
+                error_message=f"Exceeded the {prefix} phase budget of {budget_seconds:.0f}s",
+            ))
+
+    if teardown_browsers and not not_done and not timed_out:
+        # Only safe when every worker is idle. A wedged worker cannot run a
+        # teardown task, and waiting on one would reintroduce the hang - so
+        # when anything timed out, leave the browsers to the process exit.
+        _teardown_pool_browsers(pool, workers)
+
+    # Never wait: a stuck worker would block here indefinitely.
+    pool.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
 def execute_plans(
     plans: Iterable[RoutePlan],
     settings: Settings | None = None,
@@ -251,38 +366,19 @@ def execute_plans(
     # API companies first. Some will fall back to the browser internally; that
     # is bounded by the HTTP pool size, which is acceptable for the tail.
     if api_plans:
-        with ThreadPoolExecutor(max_workers=http_workers, thread_name_prefix="api") as pool:
-            futures = {pool.submit(_run, plan): plan for plan in api_plans}
-            for future in as_completed(futures):
-                plan = futures[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:  # pragma: no cover - _run is defensive
-                    log.error("%s: unexpected executor error: %s", plan.company, exc)
-                    results.append(CompanyResult(
-                        company=plan.company, jobs=[], plan=plan, success=False,
-                        error_type=type(exc).__name__, error_message=str(exc),
-                    ))
+        results.extend(_run_pool(
+            _run, api_plans, workers=http_workers, prefix="api",
+            budget_seconds=float(cfg.get("concurrency.api_phase_timeout_seconds", 1800)),
+            company_timeout=float(cfg.get("concurrency.api_company_timeout_seconds", 300)),
+        ))
 
     if browser_plans and playwright_enabled:
-        with ThreadPoolExecutor(max_workers=browser_workers, thread_name_prefix="browser") as pool:
-            futures = {pool.submit(_run, plan): plan for plan in browser_plans}
-            for future in as_completed(futures):
-                plan = futures[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:  # pragma: no cover
-                    log.error("%s: unexpected executor error: %s", plan.company, exc)
-                    results.append(CompanyResult(
-                        company=plan.company, jobs=[], plan=plan, success=False,
-                        error_type=type(exc).__name__, error_message=str(exc),
-                    ))
-
-            # Each worker must close its own browser: Playwright's sync
-            # objects are thread-affine and closing them from the main thread
-            # deadlocks. The barrier guarantees every worker thread picks up
-            # exactly one teardown task rather than one thread taking several.
-            _teardown_pool_browsers(pool, browser_workers)
+        results.extend(_run_pool(
+            _run, browser_plans, workers=browser_workers, prefix="browser",
+            budget_seconds=float(cfg.get("concurrency.browser_phase_timeout_seconds", 2400)),
+            company_timeout=float(cfg.get("concurrency.browser_company_timeout_seconds", 240)),
+            teardown_browsers=True,
+        ))
     elif browser_plans:
         for plan in browser_plans:
             results.append(CompanyResult(
