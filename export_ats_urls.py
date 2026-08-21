@@ -17,6 +17,10 @@ from typing import Any
 
 from openpyxl import load_workbook
 
+# Safe only because ats/discovery.py keeps its Playwright imports lazy (inside
+# functions) - importing this module at module load time must never drag the
+# browser stack into a plain "write the spreadsheet" code path.
+from ats.discovery import NOT_FOUND, Discovery
 from logger import get_logger
 
 log = get_logger("export_ats_urls")
@@ -192,3 +196,118 @@ def write_run_status(
     except Exception as exc:
         log.warning("Could not write run status back to %s: %s", path, exc)
         return {"updated": 0, "backup_path": None}
+
+
+def write_suggestions(
+    companies_path: Path | str,
+    discoveries: list[Discovery],
+    *,
+    apply: bool = False,
+    company_column: str = "Company",
+    ats_url_column: str = "ATS URL",
+    jobs_page_column: str = "Live Jobs Page (if ATS URL unavailable)",
+    status_column: str = "Data Retrieved",
+) -> dict[str, Any]:
+    """Record discovery results without destroying hand-curated values.
+
+    Suggestions go to three new columns by default. The workbook's own
+    ``ATS URL`` / ``Live Jobs Page`` values were curated by hand, and silently
+    overwriting them would be hostile - a wrong overwrite is far harder to
+    notice than an extra column.
+
+    Two exceptions write the real columns:
+
+    * a **blank** ``ATS URL`` cell is filled with a verified URL, matching
+      :func:`write_discovered_urls`' established behaviour;
+    * ``apply=True`` promotes suggestions, but only for rows whose
+      ``Data Retrieved`` is ``FALSE`` - a value already failing cannot be made
+      worse by a verified one.
+
+    Returns ``{"updated": int, "applied": int, "backup_path": Path | None}``.
+    """
+    path = Path(companies_path)
+    if not discoveries or not path.exists():
+        return {"updated": 0, "applied": 0, "backup_path": None}
+
+    by_company = {d.company: d for d in discoveries}
+
+    try:
+        workbook = load_workbook(path)
+        sheet = workbook.active
+
+        header_row = next(sheet.iter_rows(min_row=1, max_row=1))
+        headers = {str(cell.value).strip(): cell.column for cell in header_row if cell.value}
+
+        company_col = headers.get(company_column)
+        if not company_col:
+            log.warning("Workbook %s missing %s column; skipping suggestions",
+                        path.name, company_column)
+            return {"updated": 0, "applied": 0, "backup_path": None}
+
+        def _column(name: str) -> int:
+            existing = headers.get(name)
+            if existing:
+                return existing
+            index = sheet.max_column + 1
+            sheet.cell(row=1, column=index, value=name)
+            headers[name] = index
+            return index
+
+        suggested_ats_col = _column("Suggested ATS URL")
+        suggested_page_col = _column("Suggested Jobs Page")
+        notes_col = _column("Discovery Notes")
+
+        ats_col = headers.get(ats_url_column)
+        page_col = headers.get(jobs_page_column)
+        status_col = headers.get(status_column)
+
+        updated = applied = 0
+        for row in sheet.iter_rows(min_row=2):
+            company_cell = row[company_col - 1]
+            name = str(company_cell.value).strip() if company_cell.value else ""
+            found = by_company.get(name)
+            if not name or found is None:
+                continue
+
+            line = company_cell.row
+            sheet.cell(row=line, column=suggested_ats_col,
+                       value=found.ats_url or NOT_FOUND)
+            sheet.cell(row=line, column=suggested_page_col,
+                       value=found.jobs_page or NOT_FOUND)
+            sheet.cell(row=line, column=notes_col,
+                       value=f"{found.method}: {found.note}" if found.note else found.method)
+            updated += 1
+
+            if not found.jobs_found:
+                continue
+
+            # Exception 1: fill a blank ATS URL cell.
+            if found.ats_url and ats_col and _blank(row[ats_col - 1].value):
+                row[ats_col - 1].value = found.ats_url
+                applied += 1
+                continue
+
+            if not apply:
+                continue
+
+            # Exception 2: --apply, restricted to rows already failing.
+            failing = status_col and str(row[status_col - 1].value).strip().upper() == "FALSE"
+            if not failing:
+                continue
+            if found.ats_url and ats_col:
+                row[ats_col - 1].value = found.ats_url
+                applied += 1
+            elif found.jobs_page and page_col:
+                row[page_col - 1].value = found.jobs_page
+                applied += 1
+
+        backup_path = _backup_path(path)
+        shutil.copy2(path, backup_path)
+        workbook.save(path)
+        log.info("Wrote %s suggestion row(s), applied %s, to %s (backup: %s)",
+                 updated, applied, path.name, backup_path.name)
+        return {"updated": updated, "applied": applied, "backup_path": backup_path}
+
+    except Exception as exc:
+        log.warning("Could not write suggestions to %s: %s", path, exc)
+        return {"updated": 0, "applied": 0, "backup_path": None}

@@ -379,7 +379,11 @@ _EMBEDDED_URL_PATTERNS = {
     ASHBY: r"https?://jobs\.ashbyhq\.com/[\w-]+",
     SMARTRECRUITERS: r"https?://(?:careers|jobs)\.smartrecruiters\.com/[\w-]+",
     ICIMS: r"https?://[\w.-]*\.icims\.com/[^\s\"'<>\\]*",
-    TALEO: r"https?://[\w.-]*\.taleo\.net/[^\s\"'<>\\]*",
+    # Branded Oracle Cloud Recruiting sites (jobs.nokia.com/en/sites/CX_1/jobs)
+    # never mention taleo.net; they embed their API host instead. Extracting
+    # that host is what lets TaleoCollector's Oracle Cloud path drive them -
+    # confirmed against Nokia, which returns 575 jobs this way.
+    TALEO: r"https?://[\w.-]*\.(?:taleo\.net|oraclecloud\.com)(?::\d+)?/[^\s\"'<>\\]*",
     AVATURE: r"https?://[\w.-]*\.avature\.net/[^\s\"'<>\\]*",
     UKG: r"https?://(?:recruiting\.ultipro\.com|[\w.-]+\.ukg\.net)/[^\s\"'<>\\]*",
     PAYLOCITY: r"https?://recruiting\.paylocity\.com/[^\s\"'<>\\]*",
