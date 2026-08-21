@@ -1,4 +1,4 @@
-"""Filtering: target roles, DFW/remote locations, and the 72-hour window.
+"""Filtering: target roles, DFW/remote locations, and the freshness window.
 
 All three filters are pure functions over normalized records so they can be
 tested and reordered independently.
@@ -13,9 +13,11 @@ from typing import Any, Callable, Iterable
 from normalize import parse_date
 from settings import Settings, load_settings
 
-# Date filter status values.
-WITHIN_WINDOW = "within_72_hours"
-OUTSIDE_WINDOW = "older_than_72_hours"
+# Date filter status values. Deliberately window-agnostic: the actual cutoff
+# comes from settings.yaml's hours_old, so baking "72" into the label would
+# misstate the data whenever that value changes.
+WITHIN_WINDOW = "within_window"
+OUTSIDE_WINDOW = "older_than_window"
 DATE_UNAVAILABLE = "date_unavailable"
 
 # Title segments are split on these so "Software Engineer, Data Engineering"
@@ -209,7 +211,7 @@ def apply_filters(
     Returns:
         ``{"jobs": [...], "counts": {...}}`` where ``jobs`` are records that
         passed role + location filters and were not classified as
-        ``older_than_72_hours``. Records with an unknown date are kept and
+        ``older_than_window``. Records with an unknown date are kept and
         flagged via ``date_filter_status``.
     """
     cfg = settings or load_settings()

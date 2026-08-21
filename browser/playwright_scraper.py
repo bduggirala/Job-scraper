@@ -900,7 +900,7 @@ def scrape_with_playwright(company: str, url: str) -> PlaywrightResult:
         ``{"title", "location", "job_url", "date_posted"}`` dicts - the router
         normalizes them. ``date_posted`` is not extracted because rendered
         career pages rarely expose a trustworthy date, and inventing one would
-        corrupt the 72-hour filter.
+        corrupt the freshness filter.
 
         When the initial load finds nothing, a single search-fallback attempt
         runs (see :func:`_search_fallback`): it also watches network traffic

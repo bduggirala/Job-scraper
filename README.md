@@ -42,7 +42,7 @@ companies.xlsx
                                         ▼
                               DFW / remote filter
                                         ▼
-                                 72-hour filter
+                              freshness filter
                                         ▼
                           internal deduplication
                                         ▼
@@ -158,7 +158,7 @@ remote, description, ats_provider, scraping_method, date_filter_status,
 location_match_type, first_seen, is_new
 ```
 
-`date_filter_status` is `within_72_hours`, `older_than_72_hours`, or
+`date_filter_status` is `within_window`, `older_than_window`, or
 `date_unavailable`. Jobs with no reliable posting date are **kept and flagged**,
 never silently discarded — browser-scraped pages rarely expose a trustworthy
 date, and inventing one would corrupt the freshness filter.

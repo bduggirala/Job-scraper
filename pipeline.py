@@ -75,6 +75,7 @@ class RunSummary:
     jobs_removed: int = 0
     discovered_ats_urls: int = 0
     ats_urls_written: int = 0
+    hours_old: int = 72
     provider_counts: dict[str, int] = field(default_factory=dict)
 
     def render(self) -> str:
@@ -90,7 +91,7 @@ class RunSummary:
             f"Jobs collected:         {self.jobs_collected:,}",
             f"Target data jobs:       {self.target_role_jobs:,}",
             f"DFW/Remote matches:     {self.location_matches:,}",
-            f"Within last 72 hours:   {self.within_window:,}",
+            f"Within last {self.hours_old} hours:  {self.within_window:,}",
             f"Date unavailable:       {self.date_unavailable:,}",
             f"Duplicates removed:     {self.duplicates_removed:,}",
             f"Newly discovered:       {self.new_jobs:,}",
@@ -495,7 +496,9 @@ def run(
 
     results = execute_plans(plans, cfg)
 
-    summary = RunSummary(companies_scanned=len(plans))
+    summary = RunSummary(
+        companies_scanned=len(plans), hours_old=int(cfg.get("hours_old", 72))
+    )
     all_jobs: list[dict[str, Any]] = []
 
     for result in results:
