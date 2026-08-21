@@ -1,0 +1,32 @@
+# --- Python ---
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Runtime state (regenerated every run; never useful in version control) ---
+data/
+logs/
+output/
+
+# --- Input workbook -----------------------------------------------------
+# config/companies.xlsx holds the curated company list, and the pipeline
+# writes discovered ATS URLs back into it. It is treated as private data by
+# default; config/companies.example.xlsx documents the expected format.
+# Delete the line below if you intend to publish your list.
+config/companies.xlsx
+config/companies.xlsx.bak-*
+config/*.bak-*
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

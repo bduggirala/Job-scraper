@@ -1,0 +1,123 @@
+# ---------------------------------------------------------------------------
+# Company ATS Scraper configuration
+#
+# This pipeline is INDEPENDENT of the JobSpy pipeline. Nothing here is shared
+# with, merged into, or deduplicated against JobSpy output.
+# ---------------------------------------------------------------------------
+
+# Path to the input workbook. Relative paths resolve against the project root.
+input_excel: config/companies.xlsx
+input_sheet: null          # null = first sheet
+
+# Column names expected in the workbook.
+columns:
+  company: Company
+  ats_url: ATS URL
+  live_jobs_url: Live Jobs Page (if ATS URL unavailable)
+
+# --- Date filtering --------------------------------------------------------
+hours_old: 72
+
+# --- Location filtering ----------------------------------------------------
+locations:
+  - Dallas
+  - Irving
+  - Plano
+  - Richardson
+  - Frisco
+  - Addison
+  - Coppell
+  - Farmers Branch
+  - Westlake
+  - Fort Worth
+  - DFW
+  - Dallas-Fort Worth
+  - Grapevine
+  - Las Colinas
+
+include_remote: true
+
+# A DFW city token only counts if the location string does not also name a
+# different U.S. state (protects against "Westlake Village, CA",
+# "Richardson, UT", etc.).
+enforce_texas_for_city_match: true
+
+# --- Target roles ----------------------------------------------------------
+# Titles are split on separators (, - | / etc.) and each segment is tested.
+# A job matches if ANY segment matches a target pattern and that same segment
+# does not match an exclude pattern.
+target_role_patterns:
+  - '\bdata\s+engineer'
+  - '\bdata\s+engineering\b'
+  - '\bdata\s+platform\s+engineer'
+  - '\bsnowflake\s+(engineer|developer)'
+  - '\bdatabricks\s+(engineer|developer)'
+  - '\betl\s+(developer|engineer)'
+  - '\bbig\s+data\s+engineer'
+  - '\banalytics\s+engineer'
+
+# Segments matching these are rejected even if a target pattern also matched.
+exclude_role_patterns:
+  - '\bdata\s+scientist'
+  - '\bmachine\s+learning\s+engineer'
+  - '\bml\s+engineer'
+  - '\b(intern|internship|co-?op)\b'
+
+# --- Playwright fallback ---------------------------------------------------
+playwright:
+  enabled: true
+  headless: true
+  timeout_ms: 30000
+  max_pages: 5              # pagination / "Load More" click limit per company
+  wait_after_load_ms: 2500  # settle time for client-side rendering
+
+  # Navigation failures are usually transient (Chromium's DNS resolver
+  # buckling under concurrent browser instances, or a site resetting a
+  # repeat fingerprint) rather than a genuinely dead site. Retries use a
+  # fresh context with a rotated user-agent/viewport.
+  nav_retries: 3
+  nav_retry_backoff_ms: 2000
+
+  # Patch the JS fingerprints headless Chromium leaks (navigator.webdriver,
+  # missing plugins, WebGL vendor). Required to get past Cloudflare-style
+  # challenges on some career sites.
+  stealth: true
+
+  # Triggered only when the first page load finds zero job rows. Types one
+  # search term into a detected keyword input, submits, and re-extracts -
+  # while also watching network traffic for a real ATS endpoint the static
+  # HTML resolver couldn't see (many custom career pages only call their ATS
+  # once you interact with them).
+  search_fallback:
+    enabled: true
+    search_term: "Data Engineer"
+    max_wait_ms: 6000
+
+# --- HTTP behaviour --------------------------------------------------------
+requests:
+  timeout_seconds: 30
+  retries: 3
+  backoff_factor: 2
+  user_agent: >-
+    Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+    (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36
+  max_pages_per_company: 25   # pagination guard for API collectors
+
+# --- Concurrency -----------------------------------------------------------
+concurrency:
+  http_workers: 10
+  playwright_workers: 3
+
+# --- Storage / output ------------------------------------------------------
+database_path: data/jobs.db
+
+output:
+  directory: output
+  csv: company_jobs.csv
+  json: company_jobs.json
+  failures: scraper_failures.csv
+  raw_csv: company_jobs_raw.csv    # only written with --save-raw
+
+logging:
+  file: logs/scraper.log
+  level: INFO
