@@ -72,6 +72,7 @@ class SuccessFactorsCollector(ATSCollector):
                     self.record(
                         title=link["title"],
                         location=link.get("location"),
+                        date_posted=link.get("date_posted"),
                         job_url=link["job_url"],
                     )
                     for link in extract_job_links(html_text, search_url, selector='a[href*="/job/"]')

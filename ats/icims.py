@@ -70,6 +70,7 @@ class ICIMSCollector(ATSCollector):
                         self.record(
                             title=link["title"],
                             location=link.get("location"),
+                            date_posted=link.get("date_posted"),
                             job_url=link["job_url"],
                         )
                     )
@@ -80,6 +81,7 @@ class ICIMSCollector(ATSCollector):
                         self.record(
                             title=link["title"],
                             location=link.get("location"),
+                            date_posted=link.get("date_posted"),
                             job_url=link["job_url"],
                         )
                     )

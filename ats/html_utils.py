@@ -65,8 +65,9 @@ def extract_job_links(
         selector: optional CSS selector to narrow the search.
 
     Returns:
-        A list of ``{"title", "job_url", "location"}`` dicts. ``location`` is
-        None unless a sibling element clearly carries it.
+        A list of ``{"title", "job_url", "location", "date_posted"}`` dicts.
+        ``location`` and ``date_posted`` are None unless a sibling element
+        clearly carries them.
     """
     soup = make_soup(html_text)
     anchors = soup.select(selector) if selector else soup.find_all("a", href=True)
@@ -93,6 +94,7 @@ def extract_job_links(
             "title": title,
             "job_url": absolute,
             "location": _nearby_location(anchor),
+            "date_posted": _nearby_date(anchor),
         })
 
     return results
@@ -114,6 +116,33 @@ def _nearby_location(anchor: Any) -> str | None:
         if node:
             text = clean_text(node.get_text(" ", strip=True))
             if text:
+                return text
+        container = container.parent
+    return None
+
+
+def _nearby_date(anchor: Any) -> str | None:
+    """Look for a posting date in the anchor's immediate neighbourhood.
+
+    Mirrors :func:`_nearby_location`. A ``<time datetime=...>`` attribute is
+    preferred because it is machine-formatted; a class-marked element's text
+    is the fallback. Returns the raw string - parsing is normalize's job.
+    """
+    date_pattern = re.compile(r"(date|posted|jobDate|job-date)", re.I)
+
+    container = anchor.parent
+    for _ in range(3):
+        if container is None:
+            break
+        time_node = container.find("time")
+        if time_node is not None:
+            stamp = time_node.get("datetime")
+            if stamp:
+                return clean_text(stamp)
+        node = container.find(attrs={"class": date_pattern})
+        if node:
+            text = clean_text(node.get_text(" ", strip=True))
+            if text and len(text) < 60:
                 return text
         container = container.parent
     return None
