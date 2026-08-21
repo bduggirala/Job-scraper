@@ -62,6 +62,19 @@ def test_still_excludes_previously_excluded_roles(matcher, title):
     assert matcher.matches(title) is False
 
 
+@pytest.mark.parametrize("title", [
+    "Specialist, Data Center Operations",
+    "HVAC Technician Data Center",
+    "Director - Data Centers, Client Sourcing/Procurement",
+    "Sr. Sales Executive: Data Centers",
+    "Customer Success Specialist - Data Entry",
+])
+def test_excludes_data_center_and_data_entry_false_positives(matcher, title):
+    """'\\bdata\\b' pulls these in, but they're facilities/clerical work,
+    not data engineering - confirmed live in a 65k-job real full run."""
+    assert matcher.matches(title) is False
+
+
 def test_no_title_does_not_match(matcher):
     assert matcher.matches(None) is False
     assert matcher.matches("") is False

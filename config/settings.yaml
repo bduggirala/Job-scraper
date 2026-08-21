@@ -62,12 +62,20 @@ target_role_patterns:
 # Segments matching these are rejected even if a target pattern also matched.
 # lead/manager/principal exclude senior/people-management titles - the
 # request was individual-contributor "data" roles, not their managers.
+# data center/data entry are the two false-positive categories '\bdata\b'
+# pulls in that aren't data engineering at all - confirmed live: 8 of 33
+# matches in one run were "Data Center" facilities/infrastructure roles
+# (HVAC Technician, Sr Structural Engineer, Sales Executive - all "Data
+# Centers" as a facility, not the discipline) plus one clerical "Data Entry"
+# posting.
 exclude_role_patterns:
   - '\bdata\s+scientist'
   - '\bmachine\s+learning\s+engineer'
   - '\bml\s+engineer'
   - '\b(intern|internship|co-?op)\b'
   - '\b(lead|manager|principal)\b'
+  - '\bdata\s*center'
+  - '\bdata\s+entry\b'
 
 # --- Playwright fallback ---------------------------------------------------
 playwright:
