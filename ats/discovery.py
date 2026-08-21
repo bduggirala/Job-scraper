@@ -82,6 +82,8 @@ def root_domain_url(url: str) -> str | None:
     marketing careers page often does not link to the ATS while the corporate
     footer does, so both are worth crawling.
     """
+    if not url or not isinstance(url, str):
+        return None
     try:
         parts = urlsplit(url if "//" in url else f"https://{url}")
     except ValueError:

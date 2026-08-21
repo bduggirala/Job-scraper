@@ -31,6 +31,10 @@ def test_root_domain_returns_none_for_garbage():
     assert root_domain_url("not a url") is None
 
 
+def test_root_domain_returns_none_for_none():
+    assert root_domain_url(None) is None
+
+
 def test_candidates_finds_embedded_oracle_host():
     found = candidates_from_html(ORACLE_PAGE, "https://jobs.nokia.com/en/sites/CX_1/jobs")
     assert any("oraclecloud.com" in c for c in found)
