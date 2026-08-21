@@ -311,14 +311,29 @@ def _get_browser():
     use_stealth = bool(cfg.get("playwright.stealth", True))
 
     playwright, manager = _start_playwright(use_stealth)
-    browser = playwright.chromium.launch(
-        headless=headless,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-        ],
-    )
+    try:
+        browser = playwright.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+    except Exception:
+        # The driver (and its event loop) is already running by the time launch
+        # is attempted. If launch fails we must tear it down here - leaving it
+        # started but unreferenced poisons the next _start_playwright on this
+        # thread with "Sync API inside the asyncio loop". Mirror the teardown
+        # order used in shutdown_thread_browser.
+        try:
+            if manager is not None:
+                manager.__exit__(None, None, None)
+            else:
+                playwright.stop()
+        except Exception as exc:  # pragma: no cover - teardown best effort
+            log.debug("Playwright cleanup after failed launch failed: %s", exc)
+        raise
 
     _thread_local.playwright = playwright
     _thread_local.browser = browser

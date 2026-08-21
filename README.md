@@ -279,6 +279,9 @@ the other silently costs coverage.
 - Per-company exception isolation — one failure never stops the run
 - Each worker thread closes its own Playwright instance: the sync API is
   thread-affine and cross-thread teardown deadlocks
+- A failed Chromium launch tears down the Playwright driver it had already
+  started, so the driver's event loop can't linger and poison the next
+  company on that worker with "Sync API inside the asyncio loop"
 
 ---
 
