@@ -26,6 +26,7 @@ import pandas as pd
 from ats.router import (
     METHOD_API,
     METHOD_BROWSER,
+    SOURCE_LIVE_PAGE,
     CompanyResult,
     RoutePlan,
     fetch_company_jobs,
@@ -456,6 +457,33 @@ def write_outputs(
     return written
 
 
+def verified_repair(result: CompanyResult) -> tuple[str, str, str] | None:
+    """``(source, raw_url, repaired_url)`` if this result should overwrite a
+    dead workbook URL with the live one url_repair.py found, else ``None``.
+
+    A repair only qualifies once it is verified by actually returning jobs
+    this run - never a URL that merely "looks like a careers page".
+
+    Skipped only when the repair was superseded by a further page-resolved
+    ATS discovery *from a blank Live Jobs Page source* (Primoris, Cotality):
+    :func:`write_discovered_urls` already wrote the better, more specific URL
+    into the blank ``ATS URL`` column, and writing it here too would put an
+    ATS endpoint into the ``Live Jobs Page`` column instead. When the dead
+    value being replaced was itself in ``ATS URL`` (JPS Health Network: a
+    dead ATS URL that got repaired and then resolved to its real Cornerstone
+    endpoint), the improved URL belongs in that same column, so this still
+    applies.
+    """
+    plan = result.plan
+    if not (result.success and plan.was_repaired and plan.raw_url and plan.url):
+        return None
+    if plan.url == plan.raw_url:
+        return None
+    if plan.resolved_via_page and plan.source == SOURCE_LIVE_PAGE:
+        return None
+    return (plan.source, plan.raw_url, plan.url)
+
+
 def run(
     settings: Settings | None = None,
     *,
@@ -595,20 +623,12 @@ def run(
         summary.ats_urls_written = export_result["updated"]
 
     # A dead workbook URL that url_repair.py swapped for a live one this run,
-    # verified by actually returning jobs through it (not just "looks like a
-    # careers page") - written back so the next run starts from the live URL
-    # instead of re-repairing the same dead one every time. Skipped when the
-    # repair was superseded by a further page-resolved ATS discovery above
-    # (that already wrote the better, more specific URL into "ATS URL").
+    # written back so the next run starts from the live URL instead of
+    # re-repairing the same dead one every time - see verified_repair().
     repairs = {
-        result.company: (result.plan.source, result.plan.raw_url, result.plan.url)
+        result.company: repair
         for result in results
-        if result.success
-        and result.plan.was_repaired
-        and not result.plan.resolved_via_page
-        and result.plan.raw_url
-        and result.plan.url
-        and result.plan.url != result.plan.raw_url
+        if (repair := verified_repair(result)) is not None
     }
 
     if repairs and write_back and not output_prefix:
