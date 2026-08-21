@@ -45,3 +45,41 @@ def test_fetch_failure_is_contained(monkeypatch):
     result = discover("Acme", "https://acme.com/careers", use_browser=False)
     assert result.method == "none"
     assert result.jobs_found == 0
+
+
+def test_candidate_extraction_failure_is_contained(monkeypatch):
+    monkeypatch.setattr(discovery, "_fetch", lambda url: "<html></html>")
+
+    def boom(html, base_url):
+        raise ValueError("garbled markup")
+
+    monkeypatch.setattr(discovery, "candidates_from_html", boom)
+    result = discover("Acme", "https://acme.com/careers", use_browser=False)
+    assert result.method == "none"
+    assert result.jobs_found == 0
+
+
+def test_verification_failure_is_contained(monkeypatch):
+    monkeypatch.setattr(discovery, "_fetch", lambda url: "<html></html>")
+    monkeypatch.setattr(discovery, "candidates_from_html", lambda html, base_url: ["https://ats.example.com/x"])
+
+    def boom(company, url):
+        raise RuntimeError("collector exploded")
+
+    monkeypatch.setattr(discovery, "verify_ats_url", boom)
+    result = discover("Acme", "https://acme.com/careers", use_browser=False)
+    assert result.method == "none"
+    assert result.jobs_found == 0
+
+
+def test_link_extraction_failure_is_contained(monkeypatch):
+    monkeypatch.setattr(discovery, "_fetch", lambda url: "<html></html>")
+    monkeypatch.setattr(discovery, "candidates_from_html", lambda html, base_url: [])
+
+    def boom(html, base_url):
+        raise ValueError("garbled markup")
+
+    monkeypatch.setattr(discovery, "careers_links", boom)
+    result = discover("Acme", "https://acme.com/careers", use_browser=False)
+    assert result.method == "none"
+    assert result.jobs_found == 0

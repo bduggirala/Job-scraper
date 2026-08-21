@@ -209,20 +209,26 @@ def discover(company: str, seed_url: str | None, *, use_browser: bool = True) ->
             last_note = f"fetch failed for {url}: {exc}"
             continue
 
-        for candidate in candidates_from_html(html, url):
-            jobs_found, note = verify_ats_url(company, candidate)
-            if jobs_found:
-                result.ats_url = candidate
-                result.provider = detect_ats(candidate).get("provider")
-                result.jobs_found = jobs_found
-                result.method = "http"
-                result.note = note
-                return result
-            last_note = note
+        try:
+            for candidate in candidates_from_html(html, url):
+                jobs_found, note = verify_ats_url(company, candidate)
+                if jobs_found:
+                    result.ats_url = candidate
+                    result.provider = detect_ats(candidate).get("provider")
+                    result.jobs_found = jobs_found
+                    result.method = "http"
+                    result.note = note
+                    return result
+                last_note = note
 
-        for link in careers_links(html, url):
-            if link not in visited:
-                queue.append(link)
+            for link in careers_links(html, url):
+                if link not in visited:
+                    queue.append(link)
+        except Exception as exc:
+            # A malformed page or a throwing collector must cost this one URL,
+            # not the sweep.
+            last_note = f"page processing failed for {url}: {exc}"
+            continue
 
     if use_browser:
         browser_result = _discover_via_browser(company, seeds[0])
