@@ -383,7 +383,7 @@ _EMBEDDED_URL_PATTERNS = {
     # never mention taleo.net; they embed their API host instead. Extracting
     # that host is what lets TaleoCollector's Oracle Cloud path drive them -
     # confirmed against Nokia, which returns 575 jobs this way.
-    TALEO: r"https?://[\w.-]*(?:\.taleo\.net|oraclecloud\.com)(?::\d+)?/[^\s\"'<>\\]*",
+    TALEO: r"https?://[\w.-]*\.(?:taleo\.net|oraclecloud\.com)(?::\d+)?/[^\s\"'<>\\]*",
     AVATURE: r"https?://[\w.-]*\.avature\.net/[^\s\"'<>\\]*",
     UKG: r"https?://(?:recruiting\.ultipro\.com|[\w.-]+\.ukg\.net)/[^\s\"'<>\\]*",
     PAYLOCITY: r"https?://recruiting\.paylocity\.com/[^\s\"'<>\\]*",
