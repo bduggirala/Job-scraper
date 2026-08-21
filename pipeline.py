@@ -35,7 +35,7 @@ from database import JobDatabase
 from deduplicate import deduplicate
 from enrich import enrich_records
 from export_ats_urls import write_discovered_urls, write_run_status
-from filters import DATE_UNAVAILABLE, WITHIN_WINDOW, apply_filters
+from filters import apply_filters
 from job_identity import extract_stable_job_id
 from logger import get_logger
 from normalize import RECORD_FIELDS

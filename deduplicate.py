@@ -118,8 +118,3 @@ def deduplicate(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
     final = [by_composite[key] for key in composite_order]
     return {"jobs": final, "removed": input_count - len(final)}
-
-
-def deduplicate_list(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convenience wrapper returning just the deduplicated records."""
-    return deduplicate(records)["jobs"]

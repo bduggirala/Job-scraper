@@ -77,14 +77,6 @@ def get_session() -> requests.Session:
     return session
 
 
-def close_session() -> None:
-    """Close this thread's session, if any."""
-    session = getattr(_thread_local, "session", None)
-    if session is not None:
-        session.close()
-        _thread_local.session = None
-
-
 def _parse_retry_after(response: requests.Response) -> float | None:
     raw = response.headers.get("Retry-After")
     if not raw:

@@ -15,13 +15,11 @@ import argparse
 import json
 import re
 import sys
-from collections import Counter
 from pathlib import Path
-from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ats.detector import UNKNOWN, detect_ats, detect_from_html  # noqa: E402
+from ats.detector import detect_ats, detect_from_html  # noqa: E402
 from logger import setup_logging  # noqa: E402
 
 # Any href that plausibly points at a single posting, far broader than the
