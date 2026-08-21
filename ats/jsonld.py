@@ -200,8 +200,12 @@ class JSONLDCollector(ATSCollector):
 
     def _record_from_node(self, node: dict[str, Any]) -> dict[str, Any] | None:
         job_url = node.get("url") or node.get("@id") or self.url
+        # schema.org's canonical property is ``title``, but a meaningful share
+        # of real JobPosting blocks carry the posting title under ``name``
+        # instead (often when the page templates a generic entity), so fall
+        # back to it rather than dropping an otherwise-valid posting.
         return self.record(
-            title=node.get("title"),
+            title=node.get("title") or node.get("name"),
             location=_job_location(node),
             date_posted=node.get("datePosted"),
             job_url=job_url,

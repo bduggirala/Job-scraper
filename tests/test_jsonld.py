@@ -92,6 +92,21 @@ NONE = """
 <html><body><h1>Careers at Acme</h1><a href="/jobs">See openings</a></body></html>
 """
 
+# (f) A JobPosting that carries its title under ``name`` rather than ``title``.
+NAME_ONLY = """
+<html><body>
+<script type="application/ld+json">
+{
+  "@type": "JobPosting",
+  "name": "Lead Data Engineer",
+  "datePosted": "2026-08-12",
+  "url": "https://jobs.acme.com/postings/lde-42",
+  "jobLocation": {"address": {"addressLocality": "Dallas", "addressRegion": "TX"}}
+}
+</script>
+</body></html>
+"""
+
 # (e) A malformed JSON block alongside a valid JobPosting.
 MALFORMED_PLUS_VALID = """
 <html><body>
@@ -171,6 +186,16 @@ def test_no_jsonld_raises_unavailable(monkeypatch):
     _patch_get_text(monkeypatch, NONE)
     with pytest.raises(CollectorUnavailable):
         _collector().collect()
+
+
+def test_title_falls_back_to_name(monkeypatch):
+    # A JobPosting whose title lives under ``name`` must still be collected,
+    # not silently dropped for lacking a ``title`` key.
+    _patch_get_text(monkeypatch, NAME_ONLY)
+    rows = _collector().collect()
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Lead Data Engineer"
+    assert rows[0]["location"] == "Dallas, TX"
 
 
 def test_malformed_block_skipped_valid_extracted(monkeypatch):
