@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
 from ats.detector import (
+    RADANCY,
     SUPPORTED_PROVIDERS,
     UNKNOWN,
     detect_ats,
@@ -51,14 +52,24 @@ class Discovery:
     note: str = ""
 
 
-def verify_ats_url(company: str, url: str) -> tuple[int, str]:
+def verify_ats_url(company: str, url: str, provider: str | None = None) -> tuple[int, str]:
     """Drive ``url`` through its real collector.
 
     Returns ``(jobs_found, note)``. A return of ``0`` means rejected - the
     caller must not write the URL anywhere. This is the only thing that
     promotes a candidate into a result.
+
+    ``provider`` overrides URL-based detection for platforms that live on the
+    company's own domain and so cannot be recognised from the URL alone
+    (Radancy TalentBrew). The collector still receives the branded URL and
+    derives its API host from it.
     """
     detection = detect_ats(url)
+    if provider:
+        detection = dict(detection)
+        detection["provider"] = provider
+        if not detection.get("host"):
+            detection["host"] = (urlsplit(url).netloc or None)
     provider = detection.get("provider", UNKNOWN)
 
     collector_class = COLLECTORS.get(provider)
@@ -210,6 +221,20 @@ def discover(company: str, seed_url: str | None, *, use_browser: bool = True) ->
             continue
 
         try:
+            # Radancy TalentBrew lives on the company's own domain, so no ATS
+            # host can be extracted from the HTML - the page URL itself is the
+            # candidate, recognised only by fingerprint.
+            if detect_from_html(html, final_url=url) == RADANCY:
+                jobs_found, note = verify_ats_url(company, url, provider=RADANCY)
+                if jobs_found:
+                    result.ats_url = url
+                    result.provider = RADANCY
+                    result.jobs_found = jobs_found
+                    result.method = "http"
+                    result.note = note
+                    return result
+                last_note = note
+
             for candidate in candidates_from_html(html, url):
                 jobs_found, note = verify_ats_url(company, candidate)
                 if jobs_found:
@@ -238,6 +263,30 @@ def discover(company: str, seed_url: str | None, *, use_browser: bool = True) ->
 
     result.note = last_note
     return result
+
+
+def _try_radancy_from_rendered(company: str, page) -> Discovery | None:
+    """Recognise Radancy TalentBrew from a rendered page and verify it.
+
+    Returns a populated :class:`Discovery` when the collector proves jobs, else
+    ``None`` so the browser stage keeps looking. The collector derives its API
+    host from ``page.url``, so any page on the careers host works.
+    """
+    try:
+        html = page.content()
+    except Exception:
+        return None
+    if detect_from_html(html, final_url=page.url) != RADANCY:
+        return None
+
+    jobs_found, note = verify_ats_url(company, page.url, provider=RADANCY)
+    if not jobs_found:
+        return None
+
+    return Discovery(
+        company=company, ats_url=page.url, provider=RADANCY,
+        jobs_found=jobs_found, method="browser", note=note,
+    )
 
 
 def _discover_via_browser(company: str, seed_url: str) -> Discovery:
@@ -273,11 +322,39 @@ def _discover_via_browser(company: str, seed_url: str) -> Discovery:
         )
         context.set_default_timeout(timeout_ms)
         page = context.new_page()
-        page.goto(seed_url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(int(cfg.get("playwright.wait_after_load_ms", 2500)))
+
+        # Some enterprise careers hosts answer intermittent 5xx to automated
+        # traffic (7-Eleven's homepage returns sporadic 504s). A single bad
+        # render must not be recorded as NOT FOUND, so retry a transient
+        # gateway error before giving up.
+        settle_ms = int(cfg.get("playwright.wait_after_load_ms", 2500))
+        for attempt in range(3):
+            response = page.goto(seed_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(settle_ms)
+            status = response.status if response is not None else 0
+            if status < 500:
+                break
+            log.debug("%s: seed render got HTTP %s (attempt %s); retrying",
+                      company, status, attempt + 1)
+            page.wait_for_timeout(1500)
         _dismiss_cookie_banner(page)
 
+        # Radancy TalentBrew renders on the company's own domain, so a plain
+        # GET (which 504s or is bot-gated on some seeds, e.g. 7-Eleven's
+        # homepage) never sees it - but the browser does. Fingerprint the
+        # rendered page and hand off to the real collector, which drives the
+        # results endpoint directly rather than scraping the DOM.
+        radancy = _try_radancy_from_rendered(company, page)
+        if radancy:
+            return radancy
+
         traversal = _navigate_to_job_list(company, page, timeout_ms, max_hops=6)
+
+        # The traversal may have hopped onto the Radancy-powered search page
+        # even when the seed itself did not carry the fingerprint.
+        radancy = _try_radancy_from_rendered(company, page)
+        if radancy:
+            return radancy
 
         if traversal.discovered_ats_url:
             jobs_found, note = verify_ats_url(company, traversal.discovered_ats_url)

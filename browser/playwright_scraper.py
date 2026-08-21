@@ -35,6 +35,7 @@ from ats.detector import (
     EIGHTFOLD,
     GREENHOUSE,
     LEVER,
+    RADANCY,
     SMARTRECRUITERS,
     UNKNOWN,
     WORKDAY,
@@ -794,6 +795,24 @@ def _sniff_ats_from_urls(urls: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _discover_host_based_ats(page) -> PlaywrightResult | None:
+    """Recognise an ATS that runs on the company's own domain, by fingerprint.
+
+    Some platforms (Radancy TalentBrew) render on ``careers.{company}.com``
+    with no vendor host in the URL and load their job list over XHR the DOM
+    scraper cannot see. When the rendered HTML fingerprints as one of these,
+    hand the page URL back as a discovery so the router's self-healing path
+    drives the real collector - strictly better than scraping the DOM.
+    """
+    try:
+        provider = detect_from_html(page.content(), final_url=page.url)
+    except Exception:
+        return None
+    if provider != RADANCY:
+        return None
+    return PlaywrightResult(discovered_ats_url=page.url, discovered_provider=provider)
+
+
 def _search_fallback(company: str, page, timeout_ms: int) -> PlaywrightResult:
     """Type a configured search term and retry extraction, sniffing network traffic.
 
@@ -943,6 +962,13 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         page.wait_for_timeout(settle_ms)
 
         _dismiss_cookie_banner(page)
+
+        # A branded-domain ATS (Radancy TalentBrew) is recognised only from the
+        # rendered HTML. Detecting it here lets the router self-heal to the real
+        # collector instead of scraping an XHR-driven list the DOM cannot show.
+        host_based = _discover_host_based_ats(page)
+        if host_based is not None:
+            return host_based
 
         good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
         # Landing pages routinely show a handful of "featured" roles. Taking

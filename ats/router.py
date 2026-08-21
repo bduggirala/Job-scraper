@@ -24,6 +24,7 @@ from ats.icims import ICIMSCollector
 from ats.lever import LeverCollector
 from ats.paylocity import PaylocityCollector
 from ats.phenom import PhenomCollector
+from ats.radancy import RadancyCollector
 from ats.resolver import resolve_from_page
 from ats.smartrecruiters import SmartRecruitersCollector
 from ats.url_repair import repair_careers_url
@@ -52,6 +53,7 @@ COLLECTORS: dict[str, type[ATSCollector]] = {
     "successfactors": SuccessFactorsCollector,
     "avature": AvatureCollector,
     "eightfold": EightfoldCollector,
+    "radancy": RadancyCollector,
 }
 
 METHOD_API = "direct_api"

@@ -142,6 +142,7 @@ clobber a full run's results.
 | iCIMS | HTML + JSON-LD | No public API |
 | SuccessFactors | HTML + JSON-LD | OData requires tenant auth |
 | Avature | HTML + JSON-LD | No public API |
+| Radancy (TalentBrew) | `/search-jobs/results` JSON fragment | Runs on the company's own domain; detected by HTML fingerprint, not host |
 
 Any collector that cannot serve a tenant raises `CollectorUnavailable`, and the
 router falls back to Playwright rather than failing the company.
@@ -243,7 +244,7 @@ the other silently costs coverage.
 ```
 company_job_scraper/
 ├── config/          settings.yaml, companies.xlsx
-├── ats/             detector, resolver, url_repair, router + 13 collectors
+├── ats/             detector, resolver, url_repair, router + 14 collectors
 ├── browser/         playwright_scraper.py (search, hop, stealth, discovery)
 ├── tools/           probe_site.py, canary.py (diagnostics, not the pipeline)
 ├── tests/           pytest suite (normalize, filters, extraction, traversal)

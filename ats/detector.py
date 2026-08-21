@@ -38,10 +38,11 @@ PHENOM = "phenom"
 SUCCESSFACTORS = "successfactors"
 AVATURE = "avature"
 EIGHTFOLD = "eightfold"
+RADANCY = "radancy"
 
 SUPPORTED_PROVIDERS = (
     WORKDAY, GREENHOUSE, LEVER, ASHBY, SMARTRECRUITERS, PAYLOCITY, UKG,
-    TALEO, ICIMS, PHENOM, SUCCESSFACTORS, AVATURE, EIGHTFOLD,
+    TALEO, ICIMS, PHENOM, SUCCESSFACTORS, AVATURE, EIGHTFOLD, RADANCY,
 )
 
 # Host-substring -> provider. Checked in order; first match wins.
@@ -115,6 +116,15 @@ BODY_FINGERPRINTS: tuple[tuple[str, str], ...] = (
     ("successfactors.com", SUCCESSFACTORS),
     ("sapsf.com", SUCCESSFACTORS),
     ("avature.net", AVATURE),
+    # Radancy TalentBrew (formerly TMP Worldwide) powers many enterprise
+    # careers sites on the company's *own* domain (careers.7-eleven.com), so
+    # there is no vendor HOST_PATTERN to match - only these HTML fingerprints.
+    # Its assets load from tbcdn.talentbrew.com and its job list is served from
+    # a /search-jobs/results endpoint whose module names are highly specific.
+    ("talentbrew.com", RADANCY),
+    ("data-search-filters-module-name", RADANCY),
+    ("data-search-results-module-name", RADANCY),
+    ("radancy.net", RADANCY),
 )
 
 _WORKDAY_HOST_RE = re.compile(r"^(?P<tenant>[^.]+)\.(?P<pod>wd\d+)\.(?P<domain>myworkdayjobs\.com|myworkdaysite\.com)$", re.I)
