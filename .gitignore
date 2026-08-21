@@ -20,7 +20,7 @@ output/
 # writes discovered ATS URLs back into it. It is treated as private data by
 # default; config/companies.example.xlsx documents the expected format.
 # Delete the line below if you intend to publish your list.
-config/companies.xlsx
+#config/companies.xlsx
 config/companies.xlsx.bak-*
 config/*.bak-*
 
