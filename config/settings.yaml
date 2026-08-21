@@ -137,7 +137,7 @@ requests:
 # --- Concurrency -----------------------------------------------------------
 concurrency:
   http_workers: 10
-  playwright_workers: 3
+  playwright_workers: 5
 
   # Hard wall-clock budget per phase. Playwright can block inside its own
   # event loop with no timeout of its own (a page whose overlay intercepts
@@ -148,7 +148,11 @@ concurrency:
   # when it was queued). This is the bound that matters: without it, one
   # wedged page costs the entire phase budget.
   api_company_timeout_seconds: 300      # 5 min
-  browser_company_timeout_seconds: 240  # 4 min
+  # Multi-layer traversal can render up to max_hop_visits pages before it
+  # concludes, and nav retries stack on top. At 240s companies that finish
+  # comfortably in isolation (7-Eleven, Omnicell) were being cut off
+  # mid-traversal and recorded as Timeout failures.
+  browser_company_timeout_seconds: 360  # 6 min
 
   # Phase-wide backstops.
   api_phase_timeout_seconds: 1800      # 30 min
