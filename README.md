@@ -76,6 +76,30 @@ returned 2,500.
 
 ---
 
+## Entry points & tools
+
+There is **one shared engine** (`ats/detector`, `ats/resolver`, `ats/discovery`
+and the collectors) behind everything below — these are different front doors to
+it, not separate codebases.
+
+| Command | What it does | Scrapes jobs? | Writes to workbook |
+|---------|--------------|:---:|--------------------|
+| `python main.py` | **The full pipeline.** Reads Excel → for each company gets the ATS/job URL **and collects the jobs** → normalize/filter/dedupe → `output/company_jobs.csv`. Discovers ATS URLs itself along the way (self-heal). | ✅ | verified URLs → the real `ATS URL` cell |
+| `python tools/find_ats_urls.py` | **Discovery only.** Crawls to find & *verify* an ATS URL / job-search page per company, then stops — no job list, no filtering. | ❌ | suggestions → `Suggested…` columns (or the real columns with `--apply`) |
+| `python tools/canary.py` | **Smoke test.** One company per collection path (~2 min); exits non-zero if any path returns zero jobs. Run before trusting a full run. | tests only | no |
+| `python tools/probe_site.py <url>` | **Diagnostic.** Dumps what a single page actually contains (links, detected provider). For investigating one stubborn site. | no | no |
+
+**Do I need the discovery tool?** No — `main.py` already discovers and back-fills
+ATS URLs on its own. `find_ats_urls.py` is an optional *pre-pass*: bulk-fill or
+repair the URL column up front (especially companies stuck on the slow Playwright
+path), review suggestions before trusting them, and get an explicit `NOT FOUND`
+list to fix by hand — all without a full ~15-minute scrape. Typical loop: run
+`find_ats_urls.py --only-failures` occasionally to enrich the workbook, eyeball
+and `--apply` the good ones, then every `main.py` run is faster and hits more
+direct APIs. Never run it during a full run — both write `config/companies.xlsx`.
+
+---
+
 ## Setup
 
 Requires **Python 3.10+**.
@@ -363,3 +387,26 @@ already marked `Data Retrieved = FALSE`). Blank `ATS URL` cells are filled
 directly, as they already are during a normal run.
 
 Do not run it while a full run is in progress — both write the workbook.
+
+---
+
+## Keeping this doc current
+
+**This README is the single source of truth for how the repo works.** It is
+meant to be maintained in lockstep with the code — read it to understand the
+project, and update it in the *same change* whenever you touch the things it
+describes. When you change the code, update the matching section:
+
+| If you change… | Update this section |
+|----------------|---------------------|
+| A collector, or `COLLECTORS` in `ats/router.py` | [Supported ATS providers](#supported-ats-providers) + collector list in [Codebase map](#codebase-map) |
+| Detection / resolution / routing flow | [How it works](#how-it-works) diagram |
+| A CLI flag in `main.py` | [Usage](#usage) flag table |
+| An entry-point script or tool in `tools/` | [Entry points & tools](#entry-points--tools) |
+| Any module's purpose, or add/remove a file | [Codebase map](#codebase-map) |
+| A setting in `config/settings.yaml` | [Configuration](#configuration) |
+| Output columns or filtering behaviour | [Output](#output) |
+| A design decision worth recording | add/refresh a doc under [`docs/superpowers/`](docs/superpowers/README.md) |
+
+If a change makes a section wrong, fixing the doc is part of finishing the
+change — not a follow-up.
