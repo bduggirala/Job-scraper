@@ -91,6 +91,14 @@ class RoutePlan:
     #: pattern) - the browser fallback should render the real page rather
     #: than repeat the same bad guess the API attempt already failed on.
     original_url: str | None = None
+    #: The exact value read from the workbook column named by ``source``,
+    #: before :func:`ats.url_repair.repair_careers_url` may have replaced a
+    #: dead hostname with a live one. ``None`` when no repair ran.
+    raw_url: str | None = None
+    #: True when ``url`` differs from ``raw_url`` because it was repaired
+    #: this run - lets the pipeline write the verified live URL back over
+    #: the dead one it replaced (see ``pipeline.py``'s write-back step).
+    was_repaired: bool = False
 
     @property
     def uses_browser(self) -> bool:
@@ -156,6 +164,9 @@ def plan_route(
             source=SOURCE_ATS_URL, note="No URL provided for this company",
         )
 
+    raw_url = url
+    was_repaired = False
+
     # Several workbook URLs point at retired careers.* subdomains that no
     # longer resolve. Swap in a live equivalent before doing anything else,
     # so a stale hostname is not recorded as a permanent failure.
@@ -163,6 +174,7 @@ def plan_route(
         repaired = repair_careers_url(company, url)
         if repaired:
             url = repaired
+            was_repaired = True
 
     # Captured before page resolution can overwrite ``url`` below - this is
     # the page a browser fallback should land on, not whatever ATS link the
@@ -177,6 +189,7 @@ def plan_route(
         return RoutePlan(
             company=company, url=url, provider=provider, method=METHOD_API,
             source=source, detection=detection, original_url=original_url,
+            raw_url=raw_url, was_repaired=was_repaired,
         )
 
     # Unknown from the URL alone: probe the page for an embedded/redirected ATS.
@@ -187,6 +200,7 @@ def plan_route(
                 company=company, url=resolved.get("url") or url,
                 provider=resolved["provider"], method=METHOD_API, source=source,
                 detection=resolved, resolved_via_page=True, original_url=original_url,
+                raw_url=raw_url, was_repaired=was_repaired,
             )
 
     method = METHOD_BROWSER if playwright_enabled else METHOD_API
@@ -194,6 +208,7 @@ def plan_route(
     return RoutePlan(
         company=company, url=url, provider=UNKNOWN, method=method,
         source=source, detection=detection, note=note, original_url=original_url,
+        raw_url=raw_url, was_repaired=was_repaired,
     )
 
 
@@ -311,6 +326,16 @@ def fetch_company_jobs(
         try:
             jobs = collect_via_api(plan)
             log.info("%s -> %s jobs retrieved", company, len(jobs))
+            # A page-resolved provider (plan.url came from resolve_from_page,
+            # not straight from the workbook) is just as verified as a
+            # browser-discovered one once it has actually returned jobs -
+            # write it back the same way so the next run skips resolution.
+            if plan.resolved_via_page:
+                return CompanyResult(
+                    company=company, jobs=jobs, plan=plan, success=True,
+                    discovered_ats_url=plan.url, discovered_provider=plan.provider,
+                    discovery_verified=True,
+                )
             return CompanyResult(company=company, jobs=jobs, plan=plan, success=True)
         except CollectorUnavailable as exc:
             if not playwright_enabled:

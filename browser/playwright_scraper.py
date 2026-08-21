@@ -1079,6 +1079,16 @@ def scrape_with_playwright(company: str, url: str) -> PlaywrightResult:
     fine on retry - Chromium's resolver simply buckled under concurrent
     browser instances.
 
+    A clean render that comes back with zero jobs (no exception, no
+    discovery) gets the same retry treatment, up to the same attempt budget.
+    Confirmed against a same-day pair of full runs: Nokia, Ericsson and CBRE
+    each rendered fine and found real jobs in one run, then came back empty
+    in the other under the same 3-worker concurrency - re-verified
+    individually afterward, all three worked every time in isolation. A
+    fresh context and rotated fingerprint costs nothing when the page
+    already has jobs (this path never runs then) and gives the flaky case a
+    second chance instead of recording a company as failed on one bad draw.
+
     Raises:
         RuntimeError: navigation failed on every attempt.
     """
@@ -1087,9 +1097,10 @@ def scrape_with_playwright(company: str, url: str) -> PlaywrightResult:
     backoff_ms = int(cfg.get("playwright.nav_retry_backoff_ms", 2000))
 
     last_error: Exception | None = None
+    last_empty: PlaywrightResult | None = None
     for attempt in range(attempts):
         try:
-            return _scrape_once(company, url, attempt)
+            result = _scrape_once(company, url, attempt)
         except RuntimeError as exc:
             last_error = exc
             if attempt < attempts - 1:
@@ -1097,5 +1108,18 @@ def scrape_with_playwright(company: str, url: str) -> PlaywrightResult:
                 log.debug("%s: navigation attempt %s failed (%s); retrying in %.1fs",
                           company, attempt + 1, str(exc)[:90], delay)
                 time.sleep(delay)
+            continue
 
+        if result.jobs or result.discovered_provider:
+            return result
+
+        last_empty = result
+        if attempt < attempts - 1:
+            delay = (backoff_ms * (attempt + 1) + random.randint(0, 750)) / 1000
+            log.debug("%s: attempt %s rendered cleanly but found no jobs; retrying in %.1fs",
+                      company, attempt + 1, delay)
+            time.sleep(delay)
+
+    if last_empty is not None:
+        return last_empty
     raise last_error if last_error else RuntimeError(f"Navigation failed for {url}")

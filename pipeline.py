@@ -34,7 +34,7 @@ from ats.router import (
 from database import JobDatabase
 from deduplicate import deduplicate
 from enrich import enrich_records
-from export_ats_urls import write_discovered_urls, write_run_status
+from export_ats_urls import write_discovered_urls, write_repaired_urls, write_run_status
 from filters import apply_filters
 from job_identity import extract_stable_job_id
 from logger import get_logger
@@ -593,6 +593,28 @@ def run(
         companies_path = resolve_companies_path(cfg, excel_path)
         export_result = write_discovered_urls(companies_path, discoveries)
         summary.ats_urls_written = export_result["updated"]
+
+    # A dead workbook URL that url_repair.py swapped for a live one this run,
+    # verified by actually returning jobs through it (not just "looks like a
+    # careers page") - written back so the next run starts from the live URL
+    # instead of re-repairing the same dead one every time. Skipped when the
+    # repair was superseded by a further page-resolved ATS discovery above
+    # (that already wrote the better, more specific URL into "ATS URL").
+    repairs = {
+        result.company: (result.plan.source, result.plan.raw_url, result.plan.url)
+        for result in results
+        if result.success
+        and result.plan.was_repaired
+        and not result.plan.resolved_via_page
+        and result.plan.raw_url
+        and result.plan.url
+        and result.plan.url != result.plan.raw_url
+    }
+
+    if repairs and write_back and not output_prefix:
+        companies_path = resolve_companies_path(cfg, excel_path)
+        repair_result = write_repaired_urls(companies_path, repairs)
+        summary.ats_urls_written += repair_result["updated"]
 
     # Per-company retrieval outcome, so the workbook itself shows which
     # companies this pipeline can actually reach. Scoped to full runs for the

@@ -155,8 +155,12 @@ concurrency:
   # Multi-layer traversal can render up to max_hop_visits pages before it
   # concludes, and nav retries stack on top. At 240s companies that finish
   # comfortably in isolation (7-Eleven, Omnicell) were being cut off
-  # mid-traversal and recorded as Timeout failures.
-  browser_company_timeout_seconds: 360  # 6 min
+  # mid-traversal and recorded as Timeout failures. At 360s, Slalom's
+  # traversal found its 21 jobs (logged) in 27s but the browser context
+  # teardown under full 3-worker concurrency wasn't observed finishing until
+  # ~5.5 minutes in, so the already-successful result was still discarded as
+  # a Timeout - isolated re-runs of Slalom alone complete in under 30s.
+  browser_company_timeout_seconds: 480  # 8 min
 
   # Phase-wide backstops.
   api_phase_timeout_seconds: 1800      # 30 min

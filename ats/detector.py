@@ -488,7 +488,15 @@ def extract_any_embedded_ats_url(html_text: str, provider: str) -> str | None:
     collector needs, and driving the API from them returns the real jobs.
 
     Prefers a plausible job URL when one exists, so callers get the better
-    signal whenever it is available.
+    signal whenever it is available. Still rejects bare script/style assets
+    (.js, .css): those are near-universally served from a shared CDN rather
+    than the tenant's own instance, unlike a favicon or login link, which are
+    usually hosted alongside the real tenant site (the Oracle Cloud case
+    below relies on exactly that for its favicon). Confirmed against
+    HCLTech, whose page's only path-bearing SuccessFactors reference is
+    ``hcm55.sapsf.eu/.../jquery.js`` (a script host shared across tenants),
+    while the real tenant search lives on the sibling ``career55.sapsf.eu``
+    host. Driving the API from the script host 404s every time.
     """
     if not html_text:
         return None
@@ -503,7 +511,7 @@ def extract_any_embedded_ats_url(html_text: str, provider: str) -> str | None:
 
     for match in re.finditer(pattern, html_text, re.I):
         candidate = _clean_extracted_url(match.group(0))
-        if candidate:
+        if candidate and not candidate.lower().split("?", 1)[0].endswith((".js", ".css", ".map")):
             return candidate
     return None
 

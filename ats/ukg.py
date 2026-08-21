@@ -28,11 +28,12 @@ class UKGCollector(ATSCollector):
         """Origin serving this tenant's job board.
 
         UKG Pro Recruiting is reachable both at the shared
-        ``recruiting.ultipro.com`` host and at newer per-tenant hosts such as
-        ``gamestop.rec.pro.ukg.net`` - identical URL shape and API, so the
-        host from the detected URL is used when present.
+        ``recruiting.ultipro.com`` host and at per-tenant hosts such as
+        ``recruiting2.ultipro.com`` or ``gamestop.rec.pro.ukg.net`` -
+        identical URL shape and API, so the host from the detected URL is
+        always used when present rather than assuming the shared host.
         """
-        if self.host and "ukg.net" in self.host.lower():
+        if self.host:
             return f"https://{self.host}"
         return BASE
 

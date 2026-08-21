@@ -64,6 +64,9 @@ companies.xlsx
 When the browser finds a real ATS behind a branded careers page, the router
 switches to that provider's API **in the same run**, then writes the URL back
 into the workbook's blank `ATS URL` cell so later runs skip discovery entirely.
+The same write-back also fires when the *cheaper* page-resolution step
+(`ats/resolver.py`, one HTTP GET, no browser) finds the ATS instead — not just
+the Playwright path.
 
 Only *verified* discoveries are written back — ones whose collector actually
 returned jobs. A URL that merely pattern-matches an ATS never lands in the
@@ -73,6 +76,13 @@ backed up before every write.
 Real example: GameStop's careers page links out to `gamestop.rec.pro.ukg.net`.
 Browser scraping of the landing page returned 0 jobs; the discovered UKG API
 returned 2,500.
+
+A dead `careers.*` subdomain that `ats/url_repair.py` swaps for a live one
+(see below) gets the one deliberate exception to "never overwritten": once
+the repaired URL is verified by actually returning jobs this run, it replaces
+the *exact* dead value it came from — never a value that isn't the one repair
+just fixed — so later runs start from the live page instead of re-repairing
+the same dead one every time.
 
 ---
 
@@ -282,6 +292,11 @@ the other silently costs coverage.
 - A failed Chromium launch tears down the Playwright driver it had already
   started, so the driver's event loop can't linger and poison the next
   company on that worker with "Sync API inside the asyncio loop"
+- A clean render that comes back with zero jobs is retried like a navigation
+  error, up to the same attempt budget (`playwright.nav_retries`) - confirmed
+  against a same-day pair of full runs where Nokia, Ericsson and CBRE each
+  found real jobs in one run and came back empty in the other under the same
+  3-worker concurrency, but worked every time re-verified in isolation
 
 ---
 
@@ -344,7 +359,7 @@ returns real jobs through it.
 | `deduplicate.py` | Collapse duplicate postings within a run |
 | `job_identity.py` | Stable per-job id derived from the posting URL |
 | `database.py` | SQLite tracking — upsert, per-company removal sync, new/first-seen |
-| `export_ats_urls.py` | Write verified discovered ATS URLs and run status back into the workbook |
+| `export_ats_urls.py` | Write verified discovered ATS URLs, verified dead-URL repairs, and run status back into the workbook |
 
 ### Config, tools, tests, docs
 

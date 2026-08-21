@@ -111,6 +111,91 @@ def write_discovered_urls(
         return {"updated": 0, "backup_path": None}
 
 
+def write_repaired_urls(
+    companies_path: Path | str,
+    repairs: dict[str, tuple[str, str, str]],
+    *,
+    company_column: str = "Company",
+    ats_url_column: str = "ATS URL",
+    live_jobs_url_column: str = "Live Jobs Page (if ATS URL unavailable)",
+) -> dict[str, Any]:
+    """Overwrite a dead URL with the live one ``url_repair.py`` found.
+
+    Unlike :func:`write_discovered_urls`, this **does** overwrite a non-blank
+    cell - but only the exact dead value the repair replaced this run, and
+    only after that replacement actually returned jobs. ``repairs`` maps
+    ``company -> (source, raw_url, repaired_url)`` where ``source`` is
+    ``ats.router.SOURCE_ATS_URL`` or ``SOURCE_LIVE_PAGE`` (which column the
+    dead URL came from) and ``raw_url`` is the exact dead value read from the
+    workbook at plan time. A row whose cell no longer matches ``raw_url`` is
+    skipped rather than overwritten - something else (a manual edit, a prior
+    write-back this same run) already changed it, so blindly clobbering it
+    would destroy that instead of a confirmed-dead value.
+
+    Returns ``{"updated": int, "backup_path": Path | None}``. Best-effort,
+    like the other write-back helpers: a failure here never fails the run.
+    """
+    path = Path(companies_path)
+    if not repairs or not path.exists():
+        return {"updated": 0, "backup_path": None}
+
+    from ats.router import SOURCE_ATS_URL  # local import: avoid a cycle at module load
+
+    try:
+        workbook = load_workbook(path)
+        sheet = workbook.active
+
+        header_row = next(sheet.iter_rows(min_row=1, max_row=1))
+        headers = {str(cell.value).strip(): cell.column for cell in header_row if cell.value}
+
+        company_col = headers.get(company_column)
+        ats_col = headers.get(ats_url_column)
+        live_col = headers.get(live_jobs_url_column)
+        if not company_col:
+            log.warning("Workbook %s missing %s column; skipping repair write-back",
+                        path.name, company_column)
+            return {"updated": 0, "backup_path": None}
+
+        updated = 0
+        for row in sheet.iter_rows(min_row=2):
+            company_cell = row[company_col - 1]
+            company_name = str(company_cell.value).strip() if company_cell.value else ""
+            if not company_name or company_name not in repairs:
+                continue
+
+            source, raw_url, repaired_url = repairs[company_name]
+            target_col = ats_col if source == SOURCE_ATS_URL else live_col
+            if not target_col:
+                continue
+
+            cell = row[target_col - 1]
+            current = str(cell.value).strip() if cell.value else ""
+            if current != raw_url.strip():
+                log.debug(
+                    "%s: workbook cell no longer matches the dead URL this run repaired "
+                    "(expected %r, found %r); leaving it alone",
+                    company_name, raw_url, current,
+                )
+                continue
+
+            cell.value = repaired_url
+            updated += 1
+
+        if updated == 0:
+            return {"updated": 0, "backup_path": None}
+
+        backup_path = _backup_path(path)
+        shutil.copy2(path, backup_path)
+        workbook.save(path)
+        log.info("Wrote %s repaired URL(s) to %s (backup: %s)",
+                  updated, path.name, backup_path.name)
+        return {"updated": updated, "backup_path": backup_path}
+
+    except Exception as exc:
+        log.warning("Could not write repaired URLs back to %s: %s", path, exc)
+        return {"updated": 0, "backup_path": None}
+
+
 def write_run_status(
     companies_path: Path | str,
     counts: dict[str, int],
