@@ -243,10 +243,14 @@ Everything tunable lives in `config/settings.yaml`: the freshness window
 timeout/retry/backoff, Playwright behaviour (including stealth and the search
 fallback term), and concurrency (`http_workers: 10`, `playwright_workers: 3`).
 
-Target roles are matched **per title segment** — titles are split on `,`, `/`,
-`-`, `|` and each segment tested — so `Software Engineer, Data Engineering`
-matches while `Data Scientist`, `Software Engineer` and `Machine Learning
-Engineer` do not.
+Target roles match on any title segment naming "data" as its own word (titles
+are split on `,`, `/`, `-`, `|`) — `Software Engineer, Data Engineering`
+matches via its second segment even though `Software Engineer` alone would
+not, and `Database Administrator` never matches (no word boundary between
+"data" and "base"). An exclude pattern disqualifies the **whole title**
+regardless of which segment it's in — `Senior Manager, Data Science` is
+rejected even though "Data Science" sits in a different comma segment from
+"Manager"; a per-segment-only exclude would have let it through.
 
 DFW matching rejects same-named cities in other states, so `Westlake Village, CA`
 and `Richardson, UT` do not pass as DFW.

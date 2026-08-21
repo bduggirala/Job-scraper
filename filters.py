@@ -81,18 +81,20 @@ class RoleMatcher:
     def matches(self, title: str | None) -> bool:
         """True when any title segment names a target role.
 
-        A segment matching an exclude pattern is rejected even if it also
-        matched an include pattern, which is what keeps "Data Scientist" and
-        "Machine Learning Engineer" out.
+        An exclude pattern anywhere in the *whole* title disqualifies it
+        outright - confirmed against real scraped titles like "Senior
+        Manager, Data Science - US Card", where "Data Science" alone would
+        otherwise match on its own comma segment while "Senior Manager"
+        sits in a different one. A per-segment-only exclude check would
+        accept that as an individual-contributor role; it is not.
         """
         if not title:
             return False
+        if any(pattern.search(title) for pattern in self.exclude):
+            return False
         for segment in self.segments(title):
-            if not any(pattern.search(segment) for pattern in self.include):
-                continue
-            if any(pattern.search(segment) for pattern in self.exclude):
-                continue
-            return True
+            if any(pattern.search(segment) for pattern in self.include):
+                return True
         return False
 
 

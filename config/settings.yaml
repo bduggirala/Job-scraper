@@ -46,22 +46,28 @@ enforce_texas_for_city_match: true
 # Titles are split on separators (, - | / etc.) and each segment is tested.
 # A job matches if ANY segment matches a target pattern and that same segment
 # does not match an exclude pattern.
+#
+# '\bdata\b' is deliberately broad - any title naming "data" as its own word
+# (Data Analyst, Data Platform Engineer, Business Data Analyst, ...), while
+# still not matching inside "database" (no word boundary between "data" and
+# "base"). The technology-specific patterns catch roles that don't literally
+# say "data" (Snowflake/Databricks/ETL/Analytics Engineer).
 target_role_patterns:
-  - '\bdata\s+engineer'
-  - '\bdata\s+engineering\b'
-  - '\bdata\s+platform\s+engineer'
+  - '\bdata\b'
   - '\bsnowflake\s+(engineer|developer)'
   - '\bdatabricks\s+(engineer|developer)'
   - '\betl\s+(developer|engineer)'
-  - '\bbig\s+data\s+engineer'
   - '\banalytics\s+engineer'
 
 # Segments matching these are rejected even if a target pattern also matched.
+# lead/manager/principal exclude senior/people-management titles - the
+# request was individual-contributor "data" roles, not their managers.
 exclude_role_patterns:
   - '\bdata\s+scientist'
   - '\bmachine\s+learning\s+engineer'
   - '\bml\s+engineer'
   - '\b(intern|internship|co-?op)\b'
+  - '\b(lead|manager|principal)\b'
 
 # --- Playwright fallback ---------------------------------------------------
 playwright:
@@ -115,9 +121,15 @@ playwright:
   # while also watching network traffic for a real ATS endpoint the static
   # HTML resolver couldn't see (many custom career pages only call their ATS
   # once you interact with them).
+  #
+  # "Data" rather than "Data Engineer": for these companies the site's own
+  # search is the only source of jobs we ever see - target_role_patterns can
+  # only filter what actually got fetched, so a narrower search term here
+  # would silently drop titles like "Data Analyst" or "Analytics Engineer"
+  # before the role filter ever runs.
   search_fallback:
     enabled: true
-    search_term: "Data Engineer"
+    search_term: "Data"
     max_wait_ms: 6000
 
 # --- HTTP behaviour --------------------------------------------------------
