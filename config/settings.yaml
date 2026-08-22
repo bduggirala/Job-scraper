@@ -82,7 +82,13 @@ playwright:
   enabled: true
   headless: true
   timeout_ms: 30000
-  max_pages: 5              # pagination / "Load More" click limit per company
+  # Pagination / "Load More" click limit per company. The loop already stops
+  # early once a site runs out of pages (no control found, no scroll
+  # growth), so this mainly bounds genuinely large employers rather than
+  # adding overhead to the common 1-2-page case. Raised from 5 after fixing
+  # _paginate_and_extract to accumulate across pages instead of keeping only
+  # the last one - confirmed Goldman Sachs 20->120 and IBM 30->162 jobs at 5.
+  max_pages: 10
   wait_after_load_ms: 2500  # settle time for client-side rendering
 
   # The browser needs a DIFFERENT User-Agent than requests.user_agent below.
