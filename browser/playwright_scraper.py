@@ -435,9 +435,39 @@ def _is_job_row(title: str | None, href: str | None) -> bool:
     return True
 
 
-def _click_load_more(page, max_clicks: int, timeout_ms: int) -> int:
-    """Click through "Load more"/next controls. Returns the number of clicks."""
-    clicks = 0
+def _paginate_and_extract(
+    page, initial_rows: list[dict[str, Any]], max_clicks: int, timeout_ms: int
+) -> list[dict[str, Any]]:
+    """Click through "Load more"/next controls, accumulating every page's
+    rows rather than keeping only whatever is on screen after the last click.
+
+    Some sites append new rows to the same page ("Load more" - the visible
+    list only grows). Others replace the page's content entirely with each
+    click (a genuine "next page" link, matched here by the same selector
+    list) - extracting only once, after all clicking is done, would then
+    silently keep just the final page and discard everything before it.
+    Confirmed live on Goldman Sachs' career site: its "next" control replaces
+    the list outright (1 of 20 jobs still present after a single click), so
+    the old extract-once-at-the-end approach returned only the last of 6
+    pages actually visited, not the ~120 jobs across all of them.
+
+    Re-extracting and merging by job_url after every click/scroll handles
+    both patterns without needing to know which one a given site uses.
+    Takes the caller's own initial extraction rather than re-running it, so
+    the "don't click at all when the page starts out empty" guard at each
+    call site stays intact (blind clicking on a jobless page can navigate
+    away and destroy UI the caller needs next - observed on Goldman Sachs).
+    """
+    seen: dict[str, dict[str, Any]] = {}
+
+    def _merge(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            key = row.get("job_url")
+            if key and key not in seen:
+                seen[key] = row
+
+    _merge(initial_rows)
+
     for _ in range(max_clicks):
         clicked = False
         for selector in LOAD_MORE_SELECTORS:
@@ -448,7 +478,6 @@ def _click_load_more(page, max_clicks: int, timeout_ms: int) -> int:
                 locator.scroll_into_view_if_needed(timeout=3000)
                 locator.click(timeout=5000)
                 page.wait_for_timeout(min(timeout_ms // 10, 2500))
-                clicks += 1
                 clicked = True
                 break
             except Exception:
@@ -463,10 +492,13 @@ def _click_load_more(page, max_clicks: int, timeout_ms: int) -> int:
                 after = page.evaluate("document.body.scrollHeight")
                 if after <= before:
                     break
-                clicks += 1
+                clicked = True
             except Exception:
                 break
-    return clicks
+
+        _merge(_extract_job_rows(page))
+
+    return list(seen.values())
 
 
 def _extract_jsonld_rows(page) -> list[dict[str, Any]]:
@@ -668,8 +700,7 @@ def _navigate_to_job_list(
         # is actually present.
         rows = _extract_job_rows(page)
         if rows:
-            if _click_load_more(page, max_pages, timeout_ms):
-                rows = _extract_job_rows(page) or rows
+            rows = _paginate_and_extract(page, rows, max_pages, timeout_ms)
         else:
             rows = _extract_jsonld_rows(page)
         if len(rows) >= good_enough:
@@ -908,8 +939,9 @@ def _search_fallback(company: str, page, timeout_ms: int) -> PlaywrightResult:
                     company, provider,
                 )
 
-    _click_load_more(page, int(cfg.get("playwright.max_pages", 5)), timeout_ms)
-    jobs = _extract_job_rows(page)
+    jobs = _paginate_and_extract(
+        page, _extract_job_rows(page), int(cfg.get("playwright.max_pages", 5)), timeout_ms
+    )
 
     if jobs or discovered_provider:
         log.info(
@@ -999,10 +1031,11 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         # clicks left the page with no search input at all.
         jobs = _extract_job_rows(page)
         if jobs:
-            clicks = _click_load_more(page, max_pages, timeout_ms)
-            if clicks:
-                log.debug("%s: expanded results with %s pagination action(s)", company, clicks)
-                jobs = _extract_job_rows(page) or jobs
+            initial_count = len(jobs)
+            jobs = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
+            if len(jobs) != initial_count:
+                log.debug("%s: pagination changed the result count %s -> %s",
+                          company, initial_count, len(jobs))
         else:
             # JSON-LD is often present even when the visible list is
             # client-rendered, and it carries real posting dates.
