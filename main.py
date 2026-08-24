@@ -19,7 +19,7 @@ from pathlib import Path
 
 from ats.router import METHOD_API, METHOD_BROWSER
 from logger import get_logger, setup_logging
-from pipeline import build_plans, load_companies, run
+from pipeline import build_plans, filter_companies_by_name, load_companies, run
 from settings import load_settings
 
 log = get_logger("main")
@@ -81,8 +81,7 @@ def cmd_dry_run(args: argparse.Namespace, settings) -> int:
     """Print routing decisions without scraping."""
     companies = load_companies(settings, args.excel)
     if args.test_company:
-        needle = args.test_company.strip().lower()
-        companies = companies[companies["company"].str.lower().str.contains(needle, na=False)]
+        companies = filter_companies_by_name(companies, args.test_company)
         if companies.empty:
             print(f"No company matches {args.test_company!r}")
             return 1

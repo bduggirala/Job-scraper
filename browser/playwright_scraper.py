@@ -80,9 +80,15 @@ JOB_LINK_SELECTORS = (
     "a.jobTitle",
     "a.job-title",
     "a.jobs-list-item__link",
+    "a.linkForJob",
     '[class*="job-card"] a',
     '[class*="jobCard"] a',
     '[class*="job-result"] a',
+    # Motion Recruitment's job list items carry no href keyword at all
+    # (/tech-jobs/{city}/{type}/{slug}/{id}) - only the CSS-module container
+    # class ("JobItem_module_jobItem") identifies them. Confirmed live: 20
+    # of 20 cards on a page extracted as zero without this selector.
+    '[class*="jobitem" i] a',
     '[class*="search-result"] a[href]',
 )
 
@@ -157,7 +163,7 @@ RETRY_VIEWPORTS = (
 # box as a job-keyword search versus a location box (which must be excluded -
 # FedEx has both side by side, and typing a role into the location box is
 # wrong).
-_SEARCH_INPUT_HINT_RE = re.compile(r"search|keyword|job.?title|role|position|what", re.I)
+_SEARCH_INPUT_HINT_RE = re.compile(r"search|keyword|\btitle\b|role|position|what", re.I)
 _LOCATION_INPUT_HINT_RE = re.compile(r"location|city|zip|postal|where|address", re.I)
 
 _NAV_NOISE = {
@@ -246,13 +252,36 @@ _EXTRACT_JS = """
     return null;
   };
 
+  // Some cards (Pyramid Consulting's Sprockets.ai board) link only an
+  // "Apply Now" button, with the actual title in a sibling <h3> elsewhere
+  // in the card - the anchor's own text is never the title. Confirmed
+  // live: all 72 cards on the page extracted as "Apply Now" x72 (and were
+  // then correctly discarded as nav chrome), losing every job.
+  const genericCtaRe = /^(apply( now)?|view( job| details)?|learn more|read more|see more|details)$/i;
+
+  const nearbyHeading = (el) => {
+    let node = el.parentElement;
+    for (let depth = 0; depth < 4 && node; depth++) {
+      const heading = node.querySelector('h1,h2,h3,h4,h5,h6');
+      if (heading) {
+        const text = (heading.innerText || '').trim();
+        if (text && text.length >= 3) return text;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
+
   for (const selector of selectors) {
     let nodes = [];
     try { nodes = document.querySelectorAll(selector); } catch (e) { continue; }
     for (const el of nodes) {
       const href = el.getAttribute('href');
       if (!href) continue;
-      const title = (el.innerText || el.textContent || '').trim();
+      let title = (el.innerText || el.textContent || '').trim();
+      if (genericCtaRe.test(title)) {
+        title = nearbyHeading(el) || title;
+      }
       if (!title || title.length < 3) continue;
       const key = href + '|' + title;
       if (seen.has(key)) continue;
@@ -430,7 +459,16 @@ def _is_job_row(title: str | None, href: str | None) -> bool:
         return False
     if _is_nav_text(title):
         return False
-    if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+    if href.startswith(("javascript:", "mailto:", "tel:")):
+        return False
+    # A bare "#" or "#section-name" is an in-page anchor, not a job link -
+    # but a hash-routed SPA path is a real (if client-side) route and must
+    # survive. Confirmed live on two different frameworks: Kforce uses
+    # "#/detail/{id}/" (leading slash), Mphasis's RippleHire widget uses
+    # "#detail/job/{id}" (no leading slash) - both have real path segments
+    # after the "#", which a plain same-page anchor ("#top", "#about-us")
+    # never does, so "any slash after the #" is the general signal.
+    if href.startswith("#") and "/" not in href[1:]:
         return False
     return True
 
@@ -772,9 +810,15 @@ def _find_search_input(page):
                 input_id = locator.get_attribute("id") or ""
                 haystack = f"{placeholder} {aria_label} {name} {input_id}"
 
-                if _LOCATION_INPUT_HINT_RE.search(haystack):
+                search_hint = _SEARCH_INPUT_HINT_RE.search(haystack)
+                # A field that hints at both ("Search by city, zip, or
+                # role") is a single combined location+keyword box, not a
+                # location-only field - confirmed live: Pyramid Consulting's
+                # only input has exactly this placeholder, and rejecting it
+                # outright left the site with no usable search input at all.
+                if _LOCATION_INPUT_HINT_RE.search(haystack) and not search_hint:
                     continue
-                if _SEARCH_INPUT_HINT_RE.search(haystack):
+                if search_hint:
                     return frame, locator
             except Exception as e:
                 continue

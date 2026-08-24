@@ -156,6 +156,17 @@ def load_companies(settings: Settings | None = None, excel_path: Path | str | No
     return tidy.reset_index(drop=True)
 
 
+def filter_companies_by_name(companies: pd.DataFrame, needle: str) -> pd.DataFrame:
+    """Rows whose company name contains ``needle`` (case-insensitive, literal).
+
+    ``regex=False`` matters: company names routinely contain parentheses and
+    periods ("Experis (ManpowerGroup)", "Robert Half (incl. ... Technology)")
+    which are regex metacharacters - treating the needle as a pattern instead
+    of literal text silently returns zero matches for names like those.
+    """
+    return companies[companies["company"].str.lower().str.contains(needle.strip().lower(), regex=False, na=False)]
+
+
 def build_plans(
     companies: pd.DataFrame,
     settings: Settings | None = None,
@@ -504,8 +515,7 @@ def run(
     companies = load_companies(cfg, excel_path)
 
     if company_filter:
-        needle = company_filter.strip().lower()
-        companies = companies[companies["company"].str.lower().str.contains(needle, na=False)]
+        companies = filter_companies_by_name(companies, company_filter)
         if companies.empty:
             raise ValueError(f"No company in the workbook matches {company_filter!r}")
 
