@@ -17,7 +17,12 @@ from typing import Any
 from ats.amazon import AmazonJobsCollector
 from ats.ashby import AshbyCollector
 from ats.avature import AvatureCollector
-from ats.base import ATSCollector, CollectorUnavailable, SCRAPING_METHOD_BROWSER
+from ats.base import (
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+    SCRAPING_METHOD_BROWSER,
+)
 from ats.cornerstone import CornerstoneCollector
 from ats.detector import UNKNOWN, detect_ats
 from ats.eightfold import EightfoldCollector
@@ -122,6 +127,16 @@ class CompanyResult:
     error_type: str | None = None
     error_message: str | None = None
     fell_back: bool = False
+    #: True only when the collector is confident it saw every job the provider
+    #: would serve. ``pipeline.run()`` gates removal sync on this, never on
+    #: ``success`` - a partial harvest is a real success that must not be read
+    #: as "the jobs we didn't reach have closed". Defaults True so paths that
+    #: never paginate (JSON-LD, browser) keep today's behaviour.
+    complete: bool = True
+    #: Why collection stopped, when it stopped short. See ``ats.base``.
+    stop_reason: str | None = None
+    #: What the provider claimed it had, when it said.
+    reported_total: int | None = None
     discovered_ats_url: str | None = None
     discovered_provider: str | None = None
     #: True only when the discovered URL was actually driven through its
@@ -212,8 +227,12 @@ def plan_route(
     )
 
 
-def collect_via_api(plan: RoutePlan) -> list[dict]:
+def collect_via_api(plan: RoutePlan) -> CollectionResult:
     """Run the direct collector for a planned company.
+
+    Always returns a :class:`~ats.base.CollectionResult`, even for collectors
+    that still return a bare list - :meth:`CollectionResult.coerce` wraps those
+    as complete, preserving their current behaviour until they are converted.
 
     Raises:
         CollectorUnavailable: the API could not serve this tenant.
@@ -225,7 +244,7 @@ def collect_via_api(plan: RoutePlan) -> list[dict]:
     detection = dict(plan.detection or {})
     detection.setdefault("url", plan.url)
     collector = collector_class(plan.company, detection)
-    return collector.collect()
+    return CollectionResult.coerce(collector.collect())
 
 
 def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
@@ -324,8 +343,11 @@ def fetch_company_jobs(
     if plan.method == METHOD_API:
         log.info("%s -> %s", company, plan.provider.title())
         try:
-            jobs = collect_via_api(plan)
-            log.info("%s -> %s jobs retrieved", company, len(jobs))
+            collected = collect_via_api(plan)
+            jobs = collected.jobs
+            log.info("%s -> %s jobs retrieved%s", company, len(jobs),
+                     "" if collected.complete
+                     else f" (INCOMPLETE: {collected.stop_reason})")
             # A page-resolved provider (plan.url came from resolve_from_page,
             # not straight from the workbook) is just as verified as a
             # browser-discovered one once it has actually returned jobs -
@@ -335,8 +357,14 @@ def fetch_company_jobs(
                     company=company, jobs=jobs, plan=plan, success=True,
                     discovered_ats_url=plan.url, discovered_provider=plan.provider,
                     discovery_verified=True,
+                    complete=collected.complete, stop_reason=collected.stop_reason,
+                    reported_total=collected.reported_total,
                 )
-            return CompanyResult(company=company, jobs=jobs, plan=plan, success=True)
+            return CompanyResult(
+                company=company, jobs=jobs, plan=plan, success=True,
+                complete=collected.complete, stop_reason=collected.stop_reason,
+                reported_total=collected.reported_total,
+            )
         except CollectorUnavailable as exc:
             if not playwright_enabled:
                 return CompanyResult(
@@ -395,15 +423,18 @@ def fetch_company_jobs(
             note="discovered via browser during this run",
         )
         try:
-            healed_jobs = collect_via_api(healed)
+            healed_collected = collect_via_api(healed)
             log.info("%s -> %s jobs retrieved via discovered %s API",
-                     company, len(healed_jobs), discovered_provider)
+                     company, len(healed_collected.jobs), discovered_provider)
             return CompanyResult(
-                company=company, jobs=healed_jobs, plan=healed, success=True,
+                company=company, jobs=healed_collected.jobs, plan=healed, success=True,
                 fell_back=fell_back,
                 discovered_ats_url=discovered_url,
                 discovered_provider=discovered_provider,
                 discovery_verified=True,
+                complete=healed_collected.complete,
+                stop_reason=healed_collected.stop_reason,
+                reported_total=healed_collected.reported_total,
             )
         except Exception as exc:
             log.warning("%s -> discovered %s API failed (%s); keeping browser rows",

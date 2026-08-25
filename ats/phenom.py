@@ -24,12 +24,25 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_NO_NEW_ROWS,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import PHENOM
 from normalize import join_location
 
+# Phenom serves 10 rows per request, so the old shared 25-*page* budget capped
+# every tenant at 250 jobs - measured live against seven of them (RTX, Cisco,
+# HPE, Humana, BCG, Collins Aerospace, Cencora all returned exactly 250). The
+# ceiling is now expressed in jobs via ATSCollector.max_jobs, which means the
+# same thing regardless of a provider's page size.
 PAGE_SIZE = 10
-MAX_JOBS = 1500
 
 _DDO_RE = re.compile(r"phApp\.ddo\s*=\s*(\{.*?\})\s*;", re.S)
 
@@ -113,15 +126,18 @@ class PhenomCollector(ATSCollector):
             return f"{base}/job/{seq}"
         return str(apply_url) if apply_url else None
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         base = self._base_url()
         search_url = f"{base}/search-results"
 
         records: list[dict | None] = []
         seen: set[str] = set()
+        page = 0
         total: int | None = None
+        stop_reason = STOP_EXHAUSTED
+        complete = True
 
-        for page in range(self.max_pages):
+        while len(records) < self.max_jobs:
             offset = page * PAGE_SIZE
             try:
                 html_text = http_client.get_text(
@@ -132,14 +148,20 @@ class PhenomCollector(ATSCollector):
             except Exception as exc:
                 if page == 0:
                     raise CollectorUnavailable(f"Phenom search-results unavailable: {exc}") from exc
-                self.log.warning("%s: Phenom page %s failed (%s)", self.company, page, exc)
+                self.log.warning(
+                    "%s: Phenom page %s failed (%s); marking incomplete",
+                    self.company, page, exc,
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             ddo = self._parse_ddo(html_text)
             if ddo is None:
                 if page == 0:
                     raise CollectorUnavailable("Phenom page did not contain phApp.ddo")
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
+            page += 1
 
             jobs, page_total = self._extract_jobs(ddo)
             if total is None and page_total is not None:
@@ -163,19 +185,28 @@ class PhenomCollector(ATSCollector):
 
             fresh = [r for r in page_records if r and r["job_url"] not in seen]
             if not fresh:
+                stop_reason = STOP_NO_NEW_ROWS
                 break
             for record in fresh:
                 seen.add(record["job_url"])
             records.extend(fresh)
 
-            if total is not None and len(records) >= min(total, MAX_JOBS):
+            if total is not None and len(records) >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
-            if len(records) >= MAX_JOBS:
-                break
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Phenom search-results returned zero jobs")
 
-        self.log.debug("%s: Phenom reported total=%s, collected=%s",
-                       self.company, total, len(records))
-        return self.finalize(records)
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: Phenom scrape INCOMPLETE (%s) - collected %s of %s",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, pages_fetched=page,
+            reported_total=total, stop_reason=stop_reason,
+        )

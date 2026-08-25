@@ -80,7 +80,7 @@ def test_collect_stops_when_offset_reaches_hits(monkeypatch):
         return SEARCH_PAYLOAD
 
     monkeypatch.setattr(AmazonJobsCollector, "_fetch_page", fake_fetch)
-    jobs = _collector().collect()
+    jobs = _collector().collect().jobs
     assert len(jobs) == 2
     assert calls["offsets"] == [0]  # no second page once offset >= hits
 
@@ -96,7 +96,7 @@ def test_collect_paginates_until_offset_exceeds_hits(monkeypatch):
         return payload
 
     monkeypatch.setattr(AmazonJobsCollector, "_fetch_page", fake_fetch)
-    jobs = _collector().collect()
+    jobs = _collector().collect().jobs
     assert len(jobs) == 2
     assert calls["offsets"] == [0, RESULT_LIMIT]  # walked one extra page
 

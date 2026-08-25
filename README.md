@@ -228,11 +228,48 @@ date, and inventing one would corrupt the freshness filter.
 the posting URL rather than the URL itself — retitling a job changes its URL
 slug but not its underlying requisition id, so the same job stays the same row.
 
-After each successful company scrape, jobs no longer listed by that company are
-deleted. The comparison is scoped per-company via an index (measured at 0.38ms
-against a 21,000-row table), never a full-table scan. Companies whose scrape
-*failed* are skipped entirely — a scraping hiccup must never be read as "all
-jobs closed".
+Jobs no longer listed by a company are aged out, not deleted on sight. Three
+conditions must all hold before a company is synced at all:
+
+| Condition | Why |
+|-----------|-----|
+| `result.success` | A company we could not reach tells us nothing |
+| `result.jobs` | An empty harvest is not evidence every posting closed |
+| **`result.complete`** | A scrape that stopped partway through pagination never saw the later pages — those jobs are missing from *our* data, not from the employer's site |
+
+The comparison is scoped per-company via an index (measured at 0.38ms against a
+21,000-row table), never a full-table scan.
+
+Even then removal is not immediate: a job absent from one qualifying scrape has
+its `misses` counter incremented, and only after `REMOVAL_GRACE_MISSES` (2)
+**consecutive** misses is it deleted. Seeing the job again resets the counter.
+One missed scrape is usually a flicker — a slow page, a reordered result set, a
+briefly unpublished requisition — and deleting on it destroys `first_seen`,
+which makes the job look brand new when it returns.
+
+### Collection completeness
+
+`ATSCollector.collect()` returns a **`CollectionResult`**, not a bare list:
+
+```python
+CollectionResult(jobs, complete, pages_fetched, reported_total, stop_reason)
+```
+
+`complete` is True only when the collector is confident it saw every row the
+provider would serve. A failed page, a tripped job budget, or a walk that ended
+short of the reported total all set it False and name a `stop_reason`
+(`exhausted`, `reported_total_reached`, `page_failed`, `budget_exhausted`,
+`no_new_rows`).
+
+This exists because the two cases used to be indistinguishable. A page failing
+partway through pagination produced a partial harvest the router reported as a
+success, after which the removal sync deleted every job on the pages we never
+reached — reading one transient HTTP error as "those postings closed", and
+resetting `first_seen` so they were re-reported as new when they came back.
+
+Incomplete companies are listed in the run summary with their shortfall.
+Collectors not yet converted still return a list, which `CollectionResult.coerce`
+wraps as complete — preserving their existing behaviour until they are migrated.
 
 ---
 
@@ -242,6 +279,27 @@ Everything tunable lives in `config/settings.yaml`: the freshness window
 (`hours_old`), DFW city list, target-role and exclusion regexes, HTTP
 timeout/retry/backoff, Playwright behaviour (including stealth and the search
 fallback term), and concurrency (`http_workers: 10`, `playwright_workers: 3`).
+
+### Pagination ceilings
+
+`requests.max_jobs_per_company` (default 10,000) bounds how much a converted
+collector will fetch for one company. It is expressed in **jobs, not pages**,
+deliberately: a shared *page* budget means a different job ceiling for every
+provider, because page sizes differ. The old `max_pages_per_company: 25` meant
+250 jobs on Phenom (10/page) and 5,000 on Oracle (200/page) — which silently
+truncated 23 companies in a measured run, including eleven Workday tenants that
+all returned exactly 500 (20 × 25) and seven Phenom tenants that returned
+exactly 250.
+
+Tripping the ceiling is not an error, but it marks the scrape incomplete, which
+suppresses removal sync for that company and lists it in the run summary with
+its shortfall. `max_pages_per_company` remains for collectors not yet converted
+(iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
+
+Collectors that can be truncated request **newest-first** ordering, so what
+survives a short walk is what the freshness window can still match. Workday had
+no ordering at all before this — it posted `searchText: ""` and kept an
+arbitrary slice of the tenant, unstable between runs.
 
 Target roles match on any title segment naming "data" as its own word (titles
 are split on `,`, `/`, `-`, `|`) — `Software Engineer, Data Engineering`
@@ -328,7 +386,7 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | `ats/detector.py` | Lexical ATS detection from a URL, plus HTML fingerprints and embedded-URL extraction. **Add a new provider's host/fingerprint here** |
 | `ats/resolver.py` | One HTTP GET on a branded page → identify the ATS behind it (redirect/fingerprint/embedded URL); 403→browser-UA retry |
 | `ats/url_repair.py` | Swaps a dead `careers.*` subdomain for a live careers page before routing |
-| `ats/base.py` | `ATSCollector` base class + `CollectorUnavailable`; `record()`/`finalize()` helpers every collector uses |
+| `ats/base.py` | `ATSCollector` base class, `CollectionResult` (the completeness contract) + `CollectorUnavailable`; `record()`/`finalize()` helpers every collector uses |
 | `ats/html_utils.py` | Shared HTML/JSON-LD parsing helpers for collectors |
 | `ats/discovery.py` | On-demand ATS-URL discovery engine (used by `tools/find_ats_urls.py`, **not** the live pipeline) |
 

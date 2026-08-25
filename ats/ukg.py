@@ -13,7 +13,15 @@ from __future__ import annotations
 from typing import Any
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import UKG
 from normalize import join_location
 
@@ -80,16 +88,19 @@ class UKGCollector(ATSCollector):
             return f"{self._base()}/{tenant}/JobBoard/{board}/OpportunityDetail?opportunityId={opportunity_id}"
         return None
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         tenant, board = self._coordinates()
         base = self._base()
         endpoint = f"{base}/{tenant}/JobBoard/{board}/JobBoardView/LoadSearchResults"
 
         records: list[dict | None] = []
         skip = 0
+        pages = 0
         total: int | None = None
+        stop_reason = STOP_EXHAUSTED
+        complete = True
 
-        for page in range(self.max_pages):
+        while len(records) < self.max_jobs:
             payload = {
                 "opportunitySearch": {
                     "Top": PAGE_SIZE,
@@ -114,9 +125,13 @@ class UKGCollector(ATSCollector):
                     headers={"Accept": "application/json", "Origin": base},
                 )
             except Exception as exc:
-                if page == 0:
+                if pages == 0:
                     raise CollectorUnavailable(f"UKG job board unavailable: {exc}") from exc
-                self.log.warning("%s: UKG page %s failed (%s)", self.company, page, exc)
+                self.log.warning(
+                    "%s: UKG page %s failed (%s); marking incomplete",
+                    self.company, pages, exc,
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             if not isinstance(data, dict):
@@ -129,6 +144,7 @@ class UKGCollector(ATSCollector):
                 total = data.get("totalCount") or data.get("TotalCount")
             if not opportunities:
                 break
+            pages += 1
 
             for opportunity in opportunities:
                 if not isinstance(opportunity, dict):
@@ -147,8 +163,21 @@ class UKGCollector(ATSCollector):
 
             skip += PAGE_SIZE
             if total is not None and skip >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("UKG job board returned zero opportunities")
-        return self.finalize(records)
+
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: UKG scrape INCOMPLETE (%s) - collected %s of %s",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, pages_fetched=pages,
+            reported_total=total, stop_reason=stop_reason,
+        )

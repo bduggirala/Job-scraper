@@ -158,7 +158,22 @@ requests:
   # reproduced 6/6). A generic UA doesn't match the bot signatures WAF
   # blocklists.
   user_agent: "Mozilla/5.0"
-  max_pages_per_company: 25   # pagination guard for API collectors
+
+  # Legacy page-count guard, still used by collectors not yet converted to
+  # CollectionResult (iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
+  max_pages_per_company: 25
+
+  # Job-count ceiling for converted collectors. Expressed in JOBS, not pages,
+  # because a shared *page* budget means a different job ceiling per provider:
+  # 25 pages was 250 jobs on Phenom (10/page) and 5,000 on Oracle (200/page).
+  # That mismatch silently truncated 23 companies - measured against a real
+  # run, eleven Workday tenants returned exactly 500 (20 x 25) and seven
+  # Phenom tenants exactly 250 (10 x 25).
+  #
+  # Tripping this ceiling is not an error, but it does mark the scrape
+  # incomplete, which suppresses removal sync for that company and lists it in
+  # the run summary. Raise it if the summary keeps reporting a real shortfall.
+  max_jobs_per_company: 10000
 
 # --- Concurrency -----------------------------------------------------------
 concurrency:

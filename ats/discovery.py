@@ -27,6 +27,7 @@ from ats.detector import (
     detect_from_html,
     extract_any_embedded_ats_url,
 )
+from ats.base import CollectionResult
 from ats.html_utils import make_soup
 from ats.router import COLLECTORS
 import http_client
@@ -77,13 +78,20 @@ def verify_ats_url(company: str, url: str, provider: str | None = None) -> tuple
         return 0, f"no collector for provider {provider!r}"
 
     try:
-        jobs = collector_class(company, detection).collect()
+        # coerce(): collectors return either a CollectionResult or (until they
+        # are migrated) a bare list. Verification only cares about the count.
+        collected = CollectionResult.coerce(collector_class(company, detection).collect())
     except Exception as exc:
         return 0, f"{provider} collector failed: {exc}"
 
-    count = len(jobs or [])
+    count = len(collected.jobs)
     if count == 0:
         return 0, f"{provider} collector returned zero jobs"
+    if not collected.complete:
+        return count, (
+            f"{provider} API returned {count} jobs "
+            f"(INCOMPLETE: {collected.stop_reason})"
+        )
     return count, f"{provider} API returned {count} jobs"
 
 

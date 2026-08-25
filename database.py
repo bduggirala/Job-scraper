@@ -37,11 +37,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     location    TEXT,
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
-    date_posted TEXT
+    date_posted TEXT,
+    misses      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company);
 CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
 """
+
+#: Consecutive complete scrapes that must miss a job before it is removed.
+#: One miss is usually a flicker - a slow page, a reordered result set, a
+#: requisition briefly unpublished - and deleting on it destroys first_seen,
+#: which then re-reports the job as new when it comes back.
+REMOVAL_GRACE_MISSES = 2
 
 
 def _utc_now() -> str:
@@ -84,12 +91,28 @@ class JobDatabase:
         self._connection.row_factory = sqlite3.Row
         with self._lock:
             self._connection.executescript(SCHEMA)
+            self._add_missing_columns()
             # WAL keeps concurrent readers from blocking the writer.
             self._connection.execute("PRAGMA journal_mode=WAL")
             # Keeps query-planner statistics fresh so per-company lookups
             # reliably use idx_jobs_company instead of a table scan.
             self._connection.execute("ANALYZE")
             self._connection.commit()
+
+    def _add_missing_columns(self) -> None:
+        """Additive migration for databases created before a column existed.
+
+        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table untouched, so a
+        database written by an earlier version keeps its old shape. Only
+        additive changes belong here; anything structural goes through
+        :func:`_migrate_legacy_db`.
+        """
+        cursor = self._connection.execute("PRAGMA table_info(jobs)")
+        existing = {row[1] for row in cursor.fetchall()}
+        for column, ddl in (("misses", "INTEGER NOT NULL DEFAULT 0"),):
+            if column not in existing:
+                log.info("Adding missing column jobs.%s", column)
+                self._connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
 
     @contextmanager
     def _cursor(self) -> Iterator[sqlite3.Cursor]:
@@ -192,7 +215,9 @@ class JobDatabase:
                     last_seen   = excluded.last_seen,
                     title       = COALESCE(excluded.title, jobs.title),
                     location    = COALESCE(excluded.location, jobs.location),
-                    date_posted = COALESCE(excluded.date_posted, jobs.date_posted)
+                    date_posted = COALESCE(excluded.date_posted, jobs.date_posted),
+                    -- Seeing a job again clears any accumulated absence.
+                    misses      = 0
                 """,
                 payload,
             )
@@ -201,26 +226,61 @@ class JobDatabase:
         return {"new": new_count, "updated": len(ids) - new_count}
 
     def sync_company(self, company: str, current_ids: set[str]) -> dict[str, int]:
-        """Delete jobs on file for ``company`` that were not seen this run.
+        """Age out jobs for ``company`` that were not seen this run.
 
         Only ever compares against rows for this one company (via
-        idx_jobs_company), never the whole table. Call only after a
-        *successful* scrape of ``company`` - never for a failed company, since
-        a scraping hiccup returning zero jobs must not be read as "all jobs
-        closed" and delete real, still-open postings.
+        idx_jobs_company), never the whole table.
+
+        **Call only after a scrape that was both successful and complete.** A
+        failed company must never be synced (a hiccup returning zero jobs is
+        not "all jobs closed"), and neither must a company whose pagination
+        stopped short - see :class:`ats.base.CollectionResult`.
+
+        Removal is deliberately not immediate. A job absent from one scrape has
+        its miss counter incremented; only after
+        :data:`REMOVAL_GRACE_MISSES` consecutive misses is it deleted. One
+        missed scrape is usually a flicker, and deleting on it destroys
+        ``first_seen`` - which makes the job look brand new when it returns.
+
+        Returns:
+            ``{"removed": int, "missing": int}`` - rows deleted, and rows now
+            carrying at least one miss.
         """
         known = self.company_ids(company)
-        removed = known - current_ids
-        if not removed:
-            return {"removed": 0}
+        missing = known - current_ids
 
         with self._cursor() as cursor:
-            placeholders = ",".join("?" * len(removed))
+            # Anything seen this run is healthy again: reset its counter so
+            # misses must be *consecutive* to add up to a removal.
+            if current_ids:
+                seen = list(current_ids)
+                for start in range(0, len(seen), 500):
+                    chunk = seen[start:start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    cursor.execute(
+                        f"UPDATE jobs SET misses = 0 WHERE job_id IN ({placeholders})",
+                        chunk,
+                    )
+
+            if not missing:
+                return {"removed": 0, "missing": 0}
+
+            absent = list(missing)
+            for start in range(0, len(absent), 500):
+                chunk = absent[start:start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cursor.execute(
+                    f"UPDATE jobs SET misses = misses + 1 WHERE job_id IN ({placeholders})",
+                    chunk,
+                )
+
             cursor.execute(
-                f"DELETE FROM jobs WHERE job_id IN ({placeholders})",
-                list(removed),
+                "DELETE FROM jobs WHERE company = ? AND misses >= ?",
+                (company, REMOVAL_GRACE_MISSES),
             )
-        return {"removed": len(removed)}
+            removed = cursor.rowcount or 0
+
+        return {"removed": removed, "missing": len(missing)}
 
     def close(self) -> None:
         with self._lock:

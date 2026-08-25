@@ -24,7 +24,16 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_NO_NEW_ROWS,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import JIBE
 from normalize import join_location
 
@@ -76,15 +85,19 @@ class JibeCollector(ATSCollector):
             description=data.get("description"),
         )
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         host = self._host()
         endpoint = f"https://{host}/api/jobs"
 
         records: list[dict | None] = []
         seen: set[str] = set()
+        page = 0
         total: int | None = None
+        stop_reason = STOP_EXHAUSTED
+        complete = True
 
-        for page in range(1, MAX_PAGES + 1):
+        while len(records) < self.max_jobs:
+            page += 1
             try:
                 data = self._fetch_page(endpoint, page)
             except CollectorUnavailable:
@@ -92,7 +105,11 @@ class JibeCollector(ATSCollector):
             except Exception as exc:
                 if page == 1:
                     raise CollectorUnavailable(f"Jibe API unavailable: {exc}") from exc
-                self.log.warning("%s: Jibe page %s failed (%s)", self.company, page, exc)
+                self.log.warning(
+                    "%s: Jibe page %s failed (%s); marking incomplete",
+                    self.company, page, exc,
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             jobs = data.get("jobs") or []
@@ -108,14 +125,28 @@ class JibeCollector(ATSCollector):
                     fresh.append(row)
 
             if not fresh:
+                stop_reason = STOP_NO_NEW_ROWS
                 break
             for row in fresh:
                 seen.add(row["job_url"])
             records.extend(fresh)
 
             if total is not None and len(seen) >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Jibe API returned zero jobs")
-        return self.finalize(records)
+
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: Jibe scrape INCOMPLETE (%s) - collected %s of %s",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, pages_fetched=page,
+            reported_total=total, stop_reason=stop_reason,
+        )

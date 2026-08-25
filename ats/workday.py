@@ -17,7 +17,15 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import WORKDAY
 
 PAGE_SIZE = 20
@@ -66,18 +74,26 @@ class WorkdayCollector(ATSCollector):
                 return bullet
         return None
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         endpoint = self._endpoint()
         records: list[dict | None] = []
         offset = 0
+        pages = 0
         total: int | None = None
+        stop_reason = STOP_EXHAUSTED
+        complete = True
 
-        for page in range(self.max_pages):
+        while len(records) < self.max_jobs:
             payload = {
                 "appliedFacets": {},
                 "limit": PAGE_SIZE,
                 "offset": offset,
+                # Newest-first. Without an explicit sort Workday returns rows in
+                # an unspecified order, so a truncated walk kept an arbitrary
+                # slice of the tenant - useless against a freshness window, and
+                # unstable between runs (which churned the removal sync).
                 "searchText": "",
+                "sortBy": "POSTING_DATES_DESC",
             }
             try:
                 data = http_client.post_json(
@@ -86,10 +102,16 @@ class WorkdayCollector(ATSCollector):
                     headers={"Accept": "application/json", "Referer": self._base_site_url()},
                 )
             except Exception as exc:
-                if page == 0:
+                if pages == 0:
                     raise CollectorUnavailable(f"Workday CXS unavailable: {exc}") from exc
-                self.log.warning("%s: Workday page %s failed (%s); keeping %s jobs so far",
-                                 self.company, page, exc, len(records))
+                # Earlier pages are real and worth keeping, but this walk is
+                # short: say so, or the pipeline will delete the rows we never
+                # got to as though the postings had closed.
+                self.log.warning(
+                    "%s: Workday page %s failed (%s); keeping %s jobs and marking "
+                    "the scrape incomplete", self.company, pages, exc, len(records),
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             if not isinstance(data, dict):
@@ -99,9 +121,12 @@ class WorkdayCollector(ATSCollector):
             if total is None:
                 total = data.get("total")
 
+            # An empty page means the provider is done, whatever `total` said.
             if not postings:
+                stop_reason = STOP_EXHAUSTED
                 break
 
+            pages += 1
             for posting in postings:
                 if not isinstance(posting, dict):
                     continue
@@ -118,11 +143,22 @@ class WorkdayCollector(ATSCollector):
 
             offset += PAGE_SIZE
             if total is not None and offset >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
+        else:
+            # Budget tripped with rows still outstanding.
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Workday CXS returned zero postings")
 
-        self.log.debug("%s: Workday reported total=%s, collected=%s",
-                       self.company, total, len(records))
-        return self.finalize(records)
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: Workday scrape INCOMPLETE (%s) - collected %s of %s reported",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, pages_fetched=pages,
+            reported_total=total, stop_reason=stop_reason,
+        )

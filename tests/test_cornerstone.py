@@ -111,7 +111,7 @@ def test_parses_title_location_date_and_absolute_url(monkeypatch):
         "totalCount": 3,
         "requisitions": PAGE_1["data"]["requisitions"] + PAGE_2["data"]["requisitions"],
     }}])
-    jobs = _collector().collect()
+    jobs = _collector().collect().jobs
     assert len(jobs) == 3
 
     row = next(j for j in jobs if j["title"] == "Patient Access Rep PRN - Community Health")
@@ -130,7 +130,7 @@ def test_pagination_stops_when_totalcount_reached(monkeypatch):
     monkeypatch.setattr("ats.cornerstone.PAGE_SIZE", 2)
     _patch_home(monkeypatch)
     calls = _patch_search(monkeypatch, [PAGE_1, PAGE_2])
-    jobs = _collector().collect()
+    jobs = _collector().collect().jobs
     assert len(jobs) == 3
     assert calls["n"] == 2  # page 1 (2 jobs) + page 2 (1 job) -> total reached
 

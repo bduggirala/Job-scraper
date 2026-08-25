@@ -63,7 +63,7 @@ def test_parses_title_location_url_and_apply(monkeypatch):
         JibeCollector, "_fetch_page",
         lambda self, endpoint, page: PAGE_1 if page == 1 else {"jobs": [], "totalCount": 2},
     )
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 2
 
     pa = next(r for r in rows if r["title"].startswith("Physician Assistant"))
@@ -87,7 +87,7 @@ def test_stops_at_total_count_without_extra_pages(monkeypatch):
         return PAGE_1
 
     monkeypatch.setattr(JibeCollector, "_fetch_page", fake)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 2
     assert calls["n"] == 1  # stopped once len(seen) >= totalCount
 
@@ -104,7 +104,7 @@ def test_stops_when_page_has_no_new_slugs(monkeypatch):
         return page
 
     monkeypatch.setattr(JibeCollector, "_fetch_page", fake)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 2
     assert calls["n"] == 2  # page 1 (2 new) + page 2 (0 new -> stop)
 

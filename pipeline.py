@@ -78,6 +78,10 @@ class RunSummary:
     ats_urls_written: int = 0
     hours_old: int = 72
     provider_counts: dict[str, int] = field(default_factory=dict)
+    #: Companies whose scrape stopped short of the provider's full job list.
+    incomplete_companies: int = 0
+    #: ``(company, collected, reported_total, stop_reason)`` per truncated company.
+    truncated: list[tuple[str, int, int | None, str | None]] = field(default_factory=list)
 
     def render(self) -> str:
         lines = [
@@ -114,6 +118,24 @@ class RunSummary:
                 self.provider_counts.items(), key=lambda kv: (-kv[1], kv[0])
             ):
                 lines.append(f"  {provider:<18} {count:>4}")
+
+        # Truncation used to be invisible: eleven Workday tenants all returned
+        # exactly 500 jobs for months without anything saying so. Report it
+        # loudly, sorted by how much was missed.
+        if self.truncated:
+            lines.extend([
+                "",
+                f"INCOMPLETE - {len(self.truncated)} company(ies) stopped short "
+                f"(removal sync skipped for these):",
+            ])
+            for company, collected, total, reason in sorted(
+                self.truncated, key=lambda row: -((row[2] or 0) - row[1])
+            ):
+                shortfall = f"{total - collected:,} missed" if total else "unknown shortfall"
+                lines.append(
+                    f"  {company[:26]:<26} {collected:>6,} of "
+                    f"{(f'{total:,}' if total else '?'):>7}  {shortfall}  [{reason}]"
+                )
         lines.append("=" * 58)
         return "\n".join(lines)
 
@@ -468,6 +490,48 @@ def write_outputs(
     return written
 
 
+def sync_completed_companies(
+    results: Iterable[CompanyResult], database: JobDatabase
+) -> dict[str, int]:
+    """Upsert each company's jobs and age out the ones it no longer lists.
+
+    Three conditions must all hold before a company is synced, and each guards
+    a different way of misreading absence as closure:
+
+    * ``result.success`` - a company we could not reach tells us nothing.
+    * ``result.jobs`` - an empty harvest is not evidence every posting closed.
+    * ``result.complete`` - a scrape that stopped partway through pagination
+      never saw the later pages, so the jobs on them are missing from *our*
+      data, not from the employer's site. This is the condition that was absent
+      before :class:`ats.base.CollectionResult` existed, and it is why one
+      transient HTTP error could delete hundreds of live postings.
+
+    Returns:
+        ``{"removed": int, "synced": int, "skipped_incomplete": int}``
+    """
+    stats = {"removed": 0, "synced": 0, "skipped_incomplete": 0}
+
+    for result in results:
+        if not result.success or not result.jobs:
+            continue
+        database.upsert_jobs(result.jobs)
+
+        if not result.complete:
+            stats["skipped_incomplete"] += 1
+            log.warning(
+                "%s: scrape incomplete (%s) - upserted %s job(s) but skipping "
+                "removal sync so unreached postings are not deleted",
+                result.company, result.stop_reason or "unknown", len(result.jobs),
+            )
+            continue
+
+        ids = {j["job_id"] for j in result.jobs if j.get("job_id")}
+        stats["removed"] += database.sync_company(result.company, ids)["removed"]
+        stats["synced"] += 1
+
+    return stats
+
+
 def verified_repair(result: CompanyResult) -> tuple[str, str, str] | None:
     """``(source, raw_url, repaired_url)`` if this result should overwrite a
     dead workbook URL with the live one url_repair.py found, else ``None``.
@@ -553,6 +617,12 @@ def run(
         else:
             summary.direct_api_companies += 1
 
+        if result.success and not result.complete:
+            summary.truncated.append((
+                result.company, len(result.jobs),
+                result.reported_total, result.stop_reason,
+            ))
+
         provider = result.plan.provider
         summary.provider_counts[provider] = summary.provider_counts.get(provider, 0) + 1
         all_jobs.extend(result.jobs)
@@ -584,19 +654,11 @@ def run(
         summary.duplicates_removed = deduped["removed"]
         final_jobs = deduped["jobs"]
 
-        # Per-company upsert + removal sync. Only for companies scraped
-        # successfully this run - a failed company's jobs must never be
-        # deleted just because this run couldn't reach its page (that would
-        # read as "all jobs closed" when it was really a scraping hiccup).
-        # sync_company() only ever touches that one company's rows, via
-        # idx_jobs_company - never a full-table scan.
-        for result in results:
-            if not result.success or not result.jobs:
-                continue
-            database.upsert_jobs(result.jobs)
-            ids = {j["job_id"] for j in result.jobs if j.get("job_id")}
-            sync_stats = database.sync_company(result.company, ids)
-            summary.jobs_removed += sync_stats["removed"]
+        # Per-company upsert + removal sync, gated on success AND completeness.
+        # See sync_completed_companies() for why both matter.
+        sync_stats = sync_completed_companies(results, database)
+        summary.jobs_removed = sync_stats["removed"]
+        summary.incomplete_companies = sync_stats["skipped_incomplete"]
 
         refreshed = database.get_first_seen_map([j.get("job_id") for j in final_jobs])
         for job in final_jobs:

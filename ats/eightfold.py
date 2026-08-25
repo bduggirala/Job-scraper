@@ -12,7 +12,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import EIGHTFOLD
 from normalize import join_location
 
@@ -58,16 +66,19 @@ class EightfoldCollector(ATSCollector):
             return join_location(*[str(loc) for loc in locations[:3]])
         return None
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         host = self._host()
         endpoint = f"https://{host}/api/apply/v2/jobs"
         domain = self._domain()
 
         records: list[dict | None] = []
         start = 0
+        pages = 0
         total: int | None = None
+        stop_reason = STOP_EXHAUSTED
+        complete = True
 
-        for page in range(self.max_pages):
+        while len(records) < self.max_jobs:
             params = {
                 "domain": domain,
                 "start": start,
@@ -77,9 +88,13 @@ class EightfoldCollector(ATSCollector):
             try:
                 data = http_client.get_json(endpoint, params=params)
             except Exception as exc:
-                if page == 0:
+                if pages == 0:
                     raise CollectorUnavailable(f"Eightfold API unavailable: {exc}") from exc
-                self.log.warning("%s: Eightfold page %s failed (%s)", self.company, page, exc)
+                self.log.warning(
+                    "%s: Eightfold page %s failed (%s); marking incomplete",
+                    self.company, pages, exc,
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             if not isinstance(data, dict):
@@ -90,6 +105,7 @@ class EightfoldCollector(ATSCollector):
                 total = data.get("count")
             if not positions:
                 break
+            pages += 1
 
             for position in positions:
                 if not isinstance(position, dict):
@@ -108,8 +124,21 @@ class EightfoldCollector(ATSCollector):
 
             start += PAGE_SIZE
             if total is not None and start >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Eightfold API returned zero positions")
-        return self.finalize(records)
+
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: Eightfold scrape INCOMPLETE (%s) - collected %s of %s",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, pages_fetched=pages,
+            reported_total=total, stop_reason=stop_reason,
+        )
