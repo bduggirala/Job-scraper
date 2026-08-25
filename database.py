@@ -42,7 +42,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company);
 CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+#: meta key holding the job-id scheme the stored rows were written under.
+_SCHEME_KEY = "job_id_scheme_version"
 
 #: Consecutive complete scrapes that must miss a job before it is removed.
 #: One miss is usually a flicker - a slow page, a reordered result set, a
@@ -92,6 +100,7 @@ class JobDatabase:
         with self._lock:
             self._connection.executescript(SCHEMA)
             self._add_missing_columns()
+            self._reset_if_scheme_changed()
             # WAL keeps concurrent readers from blocking the writer.
             self._connection.execute("PRAGMA journal_mode=WAL")
             # Keeps query-planner statistics fresh so per-company lookups
@@ -113,6 +122,59 @@ class JobDatabase:
             if column not in existing:
                 log.info("Adding missing column jobs.%s", column)
                 self._connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
+
+    # -- job-id scheme ----------------------------------------------------
+    def scheme_version(self) -> int:
+        """The job-id scheme the stored rows were written under (0 if unknown)."""
+        try:
+            row = self._connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (_SCHEME_KEY,)
+            ).fetchone()
+        except sqlite3.Error:
+            return 0
+        if row is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _set_scheme_version(self, version: int) -> None:
+        self._connection.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SCHEME_KEY, str(version)),
+        )
+        self._connection.commit()
+
+    def _reset_if_scheme_changed(self) -> None:
+        """Clear the table when the stored ids were built by an older scheme.
+
+        A changed id format makes every stored id unmatchable - nothing a new
+        run produces will ever equal one. Left in place those rows are never
+        refreshed and never removed (removal only considers ids the current run
+        produced), while still inflating ``known_ids()`` so real new jobs are
+        compared against dead identities.
+
+        ``first_seen`` is the only history the table holds, and it is already
+        unrecoverable once ids change, so clearing costs nothing beyond one run
+        of jobs re-reported as new.
+        """
+        from job_identity import JOB_ID_SCHEME_VERSION
+
+        stored = self.scheme_version()
+        if stored == JOB_ID_SCHEME_VERSION:
+            return
+
+        count = self._connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        if count:
+            log.warning(
+                "Job-id scheme changed (v%s -> v%s); clearing %s stored job(s). "
+                "Every job will be reported as new once on this run.",
+                stored or "untracked", JOB_ID_SCHEME_VERSION, count,
+            )
+            self._connection.execute("DELETE FROM jobs")
+        self._set_scheme_version(JOB_ID_SCHEME_VERSION)
 
     @contextmanager
     def _cursor(self) -> Iterator[sqlite3.Cursor]:

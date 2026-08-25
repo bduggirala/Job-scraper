@@ -630,8 +630,12 @@ def run(
     # job_id is a database-layer identity, never part of the spec'd normalized
     # record - computed once here and carried alongside each dict, but never
     # written into RECORD_FIELDS/OUTPUT_FIELDS (see write_outputs()).
+    # Scoped by company: the extracted ids are only unique *within* an
+    # employer, and job_id is the jobs-table primary key.
     for job in all_jobs:
-        job["job_id"] = extract_stable_job_id(job.get("job_url"), job.get("ats_provider"))
+        job["job_id"] = extract_stable_job_id(
+            job.get("job_url"), job.get("ats_provider"), job.get("company"),
+        )
 
     summary.jobs_collected = len(all_jobs)
     log.info("Collected %s raw jobs across %s companies", len(all_jobs), len(results))

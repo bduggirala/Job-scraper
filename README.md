@@ -228,6 +228,22 @@ date, and inventing one would corrupt the freshness filter.
 the posting URL rather than the URL itself — retitling a job changes its URL
 slug but not its underlying requisition id, so the same job stays the same row.
 
+Ids are **scoped by company**: `{company}:{provider}:{id}`. The extracted id is
+only unique *within* an employer, and `job_id` is the table's primary key — the
+provider prefix alone is the literal string `unknown` for every browser-routed
+company, so `https://a.com/careers?jobId=55512` and
+`https://b.com/apply?jobid=55512` used to produce the same id and merge two
+employers' postings into one row. The company key is normalized (suffixes and
+punctuation dropped) so workbook drift — "Acme Inc" one run, "Acme, Inc." the
+next — does not orphan every job that company had.
+
+`job_identity.JOB_ID_SCHEME_VERSION` records the format. When it changes, the
+`jobs` table is cleared on open rather than left holding ids nothing will ever
+match again: such rows are never refreshed and never removed (removal only
+considers ids the current run produced) while still inflating the "already
+known" set. Every job is reported as new once after such a reset, and the log
+says so.
+
 Jobs no longer listed by a company are aged out, not deleted on sight. Three
 conditions must all hold before a company is synced at all:
 
@@ -419,7 +435,7 @@ returns real jobs through it.
 | `filters.py` | Role match (per title segment), DFW/remote match, freshness window |
 | `enrich.py` | Fill coarse locations (e.g. Workday detail fetch) |
 | `deduplicate.py` | Collapse duplicate postings within a run |
-| `job_identity.py` | Stable per-job id derived from the posting URL |
+| `job_identity.py` | Stable, company-scoped per-job id derived from the posting URL; `JOB_ID_SCHEME_VERSION` |
 | `database.py` | SQLite tracking — upsert, per-company removal sync, new/first-seen |
 | `export_ats_urls.py` | Write verified discovered ATS URLs, verified dead-URL repairs, and run status back into the workbook |
 
