@@ -15,12 +15,19 @@ from __future__ import annotations
 from urllib.parse import urlsplit, urlunsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_NO_NEW_ROWS,
+    STOP_PAGE_FAILED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import SUCCESSFACTORS
 from ats.html_utils import extract_job_links, iter_jsonld_jobs, jsonld_location
 
 PAGE_STEP = 25
-MAX_PAGES = 8
 
 
 class SuccessFactorsCollector(ATSCollector):
@@ -34,12 +41,16 @@ class SuccessFactorsCollector(ATSCollector):
             raise CollectorUnavailable("Unparseable SuccessFactors URL")
         return urlunsplit((parts.scheme or "https", parts.netloc, "/search/", "", ""))
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         search_url = self._search_url()
         records: list[dict | None] = []
         seen: set[str] = set()
+        page = -1
+        complete = True
+        stop_reason = STOP_EXHAUSTED
 
-        for page in range(min(self.max_pages, MAX_PAGES)):
+        while len(records) < self.max_jobs:
+            page += 1
             params = {
                 "q": "",
                 "sortColumn": "referencedate",
@@ -53,6 +64,9 @@ class SuccessFactorsCollector(ATSCollector):
             except Exception as exc:
                 if page == 0:
                     raise CollectorUnavailable(f"SuccessFactors search unavailable: {exc}") from exc
+                self.log.warning("%s: SuccessFactors page %s failed (%s); marking incomplete",
+                                 self.company, page, exc)
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             page_records = [
@@ -80,11 +94,19 @@ class SuccessFactorsCollector(ATSCollector):
 
             fresh = [r for r in page_records if r and r["job_url"] not in seen]
             if not fresh:
+                stop_reason = STOP_NO_NEW_ROWS
                 break
             for record in fresh:
                 seen.add(record["job_url"])
             records.extend(fresh)
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("SuccessFactors search returned zero jobs")
-        return self.finalize(records)
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning("%s: SuccessFactors scrape INCOMPLETE (%s) - collected %s",
+                             self.company, stop_reason, len(jobs))
+        return CollectionResult(jobs=jobs, complete=complete,
+                                pages_fetched=page + 1, stop_reason=stop_reason)

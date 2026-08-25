@@ -89,7 +89,7 @@ def test_collect_paginates_and_stops_when_no_new_ids(monkeypatch):
         return json.dumps({"results": RESULTS_FRAGMENT, "hasJobs": True})
 
     monkeypatch.setattr(RadancyCollector, "_fetch_page", fake_fetch)
-    jobs = _collector().collect()
+    jobs = _collector().collect().jobs
     assert len(jobs) == 2
     assert calls["n"] == 2   # page 1 (2 new) + page 2 (0 new -> stop)
 

@@ -200,6 +200,13 @@ Any collector that cannot serve a tenant raises `CollectorUnavailable`, and the
 router falls back to the next tier (JSON-LD, then Playwright) rather than
 failing the company.
 
+The JSON-LD tier applies the same `hop_good_enough_rows` floor the browser
+traversal uses: a landing page embedding two or three "featured" roles for SEO
+is kept only as a fallback while the ladder continues, never accepted as the
+company's job list. It also runs for a *known* provider whose collector just
+failed — previously it was gated on an unrecognised provider and skipped
+exactly the case where a cheap tier helps most.
+
 ---
 
 ## Output
@@ -284,8 +291,11 @@ reached — reading one transient HTTP error as "those postings closed", and
 resetting `first_seen` so they were re-reported as new when they came back.
 
 Incomplete companies are listed in the run summary with their shortfall.
-Collectors not yet converted still return a list, which `CollectionResult.coerce`
-wraps as complete — preserving their existing behaviour until they are migrated.
+
+All 14 paginating collectors return a `CollectionResult`. The four that do not
+— Greenhouse, Lever, Ashby, Jobvite — return their entire board in a single
+response, so there is no pagination for them to get wrong; they stay on the
+`CollectionResult.coerce` shim, which treats a bare list as complete.
 
 ---
 

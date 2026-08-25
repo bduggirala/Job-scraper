@@ -23,11 +23,22 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import TALEO
 
 ORC_PATH = "/hcmRestApi/resources/latest/recruitingCEJobRequisitions"
 ORC_PAGE_SIZE = 200
+#: Page size sent to the legacy searchjobs endpoint. Sent explicitly so
+#: end-of-results can be judged against a size we chose rather than a guess.
+LEGACY_PAGE_SIZE = 25
 
 
 class TaleoCollector(ATSCollector):
@@ -54,7 +65,7 @@ class TaleoCollector(ATSCollector):
             return match.group(1)
         return "CX_1"
 
-    def _collect_oracle_cloud(self) -> list[dict]:
+    def _collect_oracle_cloud(self) -> CollectionResult:
         host = self.host or urlsplit(self.url or "").netloc
         if not host:
             raise CollectorUnavailable("No Oracle Cloud host available")
@@ -63,9 +74,12 @@ class TaleoCollector(ATSCollector):
         site = self._site_number()
         records: list[dict | None] = []
         offset = 0
+        pages = 0
         total: int | None = None
+        complete = True
+        stop_reason = STOP_EXHAUSTED
 
-        for page in range(self.max_pages):
+        while len(records) < self.max_jobs:
             finder = (
                 f"findReqs;siteNumber={site},limit={ORC_PAGE_SIZE},"
                 f"offset={offset},sortBy=POSTING_DATES_DESC"
@@ -84,8 +98,13 @@ class TaleoCollector(ATSCollector):
                     headers={"Accept": "application/json"},
                 )
             except Exception as exc:
-                if page == 0:
+                if pages == 0:
                     raise CollectorUnavailable(f"Oracle Cloud API unavailable: {exc}") from exc
+                self.log.warning(
+                    "%s: Oracle Cloud page %s failed (%s); marking incomplete",
+                    self.company, pages, exc,
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             items = (data or {}).get("items") or []
@@ -98,6 +117,7 @@ class TaleoCollector(ATSCollector):
             requisitions = items[0].get("requisitionList") or []
             if not requisitions:
                 break
+            pages += 1
 
             for req in requisitions:
                 if not isinstance(req, dict):
@@ -126,14 +146,24 @@ class TaleoCollector(ATSCollector):
             if len(requisitions) < ORC_PAGE_SIZE:
                 break
             if total is not None and offset >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Oracle Cloud API returned zero requisitions")
 
-        self.log.debug("%s: Oracle Cloud reported total=%s, collected=%s",
-                       self.company, total, len(records))
-        return self.finalize(records)
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: Oracle Cloud scrape INCOMPLETE (%s) - collected %s of %s",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, pages_fetched=pages,
+            reported_total=total, stop_reason=stop_reason,
+        )
 
     # -- Legacy Taleo career section --------------------------------------
     @staticmethod
@@ -145,15 +175,20 @@ class TaleoCollector(ATSCollector):
             mapped[key] = values[index] if index < len(values) else None
         return mapped
 
-    def _collect_legacy_taleo(self) -> list[dict]:
+    def _collect_legacy_taleo(self) -> CollectionResult:
         host = self.host
         if not host:
             raise CollectorUnavailable("No Taleo host available")
 
         endpoint = f"https://{host}/careersection/rest/jobboard/searchjobs"
         records: list[dict | None] = []
+        complete = True
+        stop_reason = STOP_EXHAUSTED
+        observed_page_size = LEGACY_PAGE_SIZE
 
-        for page in range(1, min(self.max_pages, 10) + 1):
+        page = 0
+        while len(records) < self.max_jobs:
+            page += 1
             payload = {
                 "multilineEnabled": False,
                 "sortingSelection": {
@@ -167,6 +202,11 @@ class TaleoCollector(ATSCollector):
                 "filterSelectionParam": {"searchFilterSelections": []},
                 "advancedSearchFiltersSelectionParam": {"searchFilterSelections": []},
                 "pageNo": page,
+                # Sent explicitly so end-of-results can be judged against a
+                # size we chose. Previously nothing was sent and the loop
+                # compared against a hard-coded 25, so a portal serving 15 a
+                # page stopped after page one and reported success.
+                "pageSize": LEGACY_PAGE_SIZE,
             }
             try:
                 data = http_client.post_json(
@@ -178,6 +218,11 @@ class TaleoCollector(ATSCollector):
             except Exception as exc:
                 if page == 1:
                     raise CollectorUnavailable(f"Taleo searchjobs unavailable: {exc}") from exc
+                self.log.warning(
+                    "%s: Taleo page %s failed (%s); marking incomplete",
+                    self.company, page, exc,
+                )
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             requisitions = (data or {}).get("requisitionList") or []
@@ -206,14 +251,24 @@ class TaleoCollector(ATSCollector):
                     )
                 )
 
-            if len(requisitions) < 25:
+            # A page shorter than the size we asked for is the last page. The
+            # first page also tells us what this portal actually honours, in
+            # case it caps below our request.
+            if page == 1:
+                observed_page_size = len(requisitions)
+            if len(requisitions) < max(1, observed_page_size):
                 break
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Taleo searchjobs returned zero requisitions")
-        return self.finalize(records)
+        return CollectionResult(
+            jobs=self.finalize(records), complete=complete,
+            pages_fetched=page, stop_reason=stop_reason,
+        )
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         if self._is_oracle_cloud():
             return self._collect_oracle_cloud()
         try:

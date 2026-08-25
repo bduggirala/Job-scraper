@@ -146,6 +146,17 @@ class CompanyResult:
     discovery_verified: bool = False
 
 
+def _good_enough_rows() -> int:
+    """Row count that counts as a genuine job list rather than featured roles.
+
+    Shared with the browser traversal (``playwright.hop_good_enough_rows``) on
+    purpose: "is this a real list?" is the same question wherever it is asked,
+    and the JSON-LD tier previously answered it with "any row at all".
+    """
+    from settings import load_settings
+    return int(load_settings().get("playwright.hop_good_enough_rows", 10))
+
+
 def _blank(value: Any) -> bool:
     if value is None:
         return True
@@ -382,11 +393,12 @@ def fetch_company_jobs(
                 error_type=type(exc).__name__, error_message=str(exc),
             )
 
-    # JSON-LD tier: for pages with no recognised provider, try harvesting
-    # schema.org JobPosting structured data over HTTP before paying for a
-    # browser. If the page carries none, CollectorUnavailable drops us through
-    # to the Playwright fallback unchanged.
-    if plan.provider == UNKNOWN and plan.url:
+    # JSON-LD tier: harvest schema.org JobPosting structured data over a single
+    # HTTP GET before paying for a browser. Runs for an unrecognised provider
+    # *and* for a known provider whose collector just failed - that is the case
+    # where a cheap tier is most valuable, and it used to be skipped.
+    jsonld_jobs: list[dict] = []
+    if plan.url:
         try:
             jsonld_jobs = collect_via_jsonld(plan)
         except CollectorUnavailable:
@@ -394,21 +406,45 @@ def fetch_company_jobs(
         except Exception as exc:  # a parser hiccup must not sink the company
             log.debug("%s -> JSON-LD tier errored (%s)", company, exc)
             jsonld_jobs = []
-        if jsonld_jobs:
-            log.info("%s -> %s jobs via JSON-LD fallback", company, len(jsonld_jobs))
-            return CompanyResult(
-                company=company, jobs=jsonld_jobs, plan=plan, success=True,
-                fell_back=fell_back,
-            )
+
+    # A landing page routinely embeds two or three "featured" roles for SEO.
+    # Accepting those as the company's job list reports 3 jobs for an employer
+    # with thousands, so apply the same floor the browser traversal uses: a
+    # small harvest is kept as a fallback while the search continues.
+    good_enough = _good_enough_rows()
+    if len(jsonld_jobs) >= good_enough:
+        log.info("%s -> %s jobs via JSON-LD", company, len(jsonld_jobs))
+        return CompanyResult(
+            company=company, jobs=jsonld_jobs, plan=plan, success=True,
+            fell_back=fell_back,
+        )
+    if jsonld_jobs:
+        log.debug("%s -> JSON-LD found only %s row(s); keeping as a fallback "
+                  "and continuing to Playwright", company, len(jsonld_jobs))
 
     log.info("%s -> Playwright fallback", company)
     try:
         jobs, discovered_url, discovered_provider = collect_via_browser(plan)
     except Exception as exc:
+        # A thin JSON-LD harvest is still better than nothing when the browser
+        # cannot run at all.
+        if jsonld_jobs:
+            log.info("%s -> browser failed (%s); keeping %s JSON-LD row(s)",
+                     company, exc, len(jsonld_jobs))
+            return CompanyResult(
+                company=company, jobs=jsonld_jobs, plan=plan, success=True,
+                fell_back=fell_back,
+            )
         return CompanyResult(
             company=company, jobs=[], plan=plan, success=False, fell_back=fell_back,
             error_type=type(exc).__name__, error_message=str(exc),
         )
+
+    # Neither tier found a real list: keep whichever saw more.
+    if len(jsonld_jobs) > len(jobs) and not discovered_provider:
+        log.info("%s -> keeping %s JSON-LD row(s) over %s browser row(s)",
+                 company, len(jsonld_jobs), len(jobs))
+        jobs = jsonld_jobs
 
     # Self-healing: the browser found the real ATS behind a branded careers
     # page (e.g. GameStop -> UKG). Collecting through that provider's API now

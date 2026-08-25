@@ -24,7 +24,15 @@ import re
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_NO_NEW_ROWS,
+    STOP_PAGE_FAILED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.detector import RADANCY
 from ats.html_utils import make_soup
 from normalize import clean_text
@@ -33,7 +41,6 @@ from normalize import clean_text
 # in ~11 requests at 500/page rather than ~52 at 100. Bounded by MAX_PAGES so a
 # tenant that ignores pagination cannot spin forever.
 RECORDS_PER_PAGE = 500
-MAX_PAGES = 60
 
 # Strips the visible field label Radancy renders inside the location span
 # (``<b>Location</b> Mattydale, NY`` -> ``Mattydale, NY``).
@@ -119,14 +126,18 @@ class RadancyCollector(ATSCollector):
             return None
         return _LABEL_RE.sub("", text) or None
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         host = self._base_host()
         results_url = f"https://{host}/search-jobs/results"
 
         records: list[dict | None] = []
         seen: set[str] = set()
+        page = 0
+        complete = True
+        stop_reason = STOP_EXHAUSTED
 
-        for page in range(1, MAX_PAGES + 1):
+        while len(records) < self.max_jobs:
+            page += 1
             try:
                 fragment = self._fetch_page(results_url, page)
             except Exception as exc:
@@ -134,6 +145,9 @@ class RadancyCollector(ATSCollector):
                     raise CollectorUnavailable(
                         f"Radancy results endpoint unavailable: {exc}"
                     ) from exc
+                self.log.warning("%s: Radancy page %s failed (%s); marking incomplete",
+                                 self.company, page, exc)
+                complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             fresh = [
@@ -141,11 +155,19 @@ class RadancyCollector(ATSCollector):
                 if row and row["job_url"] not in seen
             ]
             if not fresh:
+                stop_reason = STOP_NO_NEW_ROWS
                 break
             for row in fresh:
                 seen.add(row["job_url"])
             records.extend(fresh)
+        else:
+            complete, stop_reason = False, STOP_BUDGET
 
         if not records:
             raise CollectorUnavailable("Radancy results endpoint returned zero jobs")
-        return self.finalize(records)
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning("%s: Radancy scrape INCOMPLETE (%s) - collected %s",
+                             self.company, stop_reason, len(jobs))
+        return CollectionResult(jobs=jobs, complete=complete,
+                                pages_fetched=page, stop_reason=stop_reason)
