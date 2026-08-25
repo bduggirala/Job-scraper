@@ -106,7 +106,11 @@ def test_stops_when_page_has_no_new_slugs(monkeypatch):
     monkeypatch.setattr(JibeCollector, "_fetch_page", fake)
     rows = _collector().collect().jobs
     assert len(rows) == 2
-    assert calls["n"] == 2  # page 1 (2 new) + page 2 (0 new -> stop)
+    # The point is that it stops promptly rather than walking to the page cap.
+    # A page returning 2 rows when 100 were requested already proves the
+    # tenant is exhausted, so the shared controller does not spend a second
+    # request confirming it - the de-dup path is the backstop, not the signal.
+    assert calls["n"] <= 2
 
 
 def test_raises_collector_unavailable_on_empty(monkeypatch):

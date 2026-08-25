@@ -24,16 +24,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_NO_NEW_ROWS,
-    STOP_PAGE_FAILED,
-    STOP_TOTAL_REACHED,
-    ATSCollector,
-    CollectionResult,
-    CollectorUnavailable,
-)
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from ats.detector import PHENOM
 from normalize import join_location
 
@@ -139,87 +131,47 @@ class PhenomCollector(ATSCollector):
             return f"{base}/job/{seq}"
         return str(apply_url) if apply_url else None
 
+    def _page(self, search_url: str, base: str, request: PageRequest):
+        html_text = http_client.get_text(
+            search_url,
+            params={"from": request.offset, "s": "1"},
+            headers={"Accept": "text/html", "Referer": base},
+        )
+        ddo = self._parse_ddo(html_text)
+        if ddo is None:
+            raise CollectorUnavailable("Phenom page did not contain phApp.ddo")
+        jobs, page_total = self._extract_jobs(ddo)
+        rows = [
+            self.record(
+                title=job.get("title"),
+                location=self._location(job),
+                date_posted=job.get("postedDate") or job.get("dateCreated"),
+                job_url=self._job_url(base, job),
+                apply_url=job.get("applyUrl"),
+                employment_type=job.get("type"),
+                description=job.get("descriptionTeaser"),
+            )
+            for job in jobs
+            if isinstance(job, dict)
+        ]
+        return [r for r in rows if r], page_total
+
     def collect(self) -> CollectionResult:
         base = self._base_url()
         search_url = f"{base}/search-results"
 
-        records: list[dict | None] = []
-        seen: set[str] = set()
-        page = 0
-        total: int | None = None
-        stop_reason = STOP_EXHAUSTED
-        complete = True
-
-        while len(records) < self.max_jobs:
-            offset = page * PAGE_SIZE
-            try:
-                html_text = http_client.get_text(
-                    search_url,
-                    params={"from": offset, "s": "1"},
-                    headers={"Accept": "text/html", "Referer": base},
-                )
-            except Exception as exc:
-                if page == 0:
-                    raise CollectorUnavailable(f"Phenom search-results unavailable: {exc}") from exc
-                self.log.warning(
-                    "%s: Phenom page %s failed (%s); marking incomplete",
-                    self.company, page, exc,
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
-
-            ddo = self._parse_ddo(html_text)
-            if ddo is None:
-                if page == 0:
-                    raise CollectorUnavailable("Phenom page did not contain phApp.ddo")
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
-            page += 1
-
-            jobs, page_total = self._extract_jobs(ddo)
-            if total is None and page_total is not None:
-                total = int(page_total)
-            if not jobs:
-                break
-
-            page_records = [
-                self.record(
-                    title=job.get("title"),
-                    location=self._location(job),
-                    date_posted=job.get("postedDate") or job.get("dateCreated"),
-                    job_url=self._job_url(base, job),
-                    apply_url=job.get("applyUrl"),
-                    employment_type=job.get("type"),
-                    description=job.get("descriptionTeaser"),
-                )
-                for job in jobs
-                if isinstance(job, dict)
-            ]
-
-            fresh = [r for r in page_records if r and r["job_url"] not in seen]
-            if not fresh:
-                stop_reason = STOP_NO_NEW_ROWS
-                break
-            for record in fresh:
-                seen.add(record["job_url"])
-            records.extend(fresh)
-
-            if total is not None and len(records) >= int(total):
-                stop_reason = STOP_TOTAL_REACHED
-                break
-        else:
-            complete, stop_reason = False, STOP_BUDGET
-
-        if not records:
-            raise CollectorUnavailable("Phenom search-results returned zero jobs")
-
-        jobs = self.finalize(records)
-        if not complete:
-            self.log.warning(
-                "%s: Phenom scrape INCOMPLETE (%s) - collected %s of %s",
-                self.company, stop_reason, len(jobs), total,
+        try:
+            walk = paginate(
+                lambda request: self._page(search_url, base, request),
+                page_size=PAGE_SIZE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/phenom",
             )
-        return CollectionResult(
-            jobs=jobs, complete=complete, pages_fetched=page,
-            reported_total=total, stop_reason=stop_reason,
-        )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Phenom search-results unavailable: {exc}") from exc
+
+        if not walk.items:
+            raise CollectorUnavailable("Phenom search-results returned zero jobs")
+        return self.result(walk, walk.items)

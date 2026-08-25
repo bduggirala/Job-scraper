@@ -13,14 +13,8 @@ CollectorUnavailable so Playwright takes over.
 from __future__ import annotations
 
 import http_client
-from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_PAGE_FAILED,
-    ATSCollector,
-    CollectionResult,
-    CollectorUnavailable,
-)
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from ats.detector import PAYLOCITY
 from ats.html_utils import extract_job_links, iter_jsonld_jobs, jsonld_location
 
@@ -37,73 +31,46 @@ class PaylocityCollector(ATSCollector):
             raise CollectorUnavailable("No Paylocity company GUID in URL")
         return str(guid)
 
+    def _api_page(self, endpoint: str, guid: str, request: PageRequest):
+        data = http_client.get_json(
+            endpoint,
+            params={"companyId": guid, "pageSize": request.page_size,
+                    "pageNumber": request.page_number},
+            headers={"Accept": "application/json"},
+        )
+        jobs = (
+            data if isinstance(data, list)
+            else (data or {}).get("jobs") or (data or {}).get("items")
+        )
+        if not isinstance(jobs, list):
+            raise CollectorUnavailable("Paylocity API returned no usable job list")
+        rows = [
+            self.record(
+                title=job.get("title") or job.get("jobTitle"),
+                location=job.get("location") or job.get("locationName"),
+                date_posted=job.get("publishedDate") or job.get("postedDate"),
+                job_url=job.get("url")
+                or (f"{BASE}/recruiting/jobs/Details/{job.get('jobId') or job.get('id')}"
+                    if (job.get("jobId") or job.get("id")) else None),
+                employment_type=job.get("employmentType") or job.get("jobType"),
+                description=job.get("description"),
+            )
+            for job in jobs
+            if isinstance(job, dict)
+        ]
+        return [r for r in rows if r], None
+
     def _try_api(self, guid: str) -> CollectionResult:
         endpoint = f"{BASE}/recruiting/v2/api/jobs"
-        records: list[dict | None] = []
-        page = 0
-        complete = True
-        stop_reason = STOP_EXHAUSTED
-
-        while len(records) < self.max_jobs:
-            page += 1
-            try:
-                data = http_client.get_json(
-                    endpoint,
-                    params={"companyId": guid, "pageSize": PAGE_SIZE, "pageNumber": page},
-                    headers={"Accept": "application/json"},
-                )
-            except Exception as exc:
-                if page == 1:
-                    raise CollectorUnavailable(
-                        f"Paylocity API unavailable: {exc}"
-                    ) from exc
-                self.log.warning(
-                    "%s: Paylocity page %s failed (%s); marking incomplete",
-                    self.company, page, exc,
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
-
-            jobs = (
-                data if isinstance(data, list)
-                else (data or {}).get("jobs") or (data or {}).get("items")
-            )
-            if not isinstance(jobs, list):
-                if page == 1:
-                    raise CollectorUnavailable("Paylocity API returned no usable job list")
-                break
-            if not jobs:
-                break
-
-            for job in jobs:
-                if not isinstance(job, dict):
-                    continue
-                job_id = job.get("jobId") or job.get("id")
-                records.append(
-                    self.record(
-                        title=job.get("title") or job.get("jobTitle"),
-                        location=job.get("location") or job.get("locationName"),
-                        date_posted=job.get("publishedDate") or job.get("postedDate"),
-                        job_url=job.get("url")
-                        or (f"{BASE}/recruiting/jobs/Details/{job_id}" if job_id else None),
-                        employment_type=job.get("employmentType") or job.get("jobType"),
-                        description=job.get("description"),
-                    )
-                )
-
-            # A short page is the last page: the endpoint has no total to
-            # reconcile against, so page length is the only end marker.
-            if len(jobs) < PAGE_SIZE:
-                break
-        else:
-            complete, stop_reason = False, STOP_BUDGET
-
-        if not any(records):
-            raise CollectorUnavailable("Paylocity API rows lacked title/url")
-        return CollectionResult(
-            jobs=self.finalize(records), complete=complete,
-            pages_fetched=page, stop_reason=stop_reason,
+        walk = paginate(
+            lambda request: self._api_page(endpoint, guid, request),
+            page_size=PAGE_SIZE, max_jobs=self.max_jobs,
+            key=lambda row: row["job_url"],
+            label=f"{self.company}/paylocity",
         )
+        if not walk.items:
+            raise CollectorUnavailable("Paylocity API rows lacked title/url")
+        return self.result(walk, walk.items)
 
     def _try_html(self, guid: str) -> CollectionResult:
         list_url = self.url or f"{BASE}/recruiting/jobs/All/{guid}"

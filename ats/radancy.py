@@ -24,15 +24,8 @@ import re
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_NO_NEW_ROWS,
-    STOP_PAGE_FAILED,
-    ATSCollector,
-    CollectionResult,
-    CollectorUnavailable,
-)
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from ats.detector import RADANCY
 from ats.html_utils import make_soup
 from normalize import clean_text
@@ -126,48 +119,28 @@ class RadancyCollector(ATSCollector):
             return None
         return _LABEL_RE.sub("", text) or None
 
+    def _page(self, results_url: str, request: PageRequest):
+        fragment = self._fetch_page(results_url, request.page_number)
+        return self._parse_cards(fragment, results_url), None
+
     def collect(self) -> CollectionResult:
         host = self._base_host()
         results_url = f"https://{host}/search-jobs/results"
 
-        records: list[dict | None] = []
-        seen: set[str] = set()
-        page = 0
-        complete = True
-        stop_reason = STOP_EXHAUSTED
+        try:
+            walk = paginate(
+                lambda request: self._page(results_url, request),
+                page_size=RECORDS_PER_PAGE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/radancy",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(
+                f"Radancy results endpoint unavailable: {exc}"
+            ) from exc
 
-        while len(records) < self.max_jobs:
-            page += 1
-            try:
-                fragment = self._fetch_page(results_url, page)
-            except Exception as exc:
-                if page == 1:
-                    raise CollectorUnavailable(
-                        f"Radancy results endpoint unavailable: {exc}"
-                    ) from exc
-                self.log.warning("%s: Radancy page %s failed (%s); marking incomplete",
-                                 self.company, page, exc)
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
-
-            fresh = [
-                row for row in self._parse_cards(fragment, results_url)
-                if row and row["job_url"] not in seen
-            ]
-            if not fresh:
-                stop_reason = STOP_NO_NEW_ROWS
-                break
-            for row in fresh:
-                seen.add(row["job_url"])
-            records.extend(fresh)
-        else:
-            complete, stop_reason = False, STOP_BUDGET
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Radancy results endpoint returned zero jobs")
-        jobs = self.finalize(records)
-        if not complete:
-            self.log.warning("%s: Radancy scrape INCOMPLETE (%s) - collected %s",
-                             self.company, stop_reason, len(jobs))
-        return CollectionResult(jobs=jobs, complete=complete,
-                                pages_fetched=page, stop_reason=stop_reason)
+        return self.result(walk, walk.items)

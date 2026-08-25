@@ -292,10 +292,24 @@ resetting `first_seen` so they were re-reported as new when they came back.
 
 Incomplete companies are listed in the run summary with their shortfall.
 
-All 14 paginating collectors return a `CollectionResult`. The four that do not
-— Greenhouse, Lever, Ashby, Jobvite — return their entire board in a single
-response, so there is no pagination for them to get wrong; they stay on the
-`CollectionResult.coerce` shim, which treats a bare list as complete.
+All 14 paginating collectors return a `CollectionResult`, and all of them get
+there through the one walk in `ats/pagination.py` rather than a hand-written
+loop each. The four that do not — Greenhouse, Lever, Ashby, Jobvite — return
+their entire board in a single response, so there is no pagination for them to
+get wrong; they stay on the `CollectionResult.coerce` shim.
+
+`paginate()` adds two things none of the hand-written loops had:
+
+- **per-page retry.** A transient failure on page 12 used to end the walk and
+  mark the company incomplete, suppressing removal sync until the next clean
+  run. Most such failures succeed on a second attempt, so the walk completes.
+- **repeated-page detection.** A tenant that ignores its own paging parameter
+  serves page 1 forever; a content hash stops on the first repeat instead of
+  parsing and de-duplicating every one.
+
+A first-page failure always propagates so the collector can raise
+`CollectorUnavailable` and let the router fall back; later pages are retried
+and then tolerated as an incomplete walk.
 
 ---
 
@@ -423,7 +437,8 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | `ats/detector.py` | Lexical ATS detection from a URL, plus HTML fingerprints and embedded-URL extraction. **Add a new provider's host/fingerprint here** |
 | `ats/resolver.py` | One HTTP GET on a branded page → identify the ATS behind it (redirect/fingerprint/embedded URL); 403→browser-UA retry |
 | `ats/url_repair.py` | Swaps a dead `careers.*` subdomain for a live careers page before routing |
-| `ats/base.py` | `ATSCollector` base class, `CollectionResult` (the completeness contract) + `CollectorUnavailable`; `record()`/`finalize()` helpers every collector uses |
+| `ats/base.py` | `ATSCollector` base class, `CollectionResult` (the completeness contract) + `CollectorUnavailable`; `record()`/`finalize()`/`result()` helpers every collector uses |
+| `ats/pagination.py` | The shared pagination walk: per-page retry, repeated-page detection, total reconciliation, budget. **Every paginating collector uses this** |
 | `ats/html_utils.py` | Shared HTML/JSON-LD parsing helpers for collectors |
 | `ats/discovery.py` | On-demand ATS-URL discovery engine (used by `tools/find_ats_urls.py`, **not** the live pipeline) |
 

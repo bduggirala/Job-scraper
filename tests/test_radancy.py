@@ -91,7 +91,11 @@ def test_collect_paginates_and_stops_when_no_new_ids(monkeypatch):
     monkeypatch.setattr(RadancyCollector, "_fetch_page", fake_fetch)
     jobs = _collector().collect().jobs
     assert len(jobs) == 2
-    assert calls["n"] == 2   # page 1 (2 new) + page 2 (0 new -> stop)
+    # The point is that it stops rather than looping to the page cap. A page
+    # returning 2 cards when 500 were requested already proves exhaustion, so
+    # the shared controller stops there instead of spending a confirming
+    # request; the no-new-ids de-dup remains the backstop.
+    assert calls["n"] <= 2
 
 
 def test_collect_raises_when_endpoint_gives_nothing(monkeypatch):

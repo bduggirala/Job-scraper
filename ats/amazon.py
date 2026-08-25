@@ -27,15 +27,8 @@ from __future__ import annotations
 from typing import Any
 
 import http_client
-from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_PAGE_FAILED,
-    STOP_TOTAL_REACHED,
-    ATSCollector,
-    CollectionResult,
-    CollectorUnavailable,
-)
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from normalize import join_location
 
 try:  # pragma: no cover - falls back until AMAZON lands in the detector
@@ -111,6 +104,10 @@ class AmazonJobsCollector(ATSCollector):
             )
         return rows
 
+    def _page(self, request: PageRequest):
+        data = self._fetch_page(request.offset)
+        return self._parse_jobs(data.get("jobs") or []), data.get("hits")
+
     def collect(self) -> CollectionResult:
         """Paginate ``search.json`` and return every posting it will serve.
 
@@ -119,69 +116,17 @@ class AmazonJobsCollector(ATSCollector):
                 signalling the router to fall back to Playwright.
         """
         try:
-            first = self._fetch_page(0)
-        except Exception as exc:
-            raise CollectorUnavailable(
-                f"Amazon search.json unavailable: {exc}"
-            ) from exc
-
-        hits = int(first.get("hits") or 0)
-        if hits <= 0 and not first.get("jobs"):
-            raise CollectorUnavailable("Amazon search.json returned zero jobs")
-
-        records: list[dict | None] = []
-        seen: set[str] = set()
-        pages = 1
-        stop_reason = STOP_TOTAL_REACHED
-        complete = True
-
-        def absorb(jobs: list[dict[str, Any]]) -> None:
-            for row in self._parse_jobs(jobs or []):
-                if not row:
-                    continue
-                url = row["job_url"]
-                if url in seen:
-                    continue
-                seen.add(url)
-                records.append(row)
-
-        absorb(first.get("jobs") or [])
-
-        offset = RESULT_LIMIT
-        while offset < hits and len(records) < self.max_jobs:
-            try:
-                page = self._fetch_page(offset)
-            except Exception as exc:
-                # A later page failing keeps what we already have rather than
-                # discarding a large, valid partial harvest - but the harvest
-                # is now short, and the caller has to know that.
-                self.log.warning(
-                    "%s: Amazon page at offset %s failed (%s); marking incomplete",
-                    self.company, offset, exc,
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
-            page_jobs = page.get("jobs") or []
-            if not page_jobs:
-                stop_reason = STOP_EXHAUSTED
-                break
-            pages += 1
-            absorb(page_jobs)
-            offset += RESULT_LIMIT
-        else:
-            if offset < hits:
-                complete, stop_reason = False, STOP_BUDGET
-
-        if not records:
-            raise CollectorUnavailable("Amazon search.json yielded no parseable jobs")
-
-        jobs = self.finalize(records)
-        if not complete:
-            self.log.warning(
-                "%s: Amazon scrape INCOMPLETE (%s) - collected %s of %s",
-                self.company, stop_reason, len(jobs), hits,
+            walk = paginate(
+                self._page,
+                page_size=RESULT_LIMIT, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/amazon",
             )
-        return CollectionResult(
-            jobs=jobs, complete=complete, pages_fetched=pages,
-            reported_total=hits, stop_reason=stop_reason,
-        )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Amazon search.json unavailable: {exc}") from exc
+
+        if not walk.items:
+            raise CollectorUnavailable("Amazon search.json yielded no parseable jobs")
+        return self.result(walk, walk.items)

@@ -33,6 +33,9 @@ STOP_PAGE_FAILED = "page_failed"
 STOP_BUDGET = "budget_exhausted"
 #: A page returned rows we had already seen - the usual end-of-results marker.
 STOP_NO_NEW_ROWS = "no_new_rows"
+#: The provider served a byte-identical page again, meaning it is ignoring its
+#: own paging parameter. Distinct from NO_NEW_ROWS, which is normal exhaustion.
+STOP_REPEATED_PAGE = "repeated_page"
 
 
 @dataclass
@@ -139,6 +142,27 @@ class ATSCollector:
     def finalize(records: list[dict | None]) -> list[dict]:
         """Drop None rows and collapse repeated URLs within one company."""
         return dedupe_records([r for r in records if r])
+
+    def result(self, walk: Any, records: list[dict | None]) -> "CollectionResult":
+        """Finalize ``records`` and carry a :class:`PageWalk`'s outcome onto it.
+
+        Every paginating collector ends the same way, so the logging of an
+        incomplete walk lives here rather than being restated fourteen times.
+        """
+        jobs = self.finalize(records)
+        if not walk.complete:
+            self.log.warning(
+                "%s: %s scrape INCOMPLETE (%s) - collected %s of %s reported",
+                self.company, self.provider, walk.stop_reason,
+                len(jobs), walk.reported_total,
+            )
+        return CollectionResult(
+            jobs=jobs,
+            complete=walk.complete,
+            pages_fetched=walk.pages_fetched,
+            reported_total=walk.reported_total,
+            stop_reason=walk.stop_reason,
+        )
 
     # -- interface --------------------------------------------------------
     def collect(self) -> list[dict]:

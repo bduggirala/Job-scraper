@@ -13,16 +13,9 @@ from __future__ import annotations
 from typing import Any
 
 import http_client
-from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_PAGE_FAILED,
-    STOP_TOTAL_REACHED,
-    ATSCollector,
-    CollectionResult,
-    CollectorUnavailable,
-)
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
 from ats.detector import UKG
+from ats.pagination import PageRequest, paginate
 from normalize import join_location
 
 PAGE_SIZE = 100
@@ -88,96 +81,61 @@ class UKGCollector(ATSCollector):
             return f"{self._base()}/{tenant}/JobBoard/{board}/OpportunityDetail?opportunityId={opportunity_id}"
         return None
 
+    def _fetch_page(self, endpoint: str, base: str, request: PageRequest):
+        payload = {
+            "opportunitySearch": {
+                "Top": request.page_size,
+                "Skip": request.offset,
+                "QueryString": "",
+                "OrderBy": [
+                    {"Value": "postedDateDesc", "PropertyName": "PostedDate",
+                     "Ascending": False}
+                ],
+                "Filters": [],
+            },
+            "matchCriteria": {
+                "PreferredJobs": [], "Educations": [],
+                "LicenseAndCertifications": [], "Skills": [],
+            },
+        }
+        data = http_client.post_json(
+            endpoint, payload, headers={"Accept": "application/json", "Origin": base},
+        )
+        if not isinstance(data, dict):
+            raise CollectorUnavailable("UKG returned a non-object response")
+        opportunities = data.get("opportunities")
+        if not isinstance(opportunities, list):
+            raise CollectorUnavailable("UKG response missing 'opportunities'")
+        return opportunities, data.get("totalCount") or data.get("TotalCount")
+
     def collect(self) -> CollectionResult:
         tenant, board = self._coordinates()
         base = self._base()
         endpoint = f"{base}/{tenant}/JobBoard/{board}/JobBoardView/LoadSearchResults"
 
-        records: list[dict | None] = []
-        skip = 0
-        pages = 0
-        total: int | None = None
-        stop_reason = STOP_EXHAUSTED
-        complete = True
+        try:
+            walk = paginate(
+                lambda request: self._fetch_page(endpoint, base, request),
+                page_size=PAGE_SIZE, max_jobs=self.max_jobs,
+                label=f"{self.company}/ukg",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"UKG job board unavailable: {exc}") from exc
 
-        while len(records) < self.max_jobs:
-            payload = {
-                "opportunitySearch": {
-                    "Top": PAGE_SIZE,
-                    "Skip": skip,
-                    "QueryString": "",
-                    "OrderBy": [
-                        {"Value": "postedDateDesc", "PropertyName": "PostedDate", "Ascending": False}
-                    ],
-                    "Filters": [],
-                },
-                "matchCriteria": {
-                    "PreferredJobs": [],
-                    "Educations": [],
-                    "LicenseAndCertifications": [],
-                    "Skills": [],
-                },
-            }
-            try:
-                data = http_client.post_json(
-                    endpoint,
-                    payload,
-                    headers={"Accept": "application/json", "Origin": base},
-                )
-            except Exception as exc:
-                if pages == 0:
-                    raise CollectorUnavailable(f"UKG job board unavailable: {exc}") from exc
-                self.log.warning(
-                    "%s: UKG page %s failed (%s); marking incomplete",
-                    self.company, pages, exc,
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
-
-            if not isinstance(data, dict):
-                raise CollectorUnavailable("UKG returned a non-object response")
-
-            opportunities = data.get("opportunities")
-            if not isinstance(opportunities, list):
-                raise CollectorUnavailable("UKG response missing 'opportunities'")
-            if total is None:
-                total = data.get("totalCount") or data.get("TotalCount")
-            if not opportunities:
-                break
-            pages += 1
-
-            for opportunity in opportunities:
-                if not isinstance(opportunity, dict):
-                    continue
-                records.append(
-                    self.record(
-                        title=opportunity.get("Title") or opportunity.get("JobTitle"),
-                        location=self._location(opportunity),
-                        date_posted=opportunity.get("PostedDate") or opportunity.get("CreatedDate"),
-                        job_url=self._job_url(tenant, board, opportunity),
-                        employment_type=opportunity.get("EmploymentType")
-                        or opportunity.get("FullTime"),
-                        description=opportunity.get("Description"),
-                    )
-                )
-
-            skip += PAGE_SIZE
-            if total is not None and skip >= int(total):
-                stop_reason = STOP_TOTAL_REACHED
-                break
-        else:
-            complete, stop_reason = False, STOP_BUDGET
-
+        records = [
+            self.record(
+                title=opportunity.get("Title") or opportunity.get("JobTitle"),
+                location=self._location(opportunity),
+                date_posted=opportunity.get("PostedDate") or opportunity.get("CreatedDate"),
+                job_url=self._job_url(tenant, board, opportunity),
+                employment_type=opportunity.get("EmploymentType") or opportunity.get("FullTime"),
+                description=opportunity.get("Description"),
+            )
+            for opportunity in walk.items
+            if isinstance(opportunity, dict)
+        ]
         if not records:
             raise CollectorUnavailable("UKG job board returned zero opportunities")
-
-        jobs = self.finalize(records)
-        if not complete:
-            self.log.warning(
-                "%s: UKG scrape INCOMPLETE (%s) - collected %s of %s",
-                self.company, stop_reason, len(jobs), total,
-            )
-        return CollectionResult(
-            jobs=jobs, complete=complete, pages_fetched=pages,
-            reported_total=total, stop_reason=stop_reason,
-        )
+        return self.result(walk, records)

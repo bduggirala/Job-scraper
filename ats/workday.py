@@ -17,16 +17,9 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import http_client
-from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_PAGE_FAILED,
-    STOP_TOTAL_REACHED,
-    ATSCollector,
-    CollectionResult,
-    CollectorUnavailable,
-)
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
 from ats.detector import WORKDAY
+from ats.pagination import PageRequest, paginate
 
 PAGE_SIZE = 20
 
@@ -74,91 +67,54 @@ class WorkdayCollector(ATSCollector):
                 return bullet
         return None
 
+    def _fetch_page(self, endpoint: str, request: PageRequest):
+        payload = {
+            "appliedFacets": {},
+            "limit": request.page_size,
+            "offset": request.offset,
+            "searchText": "",
+            # Newest-first. Without an explicit sort Workday returns rows in an
+            # unspecified order, so a truncated walk kept an arbitrary slice of
+            # the tenant - useless against a freshness window, and unstable
+            # between runs, which churned the removal sync.
+            "sortBy": "POSTING_DATES_DESC",
+        }
+        data = http_client.post_json(
+            endpoint, payload,
+            headers={"Accept": "application/json", "Referer": self._base_site_url()},
+        )
+        if not isinstance(data, dict):
+            raise CollectorUnavailable("Workday CXS returned a non-object response")
+        return data.get("jobPostings") or [], data.get("total")
+
     def collect(self) -> CollectionResult:
         endpoint = self._endpoint()
-        records: list[dict | None] = []
-        offset = 0
-        pages = 0
-        total: int | None = None
-        stop_reason = STOP_EXHAUSTED
-        complete = True
 
-        while len(records) < self.max_jobs:
-            payload = {
-                "appliedFacets": {},
-                "limit": PAGE_SIZE,
-                "offset": offset,
-                # Newest-first. Without an explicit sort Workday returns rows in
-                # an unspecified order, so a truncated walk kept an arbitrary
-                # slice of the tenant - useless against a freshness window, and
-                # unstable between runs (which churned the removal sync).
-                "searchText": "",
-                "sortBy": "POSTING_DATES_DESC",
-            }
-            try:
-                data = http_client.post_json(
-                    endpoint,
-                    payload,
-                    headers={"Accept": "application/json", "Referer": self._base_site_url()},
-                )
-            except Exception as exc:
-                if pages == 0:
-                    raise CollectorUnavailable(f"Workday CXS unavailable: {exc}") from exc
-                # Earlier pages are real and worth keeping, but this walk is
-                # short: say so, or the pipeline will delete the rows we never
-                # got to as though the postings had closed.
-                self.log.warning(
-                    "%s: Workday page %s failed (%s); keeping %s jobs and marking "
-                    "the scrape incomplete", self.company, pages, exc, len(records),
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
+        try:
+            walk = paginate(
+                lambda request: self._fetch_page(endpoint, request),
+                page_size=PAGE_SIZE,
+                max_jobs=self.max_jobs,
+                label=f"{self.company}/workday",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Workday CXS unavailable: {exc}") from exc
 
-            if not isinstance(data, dict):
-                raise CollectorUnavailable("Workday CXS returned a non-object response")
-
-            postings = data.get("jobPostings") or []
-            if total is None:
-                total = data.get("total")
-
-            # An empty page means the provider is done, whatever `total` said.
-            if not postings:
-                stop_reason = STOP_EXHAUSTED
-                break
-
-            pages += 1
-            for posting in postings:
-                if not isinstance(posting, dict):
-                    continue
-                records.append(
-                    self.record(
-                        title=posting.get("title"),
-                        location=posting.get("locationsText") or posting.get("locations"),
-                        date_posted=self._extract_posted(posting),
-                        job_url=self._job_url(posting.get("externalPath")),
-                        employment_type=posting.get("timeType"),
-                        description=posting.get("jobDescription"),
-                    )
-                )
-
-            offset += PAGE_SIZE
-            if total is not None and offset >= int(total):
-                stop_reason = STOP_TOTAL_REACHED
-                break
-        else:
-            # Budget tripped with rows still outstanding.
-            complete, stop_reason = False, STOP_BUDGET
-
+        records = [
+            self.record(
+                title=posting.get("title"),
+                location=posting.get("locationsText") or posting.get("locations"),
+                date_posted=self._extract_posted(posting),
+                job_url=self._job_url(posting.get("externalPath")),
+                employment_type=posting.get("timeType"),
+                description=posting.get("jobDescription"),
+            )
+            for posting in walk.items
+            if isinstance(posting, dict)
+        ]
         if not records:
             raise CollectorUnavailable("Workday CXS returned zero postings")
 
-        jobs = self.finalize(records)
-        if not complete:
-            self.log.warning(
-                "%s: Workday scrape INCOMPLETE (%s) - collected %s of %s reported",
-                self.company, stop_reason, len(jobs), total,
-            )
-        return CollectionResult(
-            jobs=jobs, complete=complete, pages_fetched=pages,
-            reported_total=total, stop_reason=stop_reason,
-        )
+        return self.result(walk, records)

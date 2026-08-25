@@ -475,7 +475,7 @@ def _is_job_row(title: str | None, href: str | None) -> bool:
 
 def _paginate_and_extract(
     page, initial_rows: list[dict[str, Any]], max_clicks: int, timeout_ms: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """Click through "Load more"/next controls, accumulating every page's
     rows rather than keeping only whatever is on screen after the last click.
 
@@ -495,16 +495,30 @@ def _paginate_and_extract(
     the "don't click at all when the page starts out empty" guard at each
     call site stays intact (blind clicking on a jobless page can navigate
     away and destroy UI the caller needs next - observed on Goldman Sachs).
+
+    Returns:
+        ``(rows, exhausted)``. ``exhausted`` is False when the click budget
+        ran out with pages still to go - the browser equivalent of a truncated
+        API walk, and previously indistinguishable from a site that simply had
+        no more results.
     """
     seen: dict[str, dict[str, Any]] = {}
 
-    def _merge(rows: list[dict[str, Any]]) -> None:
+    def _merge(rows: list[dict[str, Any]]) -> int:
+        added = 0
         for row in rows:
             key = row.get("job_url")
             if key and key not in seen:
                 seen[key] = row
+                added += 1
+        return added
 
     _merge(initial_rows)
+
+    # Two consecutive clicks that add nothing mean the control is inert - a
+    # button that stays visible but no longer loads anything. One barren click
+    # is tolerated because some sites render asynchronously.
+    barren = 0
 
     for _ in range(max_clicks):
         clicked = False
@@ -529,14 +543,21 @@ def _paginate_and_extract(
                 page.wait_for_timeout(1200)
                 after = page.evaluate("document.body.scrollHeight")
                 if after <= before:
-                    break
+                    return list(seen.values()), True
                 clicked = True
             except Exception:
-                break
+                return list(seen.values()), True
 
-        _merge(_extract_job_rows(page))
+        if _merge(_extract_job_rows(page)):
+            barren = 0
+        else:
+            barren += 1
+            if barren >= 2:
+                return list(seen.values()), True
 
-    return list(seen.values())
+    # The budget ran out while the control was still producing rows, so there
+    # is very likely more to collect.
+    return list(seen.values()), False
 
 
 def _extract_jsonld_rows(page) -> list[dict[str, Any]]:
@@ -738,7 +759,7 @@ def _navigate_to_job_list(
         # is actually present.
         rows = _extract_job_rows(page)
         if rows:
-            rows = _paginate_and_extract(page, rows, max_pages, timeout_ms)
+            rows, _exhausted = _paginate_and_extract(page, rows, max_pages, timeout_ms)
         else:
             rows = _extract_jsonld_rows(page)
         if len(rows) >= good_enough:
@@ -983,7 +1004,7 @@ def _search_fallback(company: str, page, timeout_ms: int) -> PlaywrightResult:
                     company, provider,
                 )
 
-    jobs = _paginate_and_extract(
+    jobs, _exhausted = _paginate_and_extract(
         page, _extract_job_rows(page), int(cfg.get("playwright.max_pages", 5)), timeout_ms
     )
 
@@ -1076,7 +1097,10 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         jobs = _extract_job_rows(page)
         if jobs:
             initial_count = len(jobs)
-            jobs = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
+            jobs, exhausted = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
+            if not exhausted:
+                log.warning("%s: pagination stopped at the %s-page cap with more "
+                            "results still available", company, max_pages)
             if len(jobs) != initial_count:
                 log.debug("%s: pagination changed the result count %s -> %s",
                           company, initial_count, len(jobs))
