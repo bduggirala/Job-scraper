@@ -360,7 +360,18 @@ the other silently costs coverage.
 
 ## Reliability
 
-- 30s HTTP timeout, 3 retries, exponential backoff (tenacity), `Retry-After` honoured on 429
+- 30s HTTP timeout, 3 retries, exponential backoff **with jitter** (tenacity),
+  `Retry-After` honoured on 429. Jitter matters because ten workers share one
+  retry schedule — without it they back off in lockstep and retry together,
+  turning a transient 503 into a sustained one
+- **Per-host rate limiting** (`requests.per_host_rate_per_second`, default 3/s),
+  shared across all workers and keyed on hostname so a slow vendor never
+  throttles unrelated companies. Raising the pagination ceiling multiplied what
+  one company can request — a large Workday tenant went from 25 requests to as
+  many as 500 — and pacing is what keeps that polite
+- **Bounded response reads** (`http_client.MAX_RESPONSE_BYTES`, 8 MB): bodies
+  are streamed and truncated rather than read whole, since an unbounded `.text`
+  across 10 workers is a memory-exhaustion risk
 - Navigation retries with rotated user-agent/viewport
 - `playwright-stealth` patches the fingerprints headless Chromium leaks, which
   some career sites gate on

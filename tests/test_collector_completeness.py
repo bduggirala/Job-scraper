@@ -171,6 +171,16 @@ def test_phenom_full_walk_is_complete(monkeypatch):
     assert len(result.jobs) == 35
 
 
+def test_phenom_caps_its_budget_below_the_global_default(monkeypatch):
+    """Phenom serves 10 rows per HTML page load, so the global 10,000-job
+    ceiling would mean 1,000 sequential page renders for one company - past
+    the per-company timeout even before rate limiting. Its own ceiling keeps
+    the request count sane while still being far above the old 250."""
+    collector = _phenom(monkeypatch, total=99999)
+    assert collector.max_jobs < 10000
+    assert collector.max_jobs >= 2000
+
+
 def test_phenom_budget_trip_is_incomplete(monkeypatch):
     """Seven Phenom tenants returned exactly 250 live - the 10x25 ceiling."""
     collector = _phenom(monkeypatch, total=4000)

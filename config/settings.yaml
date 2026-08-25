@@ -175,6 +175,14 @@ requests:
   # the run summary. Raise it if the summary keeps reporting a real shortfall.
   max_jobs_per_company: 10000
 
+  # Politeness ceiling per hostname, shared across all HTTP workers. Raising
+  # max_jobs_per_company multiplied what one company can request (a large
+  # Workday tenant went from 25 requests to as many as 500), and ten workers
+  # scraping different companies on the same vendor host are ten concurrent
+  # callers of that host. Keyed on host, so a slow vendor never throttles
+  # unrelated companies. Set to 0 to disable.
+  per_host_rate_per_second: 3.0
+
 # --- Concurrency -----------------------------------------------------------
 concurrency:
   http_workers: 10
@@ -192,7 +200,12 @@ concurrency:
   # Per-company limits, measured from when a company actually starts (not
   # when it was queued). This is the bound that matters: without it, one
   # wedged page costs the entire phase budget.
-  api_company_timeout_seconds: 300      # 5 min
+  # Raised from 300s alongside the jobs-based pagination ceiling and per-host
+  # pacing. A 10,000-job Workday tenant is 500 sequential requests; at 3 req/s
+  # plus latency that is ~320s, which would have been recorded as a Timeout
+  # failure under the old limit - losing the company entirely, which is worse
+  # than the truncation the higher ceiling was meant to fix.
+  api_company_timeout_seconds: 900      # 15 min
   # Multi-layer traversal can render up to max_hop_visits pages before it
   # concludes, and nav retries stack on top. At 240s companies that finish
   # comfortably in isolation (7-Eleven, Omnicell) were being cut off

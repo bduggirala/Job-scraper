@@ -47,8 +47,21 @@ PAGE_SIZE = 10
 _DDO_RE = re.compile(r"phApp\.ddo\s*=\s*(\{.*?\})\s*;", re.S)
 
 
+#: Phenom's own ceiling, below the global default. Every page is a full HTML
+#: render returning only 10 rows, so the shared 10,000-job budget would mean
+#: 1,000 sequential page loads for one company - past the per-company timeout
+#: even before per-host pacing. 2,000 is 8x the old 250-job cap while keeping
+#: the request count to ~200. A tenant larger than this reports incomplete,
+#: which is honest and visible rather than silent.
+MAX_JOBS = 2000
+
+
 class PhenomCollector(ATSCollector):
     provider = PHENOM
+
+    @property
+    def max_jobs(self) -> int:
+        return min(super().max_jobs, MAX_JOBS)
 
     def _base_url(self) -> str:
         """Career-site root including its locale segment (e.g. /us/en)."""
