@@ -37,6 +37,7 @@ from deduplicate import deduplicate
 from enrich import enrich_records
 from export_ats_urls import write_discovered_urls, write_repaired_urls, write_run_status
 from filters import apply_filters
+from fit import score_fit
 from job_identity import extract_stable_job_id
 from logger import get_logger
 from normalize import RECORD_FIELDS
@@ -49,6 +50,9 @@ OUTPUT_FIELDS = list(RECORD_FIELDS) + [
     "location_match_type",
     "remote_scope",
     "source_query",
+    "fit_score",
+    "fit_matched",
+    "fit_explanation",
     "first_seen",
     "is_new",
 ]
@@ -82,6 +86,8 @@ class RunSummary:
     provider_counts: dict[str, int] = field(default_factory=dict)
     #: Companies whose scrape stopped short of the provider's full job list.
     incomplete_companies: int = 0
+    #: Matching jobs whose title, location or URL moved since the last run.
+    changed_jobs: int = 0
     #: ``(company, collected, reported_total, stop_reason)`` per truncated company.
     truncated: list[tuple[str, int, int | None, str | None]] = field(default_factory=list)
 
@@ -102,6 +108,7 @@ class RunSummary:
             f"Date unavailable:       {self.date_unavailable:,}",
             f"Duplicates removed:     {self.duplicates_removed:,}",
             f"Newly discovered:       {self.new_jobs:,}",
+            f"Changed since last run: {self.changed_jobs:,}",
             f"Removed (no longer listed): {self.jobs_removed:,}",
             "",
             f"Direct API companies:   {self.direct_api_companies:,}",
@@ -520,12 +527,95 @@ def write_outputs(
 
     written = {"csv": csv_path, "json": json_path, "failures": failures_path}
 
+    # Excel alongside the CSV: it is what actually gets opened and mailed, and
+    # openpyxl is already a dependency for the workbook.
+    xlsx_name = cfg.get("output.xlsx", "company_jobs.xlsx")
+    if xlsx_name:
+        xlsx_path = out_dir / f"{prefix}{xlsx_name}"
+        try:
+            with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+                jobs_frame.to_excel(writer, sheet_name="Matching jobs", index=False)
+                if failure_rows:
+                    pd.DataFrame(failure_rows, columns=FAILURE_FIELDS).to_excel(
+                        writer, sheet_name="Failures", index=False
+                    )
+            written["xlsx"] = xlsx_path
+        except Exception as exc:  # never fail a run over a spreadsheet
+            log.warning("Could not write %s: %s", xlsx_path.name, exc)
+
     if raw_jobs is not None:
         raw_path = out_dir / f"{prefix}{cfg.get('output.raw_csv', 'company_jobs_raw.csv')}"
         pd.DataFrame(raw_jobs).to_csv(raw_path, index=False, encoding="utf-8")
         written["raw"] = raw_path
 
     return written
+
+
+def _prepare_notification(
+    database: JobDatabase,
+    summary: "RunSummary",
+    final_jobs: list[dict[str, Any]],
+    changed_jobs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Work out what this run would announce, without announcing it yet.
+
+    Split from the send so the decision is made while the database is open and
+    the send happens after the outputs exist on disk - the attachment has to be
+    written before it can be attached.
+    """
+    new_jobs = [j for j in final_jobs if j.get("is_new")]
+    return {
+        "new": database.filter_unnotified(new_jobs, kind="new"),
+        "changed": database.filter_unnotified(changed_jobs, kind="changed"),
+        # A run with any truncated company cannot be trusted to know what is
+        # new, so the digest is suppressed rather than sent with a caveat.
+        "run_complete": summary.incomplete_companies == 0,
+    }
+
+
+def send_notifications(
+    payload: dict[str, Any],
+    summary: "RunSummary",
+    database_path: Path,
+    settings: Settings,
+    attachments: Iterable[Path] = (),
+) -> bool:
+    """Send the digest, then record what was announced.
+
+    Jobs are marked notified **only after** a successful send: doing it before
+    would let one SMTP failure suppress those jobs permanently.
+    """
+    from notify import build_digest, load_email_config, send_digest, should_send
+
+    new_jobs, changed_jobs = payload["new"], payload["changed"]
+    if not should_send(
+        new_jobs=new_jobs, changed_jobs=changed_jobs,
+        run_complete=payload["run_complete"],
+    ):
+        log.info("Nothing new to announce; no email sent")
+        return False
+
+    config = load_email_config(settings.get("notifications.email"))
+    if config is None:
+        log.info(
+            "%s new and %s changed job(s) to announce, but email is not "
+            "configured; skipping send", len(new_jobs), len(changed_jobs),
+        )
+        return False
+
+    digest = build_digest(new_jobs, changed_jobs, {
+        "companies_scanned": summary.companies_scanned,
+        "jobs_collected": summary.jobs_collected,
+        "incomplete_companies": summary.incomplete_companies,
+    })
+
+    if not send_digest(config, digest, attachments):
+        return False
+
+    with JobDatabase(database_path) as database:
+        database.record_notified(new_jobs, kind="new")
+        database.record_notified(changed_jobs, kind="changed")
+    return True
 
 
 def sync_completed_companies(
@@ -608,6 +698,7 @@ def run(
     save_raw: bool = False,
     output_prefix: str = "",
     write_back: bool = True,
+    notify: bool = True,
 ) -> tuple[RunSummary, list[dict[str, Any]], list[CompanyResult]]:
     """Execute a full scrape and write outputs.
 
@@ -692,6 +783,11 @@ def run(
         summary.within_window = counts["within_window"]
         summary.date_unavailable = counts["date_unavailable"]
 
+        # Explainable fit scoring, on the filtered set only - it reads
+        # descriptions, and most collected jobs never reach the output.
+        for job in filtered["jobs"]:
+            job.update(score_fit(job, cfg).as_dict())
+
         deduped = deduplicate(filtered["jobs"])
         summary.duplicates_removed = deduped["removed"]
         final_jobs = deduped["jobs"]
@@ -710,12 +806,33 @@ def run(
 
         summary.new_jobs = sum(1 for job in final_jobs if job.get("is_new"))
 
+        # Changes are reported only for jobs that survived filtering - a
+        # retitled warehouse role is a change, but not one worth an email.
+        matching_ids = {j.get("job_id") for j in final_jobs}
+        changed_jobs = [
+            c for c in database.changed_since_last_run()
+            if c["job_id"] in matching_ids
+        ]
+        summary.changed_jobs = len(changed_jobs)
+        database.clear_change_marks()
+
+        notify_payload = _prepare_notification(
+            database, summary, final_jobs, changed_jobs,
+        )
+
     paths = write_outputs(
         final_jobs, results, cfg,
         raw_jobs=all_jobs if save_raw else None, prefix=output_prefix,
     )
     for label, path in paths.items():
         log.info("Wrote %s -> %s", label, path)
+
+    # Sent after the outputs exist, so the spreadsheet can be attached. Only on
+    # a full run: a --limit or --test-company slice knows nothing about the
+    # companies it skipped, so its "new" set is not a real answer.
+    if notify and not output_prefix:
+        attachments = [p for k, p in paths.items() if k == "xlsx"]
+        send_notifications(notify_payload, summary, db_path, cfg, attachments)
 
     # Search-fallback ATS discovery, written back so the next run routes these
     # companies straight to a direct-API collector instead of Playwright.

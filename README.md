@@ -157,6 +157,7 @@ python main.py
 | `--no-playwright` | Disable browser fallback |
 | `--no-resolve` | Skip page resolution and URL repair |
 | `--no-write-back` | Don't write discovered ATS URLs into the workbook |
+| `--no-email` | Don't send the email digest, even on a full run |
 | `--save-raw` | Also write every collected job, pre-filter |
 | `--quiet` | Log to file only |
 | `--config PATH` / `--excel PATH` | Override config or input workbook |
@@ -241,6 +242,35 @@ date, and inventing one would corrupt the freshness filter.
 `error_message` and `timestamp`.
 
 ---
+
+## Notifications
+
+A full run emails a digest of new and changed matching jobs with
+`output/company_jobs.xlsx` attached. Configure the recipient in
+`config/settings.yaml` under `notifications.email`; **credentials come from the
+environment only**, since that file is in git:
+
+```bash
+export SCRAPER_SMTP_HOST=smtp.gmail.com
+export SCRAPER_SMTP_PORT=587
+export SCRAPER_SMTP_USER=you@gmail.com
+export SCRAPER_SMTP_PASSWORD=your-app-password   # Gmail: an App Password, not your login
+```
+
+Without those three variables the run logs what it *would* have sent and
+carries on — a mail problem never fails a scrape, because the spreadsheet on
+disk is the real deliverable.
+
+Three guards decide whether anything goes out:
+
+| Guard | Why |
+|-------|-----|
+| Something new or changed | A channel that mails "0 new jobs" every run is one you stop opening |
+| Every company completed | A truncated run never saw the pages it missed, so its "new" set is not a real answer |
+| Not announced before | The `notifications` table records each job once per kind, so a digest never repeats itself |
+
+Partial runs (`--test-company`, `--limit`) never send: they know nothing about
+the companies they skipped.
 
 ## Job tracking (SQLite)
 
@@ -491,6 +521,8 @@ returns real jobs through it.
 | `filters.py` | Role match (per title segment), DFW/remote match, freshness window |
 | `enrich.py` | Fill coarse locations (e.g. Workday detail fetch) |
 | `deduplicate.py` | Collapse duplicate postings within a run |
+| `fit.py` | Explainable fit scoring against a configurable skill list |
+| `notify.py` | Email digest of new/changed jobs; SMTP credentials from env only |
 | `job_identity.py` | Stable, company-scoped per-job id derived from the posting URL; `JOB_ID_SCHEME_VERSION` |
 | `database.py` | SQLite tracking — upsert, per-company removal sync, new/first-seen |
 | `export_ats_urls.py` | Write verified discovered ATS URLs, verified dead-URL repairs, and run status back into the workbook |

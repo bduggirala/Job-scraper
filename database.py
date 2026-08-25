@@ -17,6 +17,8 @@ written by, or reconciled against the JobSpy pipeline.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -38,7 +40,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     first_seen  TEXT NOT NULL,
     last_seen   TEXT NOT NULL,
     date_posted TEXT,
-    misses      INTEGER NOT NULL DEFAULT 0
+    misses      INTEGER NOT NULL DEFAULT 0,
+    record_hash TEXT,
+    changed_at  TEXT,
+    changed_fields TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company);
 CREATE INDEX IF NOT EXISTS idx_jobs_first_seen ON jobs(first_seen);
@@ -47,7 +52,22 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- One row per (job, alert kind) actually sent. This is what stops a digest
+-- repeating itself: without it every run would re-announce the same jobs,
+-- which is the failure mode that makes an alert channel worth ignoring.
+CREATE TABLE IF NOT EXISTS notifications (
+    job_id  TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, kind)
+);
 """
+
+#: Fields whose change is worth reporting. Deliberately not date_posted: many
+#: providers emit a relative string ("Posted 3 Days Ago") that re-parses to a
+#: different timestamp every run, which would mark every job changed forever.
+TRACKED_FIELDS = ("title", "location", "job_url")
 
 #: meta key holding the job-id scheme the stored rows were written under.
 _SCHEME_KEY = "job_id_scheme_version"
@@ -118,7 +138,12 @@ class JobDatabase:
         """
         cursor = self._connection.execute("PRAGMA table_info(jobs)")
         existing = {row[1] for row in cursor.fetchall()}
-        for column, ddl in (("misses", "INTEGER NOT NULL DEFAULT 0"),):
+        for column, ddl in (
+            ("misses", "INTEGER NOT NULL DEFAULT 0"),
+            ("record_hash", "TEXT"),
+            ("changed_at", "TEXT"),
+            ("changed_fields", "TEXT"),
+        ):
             if column not in existing:
                 log.info("Adding missing column jobs.%s", column)
                 self._connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
@@ -234,58 +259,172 @@ class JobDatabase:
         return {"total": total}
 
     # -- writes -----------------------------------------------------------
+    @staticmethod
+    def record_hash(record: dict[str, Any]) -> str:
+        """Content hash over the fields whose change is worth reporting."""
+        blob = "\x1f".join(str(record.get(f) or "") for f in TRACKED_FIELDS)
+        return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()
+
     def upsert_jobs(self, records: Iterable[dict[str, Any]]) -> dict[str, int]:
-        """Insert new jobs and refresh ``last_seen`` for ones already known.
+        """Insert new jobs, refresh known ones, and classify what moved.
 
         Each record must carry a ``job_id`` key (set by the caller via
         :func:`job_identity.extract_stable_job_id`). ``first_seen`` is written
         once and never overwritten.
 
+        A row whose :meth:`record_hash` differs from the stored one is recorded
+        as changed, with the specific fields named. Without this the only
+        detectable states were "present" and "absent" - a retitled or relocated
+        posting looked identical to one that had not moved.
+
         Returns:
-            ``{"new": int, "updated": int}``
+            ``{"added": int, "changed": int, "unchanged": int}``
         """
         rows = [r for r in records if r.get("job_id") and r.get("job_url")]
         if not rows:
-            return {"new": 0, "updated": 0}
+            return {"added": 0, "changed": 0, "unchanged": 0}
 
         now = _utc_now()
         ids = [r["job_id"] for r in rows]
-        existing = set(self.get_first_seen_map(ids))
 
-        payload = [
-            (
-                record["job_id"],
-                record["job_url"],
-                record.get("company"),
-                record.get("title"),
-                record.get("location"),
-                now,
-                now,
-                record.get("date_posted"),
-            )
-            for record in rows
-        ]
+        previous: dict[str, tuple[str | None, str | None, str | None, str | None]] = {}
+        with self._cursor() as cursor:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cursor.execute(
+                    f"SELECT job_id, record_hash, title, location, job_url "
+                    f"FROM jobs WHERE job_id IN ({placeholders})",
+                    chunk,
+                )
+                for row in cursor.fetchall():
+                    previous[row["job_id"]] = (
+                        row["record_hash"], row["title"], row["location"], row["job_url"],
+                    )
+
+        added = changed = unchanged = 0
+        payload = []
+        for record in rows:
+            digest = self.record_hash(record)
+            prior = previous.get(record["job_id"])
+
+            if prior is None:
+                added += 1
+                fields_json = None
+                changed_at = None
+            elif prior[0] != digest:
+                moved = [
+                    field for field, before in zip(TRACKED_FIELDS, prior[1:])
+                    if str(record.get(field) or "") != str(before or "")
+                ]
+                if moved:
+                    changed += 1
+                    fields_json = json.dumps(moved)
+                    changed_at = now
+                else:
+                    # Hash drifted without a tracked field moving (an older row
+                    # written before hashing existed). Backfill, do not report.
+                    unchanged += 1
+                    fields_json = None
+                    changed_at = None
+            else:
+                unchanged += 1
+                fields_json = None
+                changed_at = None
+
+            payload.append((
+                record["job_id"], record["job_url"], record.get("company"),
+                record.get("title"), record.get("location"), now, now,
+                record.get("date_posted"), digest, changed_at, fields_json,
+            ))
 
         with self._cursor() as cursor:
             cursor.executemany(
                 """
                 INSERT INTO jobs (job_id, job_url, company, title, location,
-                                  first_seen, last_seen, date_posted)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                  first_seen, last_seen, date_posted,
+                                  record_hash, changed_at, changed_fields)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
-                    job_url     = excluded.job_url,
-                    last_seen   = excluded.last_seen,
-                    title       = COALESCE(excluded.title, jobs.title),
-                    location    = COALESCE(excluded.location, jobs.location),
-                    date_posted = COALESCE(excluded.date_posted, jobs.date_posted),
+                    job_url        = excluded.job_url,
+                    last_seen      = excluded.last_seen,
+                    title          = COALESCE(excluded.title, jobs.title),
+                    location       = COALESCE(excluded.location, jobs.location),
+                    date_posted    = COALESCE(excluded.date_posted, jobs.date_posted),
+                    record_hash    = excluded.record_hash,
+                    changed_at     = COALESCE(excluded.changed_at, jobs.changed_at),
+                    changed_fields = COALESCE(excluded.changed_fields, jobs.changed_fields),
                     -- Seeing a job again clears any accumulated absence.
-                    misses      = 0
+                    misses         = 0
                 """,
                 payload,
             )
 
-        new_count = sum(1 for job_id in ids if job_id not in existing)
-        return {"new": new_count, "updated": len(ids) - new_count}
+        return {"added": added, "changed": changed, "unchanged": unchanged}
+
+    def changed_since_last_run(self) -> list[dict[str, Any]]:
+        """Jobs whose tracked fields moved during the most recent upsert."""
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT job_id, company, title, location, job_url, changed_fields "
+                "FROM jobs WHERE changed_fields IS NOT NULL"
+            )
+            return [
+                {
+                    "job_id": row["job_id"], "company": row["company"],
+                    "title": row["title"], "location": row["location"],
+                    "job_url": row["job_url"],
+                    "changed_fields": json.loads(row["changed_fields"]),
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def clear_change_marks(self) -> None:
+        """Reset change marks once they have been reported."""
+        with self._cursor() as cursor:
+            cursor.execute("UPDATE jobs SET changed_fields = NULL")
+
+    # -- notification bookkeeping -----------------------------------------
+    def filter_unnotified(
+        self, records: Iterable[dict[str, Any]], *, kind: str
+    ) -> list[dict[str, Any]]:
+        """The subset of ``records`` never yet announced for ``kind``.
+
+        Kinds are tracked separately so a job announced as new can still be
+        announced later when it changes.
+        """
+        rows = [r for r in records if r.get("job_id")]
+        if not rows:
+            return []
+
+        sent: set[str] = set()
+        with self._cursor() as cursor:
+            ids = [r["job_id"] for r in rows]
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                cursor.execute(
+                    f"SELECT job_id FROM notifications "
+                    f"WHERE kind = ? AND job_id IN ({placeholders})",
+                    [kind, *chunk],
+                )
+                sent.update(row["job_id"] for row in cursor.fetchall())
+
+        return [r for r in rows if r["job_id"] not in sent]
+
+    def record_notified(self, records: Iterable[dict[str, Any]], *, kind: str) -> int:
+        """Mark records as announced. Call only after a send actually succeeds."""
+        rows = [r for r in records if r.get("job_id")]
+        if not rows:
+            return 0
+        now = _utc_now()
+        with self._cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO notifications (job_id, kind, sent_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(job_id, kind) DO NOTHING",
+                [(r["job_id"], kind, now) for r in rows],
+            )
+        return len(rows)
 
     def sync_company(self, company: str, current_ids: set[str]) -> dict[str, int]:
         """Age out jobs for ``company`` that were not seen this run.

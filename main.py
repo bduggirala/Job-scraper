@@ -73,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-write-back", action="store_true",
         help="Don't write ATS URLs discovered via the search fallback back into the workbook",
     )
+    parser.add_argument(
+        "--no-email", action="store_true",
+        help="Don't send the email digest, even on a full run",
+    )
     parser.add_argument("--quiet", action="store_true", help="Log to file only")
     return parser
 
@@ -145,6 +149,7 @@ def cmd_scrape(args: argparse.Namespace, settings) -> int:
         save_raw=args.save_raw,
         output_prefix=prefix,
         write_back=not args.no_write_back,
+        notify=not args.no_email,
     )
 
     if diagnostic:
