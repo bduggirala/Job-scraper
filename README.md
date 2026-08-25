@@ -216,8 +216,21 @@ exactly the case where a cheap tier helps most.
 ```
 company, title, location, date_posted, job_url, apply_url, employment_type,
 remote, description, ats_provider, scraping_method, date_filter_status,
-location_match_type, first_seen, is_new
+location_match_type, remote_scope, source_query, first_seen, is_new
 ```
+
+`remote_scope` is `remote_us`, `remote_restricted`, `remote_non_us`, `hybrid`
+or `onsite`. Only `remote_us` counts as a remote match: a role tied to one
+non-Texas state ("Remote — must reside in New York") used to satisfy both the
+remote token and the US check, since any state name counted as US eligibility.
+
+`source_query` records which search term surfaced a job on a site whose jobs
+only exist behind a search. Blank for everything reached directly.
+
+Text columns are written with a leading `'` when the value starts with `=`,
+`+`, `-` or `@`. These come verbatim from third-party pages and the output is
+meant to be opened in a spreadsheet, where such a value is executed as a
+formula.
 
 `date_filter_status` is `within_window`, `older_than_window`, or
 `date_unavailable`. Jobs with no reliable posting date are **kept and flagged**,

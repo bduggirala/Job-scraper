@@ -274,7 +274,7 @@ def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
     return JSONLDCollector(plan.company, detection).collect()
 
 
-def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None]:
+def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None, bool]:
     """Run the Playwright fallback for a planned company.
 
     Imported lazily so that a run which never needs a browser (or a machine
@@ -302,8 +302,9 @@ def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | 
 
     result = scrape_with_playwright(plan.company, browser_url)
 
-    records = [
-        build_record(
+    records = []
+    for job in result.jobs:
+        record = build_record(
             company=plan.company,
             title=job.get("title"),
             location=job.get("location"),
@@ -314,12 +315,16 @@ def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | 
             ats_provider=plan.provider if plan.provider != UNKNOWN else "unknown",
             scraping_method=METHOD_BROWSER,
         )
-        for job in result.jobs
-    ]
+        if record:
+            # Provenance: which search term surfaced this row, when the site
+            # only reveals jobs behind a search.
+            record["source_query"] = job.get("source_query")
+            records.append(record)
     return (
-        [record for record in records if record],
+        records,
         result.discovered_ats_url,
         result.discovered_provider,
+        result.blocked,
     )
 
 
@@ -424,7 +429,7 @@ def fetch_company_jobs(
 
     log.info("%s -> Playwright fallback", company)
     try:
-        jobs, discovered_url, discovered_provider = collect_via_browser(plan)
+        jobs, discovered_url, discovered_provider, blocked = collect_via_browser(plan)
     except Exception as exc:
         # A thin JSON-LD harvest is still better than nothing when the browser
         # cannot run at all.
@@ -477,6 +482,17 @@ def fetch_company_jobs(
                         company, discovered_provider, exc)
 
     log.info("%s -> %s jobs retrieved", company, len(jobs))
+
+    # A refusal is reported as itself rather than folded into "no jobs found",
+    # so the failure report distinguishes "the site turned us away" from
+    # "we reached the site and it had nothing" - which need opposite responses.
+    if blocked and not jobs:
+        return CompanyResult(
+            company=company, jobs=[], plan=plan, success=False, fell_back=fell_back,
+            error_type="AccessDenied",
+            error_message="Site answered with a bot challenge or explicit denial",
+        )
+
     return CompanyResult(
         company=company, jobs=jobs, plan=plan,
         success=bool(jobs), fell_back=fell_back,

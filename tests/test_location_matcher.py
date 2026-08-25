@@ -56,9 +56,21 @@ def test_accepts_united_states_location(matcher):
     assert matcher.is_remote_us(record) is True
 
 
-def test_accepts_named_us_state_and_city(matcher):
+def test_a_named_us_state_and_city_is_recognised_as_american(matcher):
+    """Still US, but anchored to one state - so not remote-anywhere.
+
+    This test originally asserted ``is_remote_us`` was True, back when that
+    method only answered "is this American?". It now also has to answer "is
+    this open anywhere in the US?", and a remote role listing San Diego,
+    California is exactly the location-restricted case that used to reach a
+    DFW search as a match. The US/non-US axis it was written to cover is
+    asserted directly instead.
+    """
+    from filters import REMOTE_RESTRICTED, classify_remote_scope
+
     record = {"location": "San Diego, CALIFORNIA, us", "remote": True}
-    assert matcher.is_remote_us(record) is True
+    assert classify_remote_scope(record) == REMOTE_RESTRICTED
+    assert matcher.is_remote_us(record) is False
 
 
 def test_rejects_foreign_cities_not_in_the_non_us_blocklist(matcher):

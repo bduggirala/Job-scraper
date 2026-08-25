@@ -41,7 +41,7 @@ def test_a_thin_jsonld_harvest_does_not_stop_the_ladder(monkeypatch):
 
     def _browser(plan):
         browser_called.append(plan.company)
-        return _jobs(40, prefix="browser"), None, None
+        return _jobs(40, prefix="browser"), None, None, False
 
     monkeypatch.setattr(router, "collect_via_browser", _browser)
 
@@ -69,7 +69,7 @@ def test_a_substantial_jsonld_harvest_still_short_circuits(monkeypatch):
 def test_a_thin_harvest_is_kept_when_the_browser_finds_nothing(monkeypatch):
     """Three real jobs beat zero - the fallback must not be discarded."""
     monkeypatch.setattr(router, "collect_via_jsonld", lambda plan: _jobs(3))
-    monkeypatch.setattr(router, "collect_via_browser", lambda plan: ([], None, None))
+    monkeypatch.setattr(router, "collect_via_browser", lambda plan: ([], None, None, False))
 
     result = router.fetch_company_jobs("Acme", plan=_plan())
 

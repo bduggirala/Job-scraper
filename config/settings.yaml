@@ -170,8 +170,29 @@ playwright:
   # before the role filter ever runs.
   search_fallback:
     enabled: true
-    search_term: "Data"
     max_wait_ms: 6000
+
+    # On a search-driven site the site's own search is the only view of its
+    # jobs we ever get, so one term is a coverage ceiling, not a filter: a role
+    # whose title contains no "data" - Snowflake Engineer, Databricks Engineer,
+    # ETL Developer, Analytics Engineer - is simply invisible to a "Data"
+    # query, and those are all on the target list.
+    #
+    # Broad terms first: results merge and de-duplicate across queries, and
+    # each row records which query found it (`source_query`). Searching stays
+    # broad on purpose - target_role_patterns does the narrowing afterwards,
+    # and can only ever filter what was actually fetched.
+    search_terms:
+      - "Data"
+      - "Engineer"
+      - "Analytics"
+      - "ETL"
+
+    # Bound per company: each query costs a submit plus max_wait_ms.
+    max_queries: 4
+
+    # Retained so an older config keeps working; search_terms wins when set.
+    search_term: "Data"
 
 # --- HTTP behaviour --------------------------------------------------------
 requests:

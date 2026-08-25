@@ -47,6 +47,8 @@ log = get_logger("pipeline")
 OUTPUT_FIELDS = list(RECORD_FIELDS) + [
     "date_filter_status",
     "location_match_type",
+    "remote_scope",
+    "source_query",
     "first_seen",
     "is_new",
 ]
@@ -431,6 +433,40 @@ def execute_plans(
     return results
 
 
+#: Leading characters a spreadsheet treats as the start of a formula.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def escape_formulas(frame: pd.DataFrame) -> pd.DataFrame:
+    """Neutralise spreadsheet formulas in scraped text before writing a CSV.
+
+    Titles, locations and descriptions arrive verbatim from third-party pages,
+    and this output exists to be opened in Excel or Sheets. A value starting
+    ``=``, ``+``, ``-`` or ``@`` is evaluated as a formula on open, so a
+    crafted job title becomes code running on the reader's machine.
+
+    Prefixing with an apostrophe is the standard defence: the spreadsheet
+    treats the cell as literal text and does not display the apostrophe, while
+    the value stays readable to anything reading the CSV directly.
+    """
+    if frame.empty:
+        return frame
+
+    def _escape(value: Any) -> Any:
+        if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+            return f"'{value}"
+        return value
+
+    # Every column is walked and the isinstance check does the filtering. An
+    # earlier version skipped columns whose dtype was not ``object``, which
+    # silently disabled the whole guard under pandas 2.x - it infers ``str``
+    # for text columns, so nothing was ever escaped.
+    escaped = frame.copy()
+    for column in escaped.columns:
+        escaped[column] = escaped[column].map(_escape)
+    return escaped
+
+
 def write_outputs(
     jobs: list[dict[str, Any]],
     results: list[CompanyResult],
@@ -458,6 +494,8 @@ def write_outputs(
         jobs_frame = jobs_frame.sort_values(
             "date_posted", ascending=False, na_position="last"
         ).reset_index(drop=True)
+
+    jobs_frame = escape_formulas(jobs_frame)
 
     jobs_frame.to_csv(csv_path, index=False, encoding="utf-8")
     with json_path.open("w", encoding="utf-8") as handle:
