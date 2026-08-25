@@ -31,5 +31,8 @@ config/*.bak-*
 Thumbs.db
 *.swp
 
+# Excel lock files (created while a workbook is open)
+~$*.xlsx
+
 # Ad-hoc full-run logs
 run_output*.log
