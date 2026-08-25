@@ -70,12 +70,39 @@ target_role_patterns:
 # posting.
 exclude_role_patterns:
   - '\bdata\s+scientist'
+  - '\bdata\s+science\b'
   - '\bmachine\s+learning\s+engineer'
   - '\bml\s+engineer'
   - '\b(intern|internship|co-?op)\b'
-  - '\b(lead|manager|principal)\b'
   - '\bdata\s*center'
   - '\bdata\s+entry\b'
+
+  # Non-engineering "data" roles. '\banalyst\b' is written as its own word so
+  # it rejects "Data Analyst" / "Sr. Analyst, Data Analysis" while leaving
+  # "Data Analytics Engineer" and "Analytics Engineer" alone - those are
+  # target roles, and "analytics" is a different word from "analyst".
+  # Confirmed against a live Capital One run: of 35 titles matching '\bdata\b',
+  # all but one were analyst/scientist/manager roles rather than engineering.
+  - '\banalyst\b'
+  - '\banalysis\b'
+  - '\bbusiness\s+intelligence\b'
+  - '\bdata\s+steward'
+  - '\bdata\s+governance\b'
+  - '\bdata\s+architect\b'
+  # Non-engineering roles that merely sit near data, seen in the same run:
+  # "Data Annotator", "Principal Associate, Accounting - CPC Card Data Team",
+  # "Sr Associate, Product Management - Finance Data". None risk a real
+  # engineering title.
+  - '\bannotator\b'
+  - '\baccounting\b'
+  - '\bproduct\s+management\b'
+
+  # Management, by shape rather than by seniority word. The previous
+  # '\b(lead|manager|principal)\b' also rejected "Lead Data Engineer" and
+  # "Principal Data Engineer", which are individual-contributor titles at most
+  # employers and among the most relevant senior postings there are.
+  - '\b(manager|director|head\s+of|vice\s+president|vp)\b'
+  - '\bmanaging\s+consultant\b'
 
 # --- Playwright fallback ---------------------------------------------------
 playwright:

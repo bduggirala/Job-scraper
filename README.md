@@ -336,10 +336,17 @@ suppresses removal sync for that company and lists it in the run summary with
 its shortfall. `max_pages_per_company` remains for collectors not yet converted
 (iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
 
-Collectors that can be truncated request **newest-first** ordering, so what
-survives a short walk is what the freshness window can still match. Workday had
-no ordering at all before this — it posted `searchText: ""` and kept an
-arbitrary slice of the tenant, unstable between runs.
+What survives a truncated walk should be what the freshness window can still
+match, so collectors that can be truncated ask for newest-first where the
+provider supports it (UKG `postedDateDesc`, Oracle `POSTING_DATES_DESC`,
+Amazon `sort=recent`).
+
+**Workday CXS ignores a sort parameter** — verified directly: requesting
+`sortBy=POSTING_DATES_DESC` returns a byte-identical first page to sending
+nothing, so the collector does not send one rather than carry a dead parameter
+that reads as a guarantee. Its default order is already posting-date
+descending, measured across Capital One's 1,854 postings: mean age climbs
+monotonically from 1.6 days in the first 200 rows to 29.0 days in the last 200.
 
 Target roles match on any title segment naming "data" as its own word (titles
 are split on `,`, `/`, `-`, `|`) — `Software Engineer, Data Engineering`

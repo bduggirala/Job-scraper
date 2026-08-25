@@ -113,11 +113,16 @@ def test_hitting_the_job_budget_before_the_total_marks_the_walk_incomplete(monke
     assert result.shortfall == 7900
 
 
-def test_the_walk_requests_newest_first(monkeypatch):
-    """Truncation is only tolerable if what survives is the freshest rows.
+def test_the_walk_sends_no_dead_sort_parameter(monkeypatch):
+    """Workday CXS ignores sortBy - verified directly against a live tenant.
 
-    The collector previously posted searchText:"" with no ordering at all, so
-    its 500-job ceiling kept an arbitrary 500 of the tenant's requisitions.
+    Requesting ``sortBy=POSTING_DATES_DESC`` returns a byte-identical first
+    page to sending nothing, so carrying the parameter would read as though
+    ordering were guaranteed when it is not. Truncation is safe here anyway:
+    the endpoint's *default* order is posting-date descending (measured across
+    1,854 Capital One postings, mean age climbs monotonically from 1.6 days in
+    the first 200 rows to 29.0 in the last 200), so a budget-truncated walk
+    keeps the freshest requisitions.
     """
     fake = _FakeCXS(total=45)
     _install(monkeypatch, fake)
@@ -127,8 +132,8 @@ def test_the_walk_requests_newest_first(monkeypatch):
     assert fake.payloads, "collector made no request"
     for payload in fake.payloads:
         assert payload.get("searchText") == ""
-        assert "POSTING_DATES" in str(payload).upper() or payload.get("sortBy"), (
-            f"no newest-first ordering requested: {payload}"
+        assert "sortBy" not in payload, (
+            f"dead sort parameter reintroduced: {payload}"
         )
 
 

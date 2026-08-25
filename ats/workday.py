@@ -68,16 +68,21 @@ class WorkdayCollector(ATSCollector):
         return None
 
     def _fetch_page(self, endpoint: str, request: PageRequest):
+        # No sort parameter: Workday CXS ignores one. Verified directly against
+        # Capital One's tenant - requesting sortBy=POSTING_DATES_DESC returns a
+        # byte-identical first page to sending nothing, so passing it would be
+        # a dead parameter that reads as though ordering were guaranteed.
+        #
+        # The default order is already posting-date descending, which is what
+        # a truncated walk needs. Measured over that tenant's 1,854 postings:
+        # mean age climbs monotonically from 1.6 days in rows 0-200 to 29.0
+        # days in the last 200. So a budget-truncated Workday walk keeps the
+        # freshest requisitions - the ones a 7-day window can still match.
         payload = {
             "appliedFacets": {},
             "limit": request.page_size,
             "offset": request.offset,
             "searchText": "",
-            # Newest-first. Without an explicit sort Workday returns rows in an
-            # unspecified order, so a truncated walk kept an arbitrary slice of
-            # the tenant - useless against a freshness window, and unstable
-            # between runs, which churned the removal sync.
-            "sortBy": "POSTING_DATES_DESC",
         }
         data = http_client.post_json(
             endpoint, payload,
