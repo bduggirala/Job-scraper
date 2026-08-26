@@ -228,7 +228,10 @@ _EXTRACT_JS = """
     return null;
   };
 
-  const dateRe = /(date|posted|time|age)/i;
+  // Narrow on purpose: 'age' also matched page/manager/message/package,
+  // and 'time' matched part-time/full-time badges - so whatever text
+  // those elements held was handed to the date parser as a posting date.
+  const dateRe = /(date|posted|publish)/i;
 
   const nearbyDate = (el) => {
     let node = el.parentElement;

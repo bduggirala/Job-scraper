@@ -552,6 +552,14 @@ python tools/canary.py
 
 Unit tests: `python -m pytest tests/ -v`
 
+Test-only dependencies live in `requirements-dev.txt` (which includes
+`requirements.txt`), so a deployment does not install a test runner it will
+never use:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## Finding missing ATS URLs
 
 `tools/find_ats_urls.py` crawls a company's careers page and corporate

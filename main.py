@@ -15,6 +15,8 @@ import argparse
 import logging
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 from ats.router import METHOD_API, METHOD_BROWSER
@@ -232,15 +234,43 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-if __name__ == "__main__":
-    exit_code = main()
+def _exit(code: int, grace_seconds: float = 10.0) -> None:
+    """Exit cleanly when possible, abruptly only when a worker is wedged.
 
-    # A Playwright worker can wedge inside its own event loop with no timeout.
-    # The pipeline already records such a company as a Timeout failure and
-    # moves on, but the thread itself survives - and ThreadPoolExecutor threads
-    # are non-daemon, so the interpreter would refuse to exit while one lingers.
-    # All outputs are flushed by this point, so leave abruptly rather than hang.
+    A Playwright worker can block inside its own event loop with no timeout of
+    its own. The pipeline records such a company as a Timeout failure and moves
+    on, but the thread survives - and ThreadPoolExecutor threads are
+    non-daemon, so the interpreter refuses to exit while one lingers.
+
+    The old behaviour was to call ``os._exit`` unconditionally, which skips
+    every ``atexit`` hook and buffered flush on *every* run to defend against a
+    case that only sometimes happens. Instead, give the stragglers a short
+    grace period: a normal run exits normally, and only a genuinely stuck
+    worker gets the abrupt treatment.
+    """
     sys.stdout.flush()
     sys.stderr.flush()
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        lingering = [
+            t for t in threading.enumerate()
+            if t is not threading.current_thread() and not t.daemon and t.is_alive()
+        ]
+        if not lingering:
+            logging.shutdown()
+            sys.exit(code)
+        time.sleep(0.25)
+
+    names = ", ".join(
+        t.name for t in threading.enumerate()
+        if t is not threading.current_thread() and not t.daemon and t.is_alive()
+    )
+    log.warning("Worker thread(s) still running after %.0fs (%s); exiting abruptly. "
+                "All outputs are already written.", grace_seconds, names)
     logging.shutdown()
-    os._exit(exit_code)
+    os._exit(code)
+
+
+if __name__ == "__main__":
+    _exit(main())

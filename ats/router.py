@@ -493,10 +493,18 @@ def fetch_company_jobs(
             error_message="Site answered with a bot challenge or explicit denial",
         )
 
+    # Reaching a site that has no matching openings is a real answer, not a
+    # failure. Treating it as one inflated the failure count, filled the
+    # failure report with rows needing no action, and wrote a misleading
+    # "Data Retrieved = FALSE" into the workbook.
+    #
+    # This is safe for removal because sync_completed_companies also requires
+    # result.jobs - a zero-job result is still never read as "all jobs closed".
+    if not jobs:
+        log.info("%s -> rendered cleanly with no matching jobs", company)
+
     return CompanyResult(
         company=company, jobs=jobs, plan=plan,
-        success=bool(jobs), fell_back=fell_back,
-        error_type=None if jobs else "NoJobsFound",
-        error_message=None if jobs else "Browser fallback returned zero jobs",
+        success=True, fell_back=fell_back,
         discovered_ats_url=discovered_url, discovered_provider=discovered_provider,
     )

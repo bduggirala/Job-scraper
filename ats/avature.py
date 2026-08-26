@@ -4,8 +4,10 @@ Avature career portals are server-rendered at::
 
     https://{tenant}.avature.net/careers/SearchJobs/?jobRecordsPerPage=100&jobOffset=0
 
-Some tenants also honour ``?format=json``; that is tried first because it
-gives structured rows, with the HTML list as the fallback.
+Parsing is JSON-LD first (real dates when present), then the ``JobDetail``
+anchor markup. Some tenants also honour ``?format=json``, but this collector
+does not use it - an earlier version of this docstring claimed it was "tried
+first", which was never true of the code.
 """
 
 from __future__ import annotations
