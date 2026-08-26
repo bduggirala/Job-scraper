@@ -20,6 +20,18 @@ WITHIN_WINDOW = "within_window"
 OUTSIDE_WINDOW = "older_than_window"
 DATE_UNAVAILABLE = "date_unavailable"
 
+# Where the date behind that verdict came from. Exported as `date_source`,
+# because "within_window" alone conflates two very different claims: the
+# employer says this was posted three days ago, and *we first saw it* three
+# days ago. The second is not a posting date - a role listed for six months by
+# a company we only started scraping last week is "first seen" recently - and a
+# reader deciding whether to apply deserves to know which one they have. On a
+# real run 13 of 31 exported rows rested on first_seen and said only
+# "within_window".
+DATE_FROM_POSTING = "posted"        # the employer's own date
+DATE_FROM_FIRST_SEEN = "first_seen"  # our observation, used as a stand-in
+DATE_FROM_NOTHING = "none"           # no date at all; kept and flagged
+
 # Title segments are split on these so "Software Engineer, Data Engineering"
 # is judged on the segment that actually names the role.
 _SEGMENT_SPLIT = re.compile(r"[,;|/\\–—]|\s+-\s+|\(|\)|\[|\]")
@@ -246,9 +258,12 @@ class LocationMatcher:
             (city, re.compile(rf"\b{re.escape(city)}\b", re.I)) for city in self.cities
         ]
 
-    @staticmethod
-    def _has_non_us_signal(text: str) -> bool:
-        return any(re.search(rf"\b{re.escape(token)}\b", text) for token in _NON_US_TOKENS)
+    # There is deliberately no `_has_non_us_signal` counterpart here. One
+    # existed and `_has_us_signal` below replaced it: a curated blocklist of
+    # foreign place names can never be exhaustive, so the *absence* of a
+    # blocked token is not evidence that a role is US-based. Where a foreign
+    # name genuinely is present, `classify_remote_scope` still consults
+    # `_NON_US_TOKENS` directly.
 
     @staticmethod
     def _has_us_signal(text: str) -> bool:
@@ -354,19 +369,37 @@ def classify_date(
     Falls back to ``first_seen`` from the SQLite tracker when the ATS gives no
     posting date - a job first observed inside the window is treated as newly
     discovered rather than being discarded.
+
+    Use :func:`date_provenance` alongside this to record *which* date decided
+    it; the status alone cannot distinguish an employer's posting date from our
+    own first sighting.
     """
+    status, _source = classify_date_with_source(
+        record, hours_old, now=now, first_seen=first_seen,
+    )
+    return status
+
+
+def classify_date_with_source(
+    record: dict[str, Any],
+    hours_old: int = 72,
+    *,
+    now: datetime | None = None,
+    first_seen: str | datetime | None = None,
+) -> tuple[str, str]:
+    """:func:`classify_date`, plus which date the verdict rests on."""
     reference = now or datetime.now(timezone.utc)
     cutoff = reference - timedelta(hours=hours_old)
 
     posted = parse_date(record.get("date_posted"), reference=reference)
     if posted is not None:
-        return WITHIN_WINDOW if posted >= cutoff else OUTSIDE_WINDOW
+        return (WITHIN_WINDOW if posted >= cutoff else OUTSIDE_WINDOW), DATE_FROM_POSTING
 
     seen = parse_date(first_seen, reference=reference) if first_seen else None
     if seen is not None:
-        return WITHIN_WINDOW if seen >= cutoff else OUTSIDE_WINDOW
+        return (WITHIN_WINDOW if seen >= cutoff else OUTSIDE_WINDOW), DATE_FROM_FIRST_SEEN
 
-    return DATE_UNAVAILABLE
+    return DATE_UNAVAILABLE, DATE_FROM_NOTHING
 
 
 def apply_filters(
@@ -419,11 +452,13 @@ def apply_filters(
             continue
         counts["location_match"] += 1
 
-        status = classify_date(
+        status, date_source = classify_date_with_source(
             record, hours_old, now=now, first_seen=lookup.get(record.get("job_id", ""))
         )
         enriched = dict(record)
         enriched["date_filter_status"] = status
+        # "within_window" on its own does not say whose date said so.
+        enriched["date_source"] = date_source
         enriched["location_match_type"] = reason
         # Carried into the output so "remote" is legible rather than a bare
         # flag: remote_us / remote_restricted / remote_non_us / hybrid / onsite.

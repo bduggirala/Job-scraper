@@ -7,7 +7,6 @@ list - and that path is how ``tools/find_ats_urls.py`` verifies every candidate,
 so the whole discovery tool would fail on any converted provider.
 """
 
-import pytest
 
 import ats.discovery as discovery
 from ats.base import STOP_PAGE_FAILED, ATSCollector, CollectionResult

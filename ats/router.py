@@ -113,10 +113,6 @@ class RoutePlan:
     #: confirmed against McAfee (Workday answers total:0) and HCLTech.
     live_jobs_url: str | None = None
 
-    @property
-    def uses_browser(self) -> bool:
-        return self.method == METHOD_BROWSER
-
     def describe(self) -> str:
         provider = self.provider if self.provider != UNKNOWN else "Unknown"
         method = "Direct API" if self.method == METHOD_API else "Playwright"

@@ -31,14 +31,8 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from ats.detector import (
-    ASHBY,
-    EIGHTFOLD,
-    GREENHOUSE,
-    LEVER,
     RADANCY,
-    SMARTRECRUITERS,
     UNKNOWN,
-    WORKDAY,
     detect_ats,
     detect_from_html,
     extract_all_embedded_ats_urls,
@@ -574,6 +568,9 @@ def _paginate_and_extract(
                       budget_seconds, len(seen))
             return list(seen.values()), False
         clicked = False
+        #: Rows gained by a height-neutral scroll, so the merge below can use
+        #: that count instead of re-extracting the same DOM.
+        scrolled_added: int | None = None
         for selector in LOAD_MORE_SELECTORS:
             try:
                 locator = page.locator(selector).first
@@ -589,18 +586,37 @@ def _paginate_and_extract(
 
         if not clicked:
             # No pagination control: try lazy-load via scrolling instead.
+            #
+            # Page height is only *one* signal that a scroll did something. A
+            # virtualized list (react-window and friends) keeps its scroll
+            # height fixed on purpose and swaps rows in and out of the DOM as
+            # you move, so height alone says "nothing happened" on exactly the
+            # sites where scrolling matters most - and returning `True` here
+            # would report that truncation as a complete harvest. So a scroll
+            # that did not grow the page is not conclusive by itself: fall
+            # through and let the row-level `barren` counter below decide,
+            # which is the signal that actually tracks whether we are still
+            # collecting jobs.
             try:
                 before = page.evaluate("document.body.scrollHeight")
                 page.mouse.wheel(0, 20000)
                 page.wait_for_timeout(1200)
                 after = page.evaluate("document.body.scrollHeight")
-                if after <= before:
-                    return list(seen.values()), True
                 clicked = True
+                if after <= before:
+                    # Inconclusive, so ask the rows directly - and reuse that
+                    # answer below rather than extracting twice, which would
+                    # make the second extraction look barren every time and
+                    # end the walk two iterations later regardless.
+                    scrolled_added = _merge(_extract_job_rows(page))
+                    if scrolled_added == 0:
+                        # Neither the page nor the row set moved: the end.
+                        return list(seen.values()), True
             except Exception:
                 return list(seen.values()), True
 
-        if _merge(_extract_job_rows(page)):
+        added = scrolled_added if scrolled_added is not None else _merge(_extract_job_rows(page))
+        if added:
             barren = 0
         else:
             barren += 1
@@ -918,7 +934,7 @@ def _find_search_input(page):
                 'input[type="text"], input[type="search"], input:not([type])'
             )
             count = min(candidates.count(), 20)
-        except Exception as e:
+        except Exception:
             continue
 
         for index in range(count):
@@ -942,7 +958,7 @@ def _find_search_input(page):
                     continue
                 if search_hint:
                     return frame, locator
-            except Exception as e:
+            except Exception:
                 continue
     return None
 

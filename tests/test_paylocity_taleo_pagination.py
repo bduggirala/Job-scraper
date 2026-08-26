@@ -7,7 +7,6 @@
   page one and reported success.
 """
 
-import pytest
 
 import ats.paylocity as paylocity_module
 import ats.taleo as taleo_module

@@ -11,7 +11,6 @@ entire board in one response and stay on the bare-list shim deliberately:
 there is no pagination for them to get wrong.
 """
 
-import pytest
 
 import ats.avature as avature_module
 import ats.icims as icims_module

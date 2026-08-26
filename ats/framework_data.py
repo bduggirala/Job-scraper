@@ -40,11 +40,46 @@ from normalize import join_location
 FRAMEWORK_DATA = "framework_data"
 
 #: ``window.<name> = {...};`` assignments worth parsing.
+#:
+#: The four framework-standard names are tried first because they are the ones
+#: that reliably hold hydration state. But a house-built careers site names its
+#: payload whatever it likes - Paylocity ships the entire board as
+#: ``window.pageData`` - and a fixed list of four could only ever see the sites
+#: that happened to use a framework convention. So an assignment to *any*
+#: plausible window property is a candidate now, with the walk's own
+#: job-shape test doing the discriminating (see :func:`_is_job_shaped`).
 _ASSIGNMENT_RE = re.compile(
     r"window\.(?:__NUXT__|__INITIAL_STATE__|__APP_STATE__|__PRELOADED_STATE__)"
     r"\s*=\s*(\{.*?\})\s*[;<]",
     re.S,
 )
+
+#: The named payloads, tried before anything else.
+_KNOWN_ASSIGNMENT_RE = re.compile(
+    r"window\.(?:__NUXT__|__INITIAL_STATE__|__APP_STATE__|__PRELOADED_STATE__)\s*=\s*"
+)
+
+#: Any other ``window.<identifier> = {`` on the page. Deliberately permissive
+#: about the name and strict about everything after it: the blob must parse as
+#: JSON and must contain job-shaped objects before a single row is emitted.
+_ANY_ASSIGNMENT_RE = re.compile(r"window\.([A-Za-z_$][\w$]*)\s*=\s*(?=\{)")
+
+#: Analytics and consent payloads sit in exactly this shape on nearly every
+#: careers page. Skipping them by name is cheaper than parsing a 100 KB
+#: tag-manager blob to discover it holds no jobs.
+_IGNORED_ASSIGNMENTS = frozenset({
+    "datalayer", "dataLayer", "ga", "gtag", "_gaq", "utag_data", "digitalData",
+    "adobeDataLayer", "optimizely", "onetrust", "otconsent", "clarity",
+    "__reactdevtools_global_hook__", "performance", "config", "settings",
+})
+
+#: How many unnamed candidates to parse per page. A page can carry dozens of
+#: small window assignments; balanced-brace scanning each one is linear in the
+#: page size, so the total stays bounded rather than quadratic on a hostile page.
+_MAX_CANDIDATES = 25
+
+#: Below this, a blob is a feature flag or a config stub, not a job list.
+_MIN_BLOB_CHARS = 200
 
 #: Keys that carry a posting's title, URL, location and date, most specific
 #: first. Matched case-insensitively against a candidate dict's keys.
@@ -89,20 +124,48 @@ def _payloads(html_text: str) -> Iterator[Any]:
             except (ValueError, TypeError):
                 continue
 
-    for match in re.finditer(
-        r"window\.(?:__NUXT__|__INITIAL_STATE__|__APP_STATE__|__PRELOADED_STATE__)\s*=\s*",
-        html_text,
-    ):
+    seen_at: set[int] = set()
+
+    for match in _KNOWN_ASSIGNMENT_RE.finditer(html_text):
         brace = html_text.find("{", match.end())
-        if brace == -1:
+        if brace == -1 or brace in seen_at:
             continue
-        blob = _balanced_json(html_text, brace)
-        if not blob:
+        seen_at.add(brace)
+        # No size floor here: a named hydration payload is worth reading at
+        # any size, and applying the speculative-candidate floor to it would
+        # silently change what this tier already handled.
+        payload = _parse_blob(html_text, brace, min_chars=0)
+        if payload is not None:
+            yield payload
+
+    # Then anything else assigned to a window property. Ordered after the
+    # known names so a page carrying both is read from its real hydration
+    # state first.
+    budget = _MAX_CANDIDATES
+    for match in _ANY_ASSIGNMENT_RE.finditer(html_text):
+        if budget <= 0:
+            break
+        if match.group(1).lower() in _IGNORED_ASSIGNMENTS:
             continue
-        try:
-            yield json.loads(blob)
-        except (ValueError, TypeError):
+        brace = html_text.find("{", match.end() - 1)
+        if brace == -1 or brace in seen_at:
             continue
+        seen_at.add(brace)
+        budget -= 1
+        payload = _parse_blob(html_text, brace)
+        if payload is not None:
+            yield payload
+
+
+def _parse_blob(html_text: str, brace: int, min_chars: int = _MIN_BLOB_CHARS) -> Any | None:
+    """Balanced-scan and parse one ``{...}`` payload, or None."""
+    blob = _balanced_json(html_text, brace)
+    if not blob or len(blob) < min_chars:
+        return None
+    try:
+        return json.loads(blob)
+    except (ValueError, TypeError):
+        return None
 
 
 def _pick(node: dict[str, Any], keys: tuple[str, ...]) -> Any:

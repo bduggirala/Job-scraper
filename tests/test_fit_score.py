@@ -10,7 +10,6 @@ no description must therefore be reported as *unscored*, not as a zero - those
 mean opposite things to someone reading the output.
 """
 
-import pytest
 
 from fit import score_fit
 

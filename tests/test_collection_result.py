@@ -6,7 +6,6 @@ pipeline then deleted every stored job absent from the partial harvest. These
 tests pin the contract that makes partial collection visible.
 """
 
-import pytest
 
 from ats.base import CollectionResult
 

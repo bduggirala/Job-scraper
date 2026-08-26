@@ -10,7 +10,6 @@ import pytest
 
 from deduplicate import (
     deduplicate,
-    duplicate_key,
     normalize_company,
     normalize_location,
     normalize_title,

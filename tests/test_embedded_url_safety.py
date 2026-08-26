@@ -21,7 +21,6 @@ from ats.detector import (
     WORKDAY,
     extract_all_embedded_ats_urls,
     extract_any_embedded_ats_url,
-    extract_embedded_ats_url,
     is_safe_fetch_target,
 )
 

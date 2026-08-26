@@ -2,3 +2,6 @@
 # not install a test runner it will never use.
 -r requirements.txt
 pytest==8.3.4
+# Lint + format check. Dev-only: nothing at runtime imports it.
+#   ./venv/bin/ruff check --select F,E9 --exclude venv .
+ruff>=0.16,<1.0

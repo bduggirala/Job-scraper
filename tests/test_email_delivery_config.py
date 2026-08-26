@@ -19,7 +19,6 @@ Credentials still come from the environment only and are never logged; these
 tests assert that too.
 """
 
-import os
 from pathlib import Path
 
 import pytest
@@ -247,10 +246,33 @@ def test_the_example_env_file_exists_and_disables_email_by_default():
 
     text = example.read_text(encoding="utf-8")
     assert "EMAIL_ENABLED=false" in text, "the example must not arrive armed"
-    assert "you@example.com" in text
     for key in ("SCRAPER_SMTP_HOST", "SCRAPER_SMTP_USER",
                 "SCRAPER_SMTP_PASSWORD", "SCRAPER_EMAIL_TO"):
         assert key in text, f"{key} is undocumented"
+
+
+def test_the_recipient_lives_in_the_example_env_and_nowhere_else():
+    """One place names the recipient, and it is not the code.
+
+    ``.env.example`` deliberately carries the real address for this
+    deployment - it is a routing destination, not a credential, and having it
+    in exactly one file is what stops it being pasted through the codebase.
+    What must stay generic is ``config/settings.yaml``: it is the file a
+    reader is most likely to copy, and ``SCRAPER_EMAIL_TO`` overrides it
+    anyway, so a real address there would be both redundant and sticky.
+    """
+    recipient = "bharghav.de@gmail.com"
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    assert f"SCRAPER_EMAIL_TO={recipient}" in example
+
+    tracked_config = (PROJECT_ROOT / "config" / "settings.yaml").read_text(encoding="utf-8")
+    assert recipient not in tracked_config, "settings.yaml must stay a placeholder"
+    assert "you@example.com" in tracked_config
+
+    for module in sorted(PROJECT_ROOT.glob("*.py")) + sorted(PROJECT_ROOT.glob("ats/*.py")):
+        assert recipient not in module.read_text(encoding="utf-8"), (
+            f"{module.name} hard-codes the recipient"
+        )
 
 
 def test_the_example_env_file_carries_no_secret_value():

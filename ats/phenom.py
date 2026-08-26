@@ -24,7 +24,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_BUDGET_UNORDERED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from ats.pagination import PageRequest, paginate
 from ats.detector import PHENOM
 from normalize import join_location
@@ -46,10 +52,19 @@ _DDO_RE = re.compile(r"phApp\.ddo\s*=\s*(\{.*?\})\s*;", re.S)
 #: 8,000 is ~800 requests, about 507s at the configured 3 req/s - inside the
 #: 900s per-company budget with room to spare. That is enough to complete
 #: Collins Aerospace, RTX and Humana, which a 2,000 ceiling truncated. CVS
-#: Health (19,246 postings) and Signify stay incomplete and always will: 1,925
-#: sequential requests does not fit any sane timeout. They are reported as
-#: truncated, and because the walk is newest-first the gap is the oldest
-#: postings - nothing a 7-day freshness window would have matched.
+#: Health (18,904 postings) and Signify stay incomplete and always will: 1,890
+#: sequential requests is ~1,020s at the rate those two actually achieve
+#: (8,000 rows took 432s each, sharing one rate-limited host), and overrunning
+#: the per-company budget loses the company outright rather than truncating it.
+#:
+#: **The gap is not the oldest postings.** That was claimed here for a long
+#: time, on the strength of the ``s=1`` parameter the search URL carries, and
+#: it is false: offset 0 returned a 12 June posting while offset 7,990 returned
+#: one from 24 August, and none of ``s=2``/``s=3``/``sortBy``/``keywords``/``q``
+#: changed the ordering or the total - this endpoint ignores them all. The rows
+#: beyond the ceiling are an arbitrary slice by date, so a truncated Phenom
+#: tenant may be hiding jobs posted today. Hence STOP_BUDGET_UNORDERED, which
+#: keeps these companies out of the "we know what we missed" set.
 MAX_JOBS = 8000
 
 
@@ -179,4 +194,17 @@ class PhenomCollector(ATSCollector):
 
         if not walk.items:
             raise CollectorUnavailable("Phenom search-results returned zero jobs")
-        return self.result(walk, walk.items)
+
+        result = self.result(walk, walk.items)
+        if result.stop_reason == STOP_BUDGET:
+            # Phenom serves by relevance, not date (see the note on MAX_JOBS),
+            # so this ceiling hides postings of every age rather than only the
+            # oldest. Saying so is what keeps these companies out of the set a
+            # digest is allowed to treat as fully understood.
+            self.log.warning(
+                "%s: Phenom ceiling reached at %s of %s postings - the rows "
+                "beyond it are NOT the oldest, this tenant serves by relevance",
+                self.company, len(result.jobs), result.reported_total,
+            )
+            result.stop_reason = STOP_BUDGET_UNORDERED
+        return result

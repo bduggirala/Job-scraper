@@ -40,6 +40,12 @@ STOP_REPEATED_PAGE = "repeated_page"
 #: provider serves few rows per request: at ten per page the ceiling is 5,000
 #: jobs regardless of how high ``max_jobs_per_company`` is set.
 STOP_PAGE_CEILING = "page_ceiling"
+#: Same ceiling as :data:`STOP_BUDGET`, but against a provider that does **not**
+#: serve its rows newest-first, so the rows we did not reach are of no
+#: particular age. A collector must use this rather than ``budget_exhausted``
+#: unless it can actually establish date ordering - see the note on
+#: :data:`DESCRIBABLE_STOP_REASONS`.
+STOP_BUDGET_UNORDERED = "budget_exhausted_unordered"
 #: A single-GET tier (JSON-LD, static HTML, framework payload) harvested a page
 #: that advertises more results than it served - a stated results count above
 #: what we extracted, a pagination widget, or a "view all jobs" link. The tier
@@ -53,9 +59,19 @@ STOP_SHORT_OF_TOTAL = "short_of_reported_total"
 #: Truncations whose *shape* we know, so a run carrying only these can still be
 #: trusted to say what is new.
 #:
-#: ``budget_exhausted`` and ``page_ceiling`` are ceilings we imposed ourselves,
-#: and the walks that hit them are newest-first, so what was missed is the
-#: oldest postings - nothing a freshness window would have matched.
+#: ``budget_exhausted`` and ``page_ceiling`` are ceilings we imposed ourselves
+#: on a walk that runs newest-first, so what was missed is the oldest postings -
+#: nothing a freshness window would have matched.
+#:
+#: That premise has to be *earned*, not assumed. It was assumed for Phenom for
+#: a long time on the strength of an undocumented ``s=1`` sort parameter, and
+#: it was simply untrue: measured directly against the CVS Health tenant, the
+#: first page held a posting from 12 June while offset 7,990 held one from 24
+#: August, and no sort or keyword parameter changed the ordering. Its 8,000-row
+#: ceiling against 18,904 postings was therefore hiding jobs of every age,
+#: including current ones - the exact failure this classification exists to
+#: rule out. A collector that cannot establish date ordering must report
+#: :data:`STOP_BUDGET_UNORDERED` instead, which is deliberately absent below.
 #: ``more_results_available`` is here for a different reason: it is not
 #: newest-first, but the gap is *stable* (the same single-GET tier fetches the
 #: same page every run), so the rows it does see are a consistent set and a new

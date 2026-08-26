@@ -22,7 +22,6 @@ Where no total is reported there is nothing to reconcile against, and an
 honest short page still means exhausted.
 """
 
-import pytest
 
 from ats.base import (
     STOP_BUDGET,

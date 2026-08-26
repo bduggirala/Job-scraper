@@ -15,7 +15,6 @@ Fakes are per-collector because each provider's request/response shape differs;
 the assertions are identical on purpose.
 """
 
-import pytest
 
 import ats.cornerstone as cornerstone_module
 import ats.eightfold as eightfold_module
@@ -23,7 +22,13 @@ import ats.jibe as jibe_module
 import ats.phenom as phenom_module
 import ats.smartrecruiters as sr_module
 import ats.ukg as ukg_module
-from ats.base import STOP_BUDGET, STOP_PAGE_FAILED, CollectionResult
+from ats.base import (
+    DESCRIBABLE_STOP_REASONS,
+    STOP_BUDGET,
+    STOP_BUDGET_UNORDERED,
+    STOP_PAGE_FAILED,
+    CollectionResult,
+)
 from ats.cornerstone import CornerstoneCollector
 from ats.eightfold import EightfoldCollector
 from ats.jibe import JibeCollector
@@ -187,9 +192,30 @@ def test_phenom_budget_trip_is_incomplete(monkeypatch):
     monkeypatch.setattr(type(collector), "max_jobs", property(lambda self: 250))
     result = collector.collect()
     assert result.complete is False
-    assert result.stop_reason == STOP_BUDGET
     assert len(result.jobs) == 250
     assert result.shortfall == 3750
+
+
+def test_a_phenom_ceiling_does_not_claim_the_gap_is_the_oldest_jobs(monkeypatch):
+    """Phenom serves by relevance, so its ceiling hides jobs of every age.
+
+    ``budget_exhausted`` means "we stopped early, but the walk was newest-first
+    so the gap is only stale postings" - which is why a run carrying only that
+    reason is still trusted to report what is new. Phenom does not earn that:
+    measured against the live CVS tenant, offset 0 held a 12 June posting and
+    offset 7,990 held one from 24 August, and no sort or keyword parameter
+    changed it. Reporting plain ``budget_exhausted`` here would let a digest
+    treat 10,900 unseen postings as known-stale when some were posted today.
+    """
+    collector = _phenom(monkeypatch, total=4000)
+    monkeypatch.setattr(type(collector), "max_jobs", property(lambda self: 250))
+    result = collector.collect()
+
+    assert result.stop_reason == STOP_BUDGET_UNORDERED
+    assert result.stop_reason != STOP_BUDGET
+    assert result.stop_reason not in DESCRIBABLE_STOP_REASONS, (
+        "an unordered truncation must never count as a describable one"
+    )
 
 
 def test_phenom_failed_page_is_incomplete(monkeypatch):

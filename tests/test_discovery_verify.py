@@ -1,4 +1,3 @@
-import pytest
 
 from ats.base import CollectorUnavailable
 from ats.discovery import NOT_FOUND, Discovery, verify_ats_url

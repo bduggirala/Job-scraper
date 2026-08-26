@@ -184,6 +184,22 @@ playwright:
   # browser_company_timeout_seconds so a slow paginator is recorded as
   # truncated (removal sync skipped, listed in the summary) rather than as a
   # Timeout failure that discards every row it did collect.
+  #
+  # 150, and it must stay there until abandonment is survivable. Raising it to
+  # 300 was tried and reverted, because it made the run dramatically worse:
+  # PwC, CBRE and Slalom each ran past browser_company_timeout_seconds and
+  # were abandoned - and **abandoning a company does not free its worker
+  # thread**. With all three Playwright workers wedged the phase went to zero
+  # throughput, and the fourteen companies still queued behind them died on
+  # the phase budget instead. Measured, one run against the next: Goldman
+  # Sachs 820 jobs -> 0, IBM 1,016 -> 0, Jacobs 720 -> 0, Pyramid 404 -> 0,
+  # Verizon 394 -> 0, Kelly 100 -> 0, Randstad 132 -> 0. Every company the
+  # raise was meant to help finished with nothing, and total failures went
+  # from 3 to 20.
+  #
+  # The lesson is that a longer budget is not a safe way to buy coverage while
+  # a timed-out company keeps its worker. Fix that first (see the run report's
+  # remaining risks), then this can rise.
   pagination_budget_seconds: 150
   wait_after_load_ms: 2500  # settle time for client-side rendering
 
@@ -327,11 +343,21 @@ concurrency:
   # teardown under full 3-worker concurrency wasn't observed finishing until
   # ~5.5 minutes in, so the already-successful result was still discarded as
   # a Timeout - isolated re-runs of Slalom alone complete in under 30s.
-  browser_company_timeout_seconds: 480  # 8 min
+  # Must stay comfortably above pagination_budget_seconds (150) plus
+  # hop_budget_seconds (100) plus nav retries and context teardown, or a
+  # company that paginates for its full budget is killed as a Timeout - which
+  # discards every row it collected, the opposite of what the budget is for.
+  #
+  # 600 rather than the 480 this ran at for a long time: since an abandoned
+  # company keeps its worker, abandonment costs the whole phase and buys
+  # almost nothing, so the bias should be toward letting a company finish.
+  # 600 - 150 - 100 leaves ~350s for navigation, search and teardown, and
+  # teardown under full 3-worker concurrency has been observed taking minutes.
+  browser_company_timeout_seconds: 600  # 10 min
 
   # Phase-wide backstops.
   api_phase_timeout_seconds: 1800      # 30 min
-  browser_phase_timeout_seconds: 2400  # 40 min
+  browser_phase_timeout_seconds: 3000  # 50 min (was 2400; headroom for a slow round)
 
 # --- Storage / output ------------------------------------------------------
 database_path: data/jobs.db

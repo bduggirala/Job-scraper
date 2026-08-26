@@ -48,6 +48,10 @@ log = get_logger("pipeline")
 
 OUTPUT_FIELDS = list(RECORD_FIELDS) + [
     "date_filter_status",
+    # Which date the freshness verdict rests on: the employer's posting date,
+    # our own first sighting, or nothing at all. "within_window" conflated the
+    # first two, and they are different claims.
+    "date_source",
     "location_match_type",
     "remote_scope",
     "source_query",
@@ -656,7 +660,6 @@ def _run_pool(
         pending -= overdue
         timed_out |= overdue
 
-    done = set(futures) - pending - timed_out
     not_done = pending
 
     if not_done:

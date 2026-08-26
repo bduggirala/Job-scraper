@@ -11,7 +11,6 @@ the collector says it is incomplete, the router carries that flag, and the
 pipeline refuses to sync on it.
 """
 
-import pytest
 
 import ats.router as router
 from ats.base import STOP_PAGE_FAILED, ATSCollector, CollectionResult

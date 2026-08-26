@@ -9,9 +9,7 @@ Three rules matter more than the formatting:
 * credentials come from the environment, never from settings.yaml.
 """
 
-import os
 
-import pytest
 
 from notify import (
     EmailConfig,

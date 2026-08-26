@@ -12,7 +12,6 @@ without bound.
 
 import time
 
-import pytest
 
 import http_client
 from http_client import HostRateLimiter

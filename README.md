@@ -197,7 +197,7 @@ its spreadsheet is a slice rather than a replacement.
 | Lever | `api.lever.co/v0/postings` | Documented public API |
 | Ashby | `api.ashbyhq.com/posting-api` | Documented public API |
 | SmartRecruiters | `api.smartrecruiters.com` | Documented public API |
-| Paylocity | `recruiting.paylocity.com` | Tenant + board GUID from the URL |
+| Paylocity | `recruiting.paylocity.com` | Tenant + board GUID from the URL. JSON API first, then the `window.pageData` blob the page ships the whole board in |
 | Eightfold | `/api/apply/v2/jobs` | Uses `?domain=` when present |
 | UKG Pro | `JobBoardView/LoadSearchResults` | `ultipro.com` and `*.ukg.net` hosts |
 | Phenom | `phApp.ddo` on `/search-results` | Page-embedded JSON, not the dead `/widgets` endpoint |
@@ -218,7 +218,20 @@ over a single HTTP GET each before the browser fallback, in ascending cost:
 1. `ats/jsonld.py` — `schema.org/JobPosting` structured data;
 2. `ats/static_html.py` — a server-rendered job list;
 3. `ats/framework_data.py` — a `__NEXT_DATA__` / `__NUXT__` / `__INITIAL_STATE__`
-   hydration payload (the generic form of the trick `ats/phenom.py` uses).
+   hydration payload, **or any other `window.<name> = {…}` assignment on the
+   page** (the generic form of the trick `ats/phenom.py` uses).
+
+Tier 3 used to know exactly four `window.*` names, which covers sites built on
+a framework convention and nothing else — and "nothing else" is a large share
+of enterprise careers sites, which name their payload whatever they like. The
+name is no longer the test: any plausible `window.<identifier> = {…}` is a
+candidate, and the safety sits in what happens next — the blob must parse as
+JSON, and only objects carrying **both** a title-ish and a URL-ish key become
+rows, so analytics `dataLayer` blobs, breadcrumbs and product lists yield
+nothing. Bounded at `_MAX_CANDIDATES` (25) parses per page with a
+`_MIN_BLOB_CHARS` (200) floor on the speculative ones, so a page carrying a
+hundred small config assignments cannot make the tier quadratic. Named
+framework payloads are still parsed first, and at any size.
 
 Every company one of these answers is a company that never pays for a Chromium
 instance. All three are judged against the same `hop_good_enough_rows` floor,
@@ -245,7 +258,7 @@ exactly the case where a cheap tier helps most.
 ```
 company, title, location, date_posted, job_url, apply_url, employment_type,
 remote, description, ats_provider, scraping_method, date_filter_status,
-location_match_type, remote_scope, source_query, fit_score, fit_matched,
+date_source, location_match_type, remote_scope, source_query, fit_score, fit_matched,
 fit_explanation, first_seen, is_new, change_status, run_id
 ```
 
@@ -279,6 +292,17 @@ formula.
 `date_unavailable`. Jobs with no reliable posting date are **kept and flagged**,
 never silently discarded — browser-scraped pages rarely expose a trustworthy
 date, and inventing one would corrupt the freshness filter.
+
+`date_source` says which date that verdict rests on — `posted` (the employer's
+own), `first_seen` (ours, standing in), or `none`. The status alone conflated
+the first two, and they are different claims: "the employer posted this three
+days ago" and "we first saw this three days ago" are the same label but not the
+same fact, because a role listed for six months by a company we only started
+scraping last week is *first seen* recently. On the run that prompted this, 13
+of 31 exported rows rested on `first_seen` and were labelled identically to the
+ones backed by a real posting date. The rows are still kept — the freshness
+policy is deliberately inclusive — but a reader deciding whether to apply can
+now see which kind of row they have.
 
 `output/scraper_failures.csv` — one row per failed company with `error_type`,
 `error_message` and `timestamp`.
@@ -478,12 +502,28 @@ name a `stop_reason`:
 | `reported_total_reached` | yes | Collected count met the reported total |
 | `no_new_rows` / `repeated_page` | depends | The walk ended on a repeat; complete unless a reported total says otherwise |
 | `page_failed` | no | A page beyond the first failed — hole of unknown shape |
-| `budget_exhausted` | no | `max_jobs_per_company` tripped while rows remained |
+| `budget_exhausted` | no | `max_jobs_per_company` tripped while rows remained, on a walk that runs newest-first |
+| `budget_exhausted_unordered` | no | The same ceiling against a provider that serves by **relevance**, so the gap is of no particular age |
 | `page_ceiling` | no | `pagination.MAX_PAGES` (500) tripped first |
 | `short_of_reported_total` | no | The walk ended naturally, but the provider's own total says there was more |
 | `more_results_available` | no | A single-GET tier read page one of a list the page itself advertises as longer |
 
-Two of these are recent and both were silent completeness lies:
+Three of these are recent and all three were silent completeness lies:
+
+- **`budget_exhausted_unordered`.** `budget_exhausted` is treated as a
+  *describable* truncation — a run carrying only describable truncations is
+  still trusted to say what is new — and the entire justification for that is
+  that the walk runs newest-first, so what was missed is only stale postings.
+  Phenom was assumed to qualify on the strength of the `s=1` sort parameter its
+  search URL carries. It does not: measured directly against the live CVS
+  Health tenant, offset 0 returned a posting from 12 June while offset 7,990
+  returned one from 24 August, and none of `s=2`, `s=3`, `sortBy`, `keywords`
+  or `q` changed the ordering or the total — that endpoint ignores them all. So
+  CVS Health and Signify Health were stopping at 8,000 of 18,904 postings with
+  the missing 10,900 being an arbitrary slice **by date**, while the digest
+  logic treated them as known-stale. Any collector that cannot establish date
+  ordering must report this reason instead, and it is deliberately absent from
+  `DESCRIBABLE_STOP_REASONS`.
 
 - **`page_ceiling`.** `MAX_PAGES` bounds the loop independently of the job
   budget, but the reason was derived from the budget alone, so running out of
@@ -503,10 +543,12 @@ requesting offset `total - 5` returned exactly 5 rows on Capital One (1,842),
 Travelers (346) and Texas Capital Bank (81), so the reported total is accurate
 and a large shortfall is evidence of a stall rather than benign over-reporting.
 
-**The single-GET tiers carry it too.** JSON-LD, static HTML and the framework
-payload each fetch one URL and cannot follow a pagination control, so whether
-what they hold is the whole list is a question about the *page*, not about the
-harvest — and `ats.html_utils.detect_more_results()` asks it. Four signals count
+**The single-GET tiers carry it too.** JSON-LD, static HTML, the framework
+payload — and `ats/jobvite.py`, which is a provider collector but reads exactly
+one URL like they do — each fetch one page and cannot follow a pagination
+control, so whether what they hold is the whole list is a question about the
+*page*, not about the harvest, and `ats.html_utils.detect_more_results()` asks
+it. Four signals count
 as evidence of more:
 
 | Signal | Example seen live |
@@ -665,6 +707,18 @@ match, so collectors that can be truncated ask for newest-first where the
 provider supports it (UKG `postedDateDesc`, Oracle `POSTING_DATES_DESC`,
 Amazon `sort=recent`).
 
+**Where the provider does not support it, say so rather than assume it.**
+Phenom's search URL carries `s=1`, which was read as a date sort for a long
+time and is not one — see `budget_exhausted_unordered` above. A collector whose
+ordering cannot be established reports that reason instead, which keeps its
+companies out of the set the digest treats as fully understood. The practical
+consequence today is CVS Health and Signify Health: 8,000 of 18,904 postings,
+a gap that cannot be walked (≈1,890 sequential requests, ~1,020s at the rate
+those two actually achieve against one rate-limited host, against a 900s
+per-company budget) and cannot be narrowed (that endpoint ignores every
+keyword and sort parameter tried). They are reported honestly as truncated
+rather than quietly as complete.
+
 **Workday CXS ignores a sort parameter** — verified directly: requesting
 `sortBy=POSTING_DATES_DESC` returns a byte-identical first page to sending
 nothing, so the collector does not send one rather than carry a dead parameter
@@ -735,10 +789,40 @@ A count alone had to stay low (it was 10), because the only other bound was
 `browser_company_timeout_seconds`, and **overshooting that is recorded as a
 Timeout failure, which discards every row already collected** — strictly worse
 than truncation. The wall-clock bound decouples the two: the count can be
-generous, and a genuinely slow paginator gives up at 150s and is reported as
-truncated instead of failing. Measured against a full run at 10 clicks, IBM
-stopped at 280 jobs, CBRE at 420 and Goldman Sachs at 220, each with
-`[budget_exhausted]` and more still available.
+generous, and a genuinely slow paginator gives up at the budget and is
+reported as truncated instead of failing. Measured against a full run at 10
+clicks, IBM stopped at 280 jobs, CBRE at 420 and Goldman Sachs at 220, each
+with `[budget_exhausted]` and more still available.
+
+**Raising this budget is not a safe way to buy coverage — measured.** At 150s
+six large employers were still stopping with more advertised (Goldman Sachs
+820 jobs, IBM 1,016, Jacobs 720, Pyramid 404, Verizon 394, DXC 386), so the
+budget was raised to 300s with `browser_company_timeout_seconds` moved 480 →
+660 to match. The result was strictly worse. PwC, CBRE and Slalom each ran past
+the per-company limit and were abandoned — and **an abandoned company does not
+give its worker thread back**. With all three Playwright workers wedged the
+phase dropped to zero throughput and the fourteen companies queued behind them
+died on the phase budget instead. One run to the next: Goldman Sachs 820 → 0,
+IBM 1,016 → 0, Jacobs 720 → 0, Pyramid 404 → 0, Verizon 394 → 0, Kelly 100 → 0,
+Randstad 132 → 0; total failures 3 → 20. Every company the raise was meant to
+help finished with nothing.
+
+So the budget is back at 150s, and the ordering is: make an abandoned company
+release its worker *first*, then this can rise. `browser_company_timeout_seconds`
+is 600 rather than the original 480 for the same reason — since abandonment
+costs the whole phase and buys almost nothing, the bias should be toward
+letting a company finish.
+
+**Scrolling: page height is not the test.** The lazy-load path used to compare
+`document.body.scrollHeight` before and after a scroll and call the walk
+complete when it did not grow. A *virtualized* list — react-window, ag-grid,
+and the enterprise careers grids built on them — keeps its scroll height fixed
+by design, recycling a small pool of DOM rows across thousands of records, so
+height never grows on exactly the sites where scrolling matters most. The walk
+stopped after one screen and reported a **complete** harvest, which lets
+removal sync delete every posting it never reached. A height-neutral scroll is
+now inconclusive rather than final: the row-level barren counter, which tracks
+whether jobs are still arriving, decides instead.
 
 ### Two User-Agents, deliberately
 
@@ -747,6 +831,42 @@ AWS WAF's bot captcha on several iCIMS tenants. `playwright.user_agent` is a
 full Chrome string because Cloudflare rejects the bare one outright in a real
 browser context. Neither value works for both paths — changing either to match
 the other silently costs coverage.
+
+---
+
+## Logging
+
+**One file, describing the current run only:** `logs/scraper.log`
+(`logging.file` in `config/settings.yaml`).
+
+Each run opens it with `mode="w"`, so starting a run replaces the previous
+run's log rather than appending to it. There are no timestamped per-run logs
+and no rotated `.1`/`.2`/`.3` siblings — nothing accumulates, and "the log" is
+never ambiguous.
+
+That replaced a `RotatingFileHandler` appending behind three 5 MB backups,
+which was wrong in two ways. Diagnosing a run meant first locating where it
+began inside a file holding several; and on a long run the rotation could
+discard that run's *own beginning* to make room for its end — the part you most
+want when a company failed early.
+
+| Property | Behaviour |
+|----------|-----------|
+| Location | `logs/scraper.log`; the directory is created if absent |
+| Lifetime | The latest run only — truncated at the start of the next one |
+| File level | Always `DEBUG`, regardless of console verbosity |
+| Console level | `logging.level` (default `INFO`); `--quiet` silences the console without affecting the file |
+| Concurrency | Workers are threads sharing one handler, so writes are serialised by `logging`'s own lock — no interleaved or torn lines |
+| Crash safety | Written incrementally, so an interrupted or failed run still leaves its log behind |
+| Tests | `tests/conftest.py` redirects `setup_logging` into `tmp_path` for every test — a stray call would otherwise *truncate* the log of the run being diagnosed |
+
+`setup_logging(..., fresh=False)` appends instead, for tools that are not runs
+of their own: `tools/canary.py` writes `logs/canary.log`, `find_ats_urls.py`
+writes `logs/discovery.log`, `probe_site.py` writes `logs/probe.log`. Each is
+its own single current file under the same policy.
+
+Run *statistics* are a separate concern and unaffected: `output/last_run.json`
+still carries the full per-company record (see [Output](#output)).
 
 ---
 
@@ -818,7 +938,7 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | `paylocity.py` `ukg.py` `taleo.py` `icims.py` `phenom.py` | |
 | `successfactors.py` `avature.py` `eightfold.py` `radancy.py` | |
 | `amazon.py` `jobvite.py` `cornerstone.py` `jibe.py` | added in the coverage-expansion branch |
-| `jsonld.py` | **generic** schema.org JobPosting tier — provider-agnostic fallback |
+| `jsonld.py` `static_html.py` `framework_data.py` | **generic** tiers — provider-agnostic, one GET each, tried before the browser |
 
 To add a provider: register its host/fingerprint in `detector.py`, write
 `ats/<provider>.py` subclassing `ATSCollector`, add it to `COLLECTORS` in
@@ -849,13 +969,14 @@ returns real jobs through it.
 
 | Path | Responsibility |
 |------|----------------|
-| `config/settings.yaml` | All tunables (freshness, roles, DFW cities, HTTP, Playwright, concurrency) |
+| `config/settings.yaml` | All tunables (freshness, roles, DFW cities, HTTP, Playwright, concurrency, logging) |
 | `config/companies.xlsx` | Input workbook (Company / ATS URL / Live Jobs Page) — 180 companies, all names unique |
 | `.env.example` | Tracked template for the email variables; carries no values. Copy to `.env` (gitignored) |
 | `tools/canary.py` | ~2-min smoke test: one company per collection path (run before a full run) |
 | `tools/find_ats_urls.py` | Crawl + verify missing ATS URLs, write suggestions into the workbook |
 | `tools/probe_site.py` | Diagnostic: dump what a single page actually contains |
-| `tests/` | Offline pytest suite (network mocked) |
+| `tests/` | Offline pytest suite (network mocked), 887 tests |
+| `tests/conftest.py` | Suite-wide isolation: clears the `.env` variables, and redirects `setup_logging` into `tmp_path` so no test can truncate `logs/scraper.log` |
 | `docs/superpowers/` | Design specs + implementation plans — see `docs/superpowers/README.md` for the index |
 
 ## Before trusting a full run
@@ -870,7 +991,13 @@ whole provider (or the browser path) breaks silently:
 python tools/canary.py
 ```
 
-Unit tests: `python -m pytest tests/ -q` (~4 minutes).
+Unit tests: `python -m pytest tests/ -q` (887 tests, ~8.5 minutes).
+
+Lint: `python -m ruff check --select F,E9 --exclude venv .` — `F` catches
+unused imports and dead locals, `E9` catches syntax/IO errors. Kept to those
+two families deliberately: this codebase carries long explanatory comments and
+deliberately wide lines, and a full default rule set would report hundreds of
+style opinions that say nothing about whether jobs are being missed.
 
 After a run, `output/last_run.json` is the fastest way to see what happened:
 the `status_counts` block, and `removal_sync_allowed` per company. Re-run just

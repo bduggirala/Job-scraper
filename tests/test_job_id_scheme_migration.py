@@ -12,7 +12,6 @@ history the table holds, and it is already unrecoverable once the ids change.
 
 import sqlite3
 
-import pytest
 
 from database import JobDatabase
 from job_identity import JOB_ID_SCHEME_VERSION

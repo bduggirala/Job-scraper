@@ -11,7 +11,6 @@ be skipped by the removal sync, because "we saw nothing" is never evidence
 that every posting closed.
 """
 
-import pytest
 
 import ats.router as router
 import pipeline

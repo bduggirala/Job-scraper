@@ -17,10 +17,11 @@ bypasses the default entirely.
 
 from __future__ import annotations
 
-import os
+import logging
 
 import pytest
 
+import logger as logger_module
 import settings as settings_module
 
 #: Every variable ``.env.example`` documents. Cleared before each test so a
@@ -51,3 +52,31 @@ def isolate_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(settings_module, "DEFAULT_ENV_PATH", tmp_path / "absent.env")
     monkeypatch.setattr(settings_module, "_env_loaded", False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def never_touch_the_production_log(monkeypatch, tmp_path):
+    """A test run must not write - or truncate - ``logs/scraper.log``.
+
+    Since each run now opens the log with ``mode="w"``, a stray
+    ``setup_logging()`` from a test would not merely add noise: it would
+    *erase* the log of the run someone is currently diagnosing. So the path is
+    redirected into ``tmp_path`` for every test, and the module's once-only
+    flag is reset so the redirect actually takes effect.
+    """
+    real_setup = logger_module.setup_logging
+
+    def redirected(log_file, level="INFO", quiet=True, **kwargs):
+        return real_setup(tmp_path / "test-scraper.log", level, quiet=True, **kwargs)
+
+    monkeypatch.setattr(logger_module, "_CONFIGURED", False)
+    monkeypatch.setattr(logger_module, "setup_logging", redirected)
+    yield
+    # Release the temp file so Windows can delete tmp_path, and leave the
+    # module ready for the next test to configure from scratch.
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.FileHandler):
+            handler.close()
+            root.removeHandler(handler)
+    logger_module._CONFIGURED = False

@@ -11,7 +11,6 @@ answers HTTP 422 with HTTP 500 on the page itself, while both companies have
 (or in McAfee's case, list) a working careers page.
 """
 
-import pytest
 
 import ats.router as router
 from ats.base import CollectorUnavailable

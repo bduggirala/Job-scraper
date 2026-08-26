@@ -7,7 +7,7 @@ monkeypatching the fetch.
 
 import pytest
 
-from ats.base import CollectorUnavailable
+from ats.base import STOP_EXHAUSTED, STOP_MORE_AVAILABLE, CollectorUnavailable
 from ats.jobvite import JOBVITE, JobviteCollector
 
 # Two real FirstCash rows plus a duplicate of the first (same href) to prove
@@ -87,7 +87,7 @@ def test_parse_rows_ignores_non_job_anchors():
 def test_collect_dedupes_repeated_job_urls(monkeypatch):
     # The fixture repeats job oLjEufwW in a second category table.
     monkeypatch.setattr(JobviteCollector, "_fetch", lambda self, url: LANDING_HTML)
-    jobs = _collector().collect()
+    jobs = _collector().collect().jobs
     urls = [j["job_url"] for j in jobs]
     assert len(urls) == len(set(urls))
     assert len(jobs) == 2   # 3 rows, one is a duplicate
@@ -115,3 +115,48 @@ def test_slug_falls_back_to_url_path():
         "host": "jobs.jobvite.com",
     })
     assert c._slug() == "tyler-technologies"
+
+
+# --- completeness ----------------------------------------------------------
+#
+# Jobvite reads exactly one URL and cannot follow a pagination control, so
+# whether it holds the whole board is a question about the *page*, not about
+# the harvest. It used to return a bare list, which the router takes at face
+# value as complete - the same completeness lie that let removal sync delete
+# everything past page one on the JSON-LD, static-HTML and framework tiers
+# before those learned to ask.
+
+def _collect(monkeypatch, html):
+    monkeypatch.setattr(JobviteCollector, "_fetch", lambda self, url: html)
+    return _collector().collect()
+
+
+def test_a_plain_board_is_reported_complete(monkeypatch):
+    result = _collect(monkeypatch, LANDING_HTML)
+    assert result.complete is True
+    assert result.stop_reason == STOP_EXHAUSTED
+
+
+def test_an_all_jobs_footer_link_alone_does_not_mean_incomplete(monkeypatch):
+    """The real fixture carries one, and it is ordinary navigation."""
+    assert "All Jobs" in LANDING_HTML
+    assert _collect(monkeypatch, LANDING_HTML).complete is True
+
+
+def test_a_paginated_board_is_reported_incomplete(monkeypatch):
+    extra = '<div class="pagination"><a href="?p=2">2</a></div>'
+    html = LANDING_HTML.replace("</body>", extra + "</body>")
+    result = _collect(monkeypatch, html)
+
+    assert result.complete is False
+    assert result.stop_reason == STOP_MORE_AVAILABLE
+    assert result.jobs, "the rows it did read are still kept, not discarded"
+
+
+def test_a_stated_total_above_what_was_served_is_reported_incomplete(monkeypatch):
+    extra = "<p>Showing 1-2 of 418 jobs</p>"
+    result = _collect(monkeypatch, LANDING_HTML.replace("</body>", extra + "</body>"))
+
+    assert result.complete is False
+    assert result.reported_total == 418
+    assert len(result.jobs) == 2

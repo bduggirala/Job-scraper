@@ -20,7 +20,6 @@ jobs:
 
 from __future__ import annotations
 
-import pytest
 
 from ats import router
 from ats.base import STOP_MORE_AVAILABLE, CollectionResult

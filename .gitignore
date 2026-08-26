@@ -43,8 +43,21 @@ Thumbs.db
 # Excel lock files (created while a workbook is open)
 ~$*.xlsx
 
-# Ad-hoc full-run logs
-run_output*.log
-run_full*.log
-run_final*.log
-retry_run*.log
+# Logs. Every log this project writes belongs under logs/ (ignored above) and
+# holds the latest run only - see the Logging section of README.md. This
+# catch-all is for ad-hoc redirects at the repo root, which is how a dozen
+# run_output*.log / run_full*.log files accumulated before the policy existed.
+*.log
+
+# Local scratch: databases and workbooks copied aside before a risky change.
+*.bak
+*.bak-*
+*.sqlite
+*.sqlite3
+
+# Editor / tooling caches that appear only on some machines
+.ruff_cache/
+.cache/
+*.tmp
+*.orig
+*.rej

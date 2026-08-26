@@ -5,7 +5,6 @@ monkeypatched. The fixtures are trimmed copies of the real
 ``jpshealthnet.csod.com`` responses (context token page + search envelope).
 """
 
-import json
 
 import pytest
 

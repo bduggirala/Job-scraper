@@ -17,7 +17,6 @@ inside a 7-day freshness window is behind it. A failed page is a hole of
 unknown shape.
 """
 
-import pytest
 
 from ats.base import (
     STOP_BUDGET,

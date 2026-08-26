@@ -34,8 +34,14 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
-from ats.html_utils import make_soup
+from ats.base import (
+    STOP_EXHAUSTED,
+    STOP_MORE_AVAILABLE,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
+from ats.html_utils import detect_more_results, make_soup
 from normalize import clean_text
 
 try:  # Wired into ats/detector.py alongside the other providers.
@@ -113,7 +119,7 @@ class JobviteCollector(ATSCollector):
             return None
         return clean_text(cell.get_text(" ", strip=True))
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         careers_url = self._careers_url()
         try:
             html_text = self._fetch(careers_url)
@@ -127,4 +133,24 @@ class JobviteCollector(ATSCollector):
             raise CollectorUnavailable(
                 f"Jobvite careers page returned zero jobs for {self._slug()!r}"
             )
-        return self.finalize(records)
+
+        jobs = self.finalize(records)
+
+        # This collector reads exactly one URL and cannot follow a pagination
+        # control, so whether it holds the whole board is a question about the
+        # *page*, not about the harvest - the same question the JSON-LD, static
+        # HTML and framework tiers ask. Returning a bare list here meant
+        # `complete=True` by default, which is the completeness lie that let
+        # removal sync delete every posting past page one.
+        total, evidence = detect_more_results(html_text, len(jobs), careers_url)
+        if evidence:
+            self.log.warning(
+                "%s: Jobvite page advertises more than the %s row(s) it served "
+                "(%s); reporting the harvest as incomplete",
+                self.company, len(jobs), evidence,
+            )
+            return CollectionResult(
+                jobs=jobs, complete=False, pages_fetched=1,
+                reported_total=total, stop_reason=STOP_MORE_AVAILABLE,
+            )
+        return CollectionResult(jobs=jobs, pages_fetched=1, stop_reason=STOP_EXHAUSTED)

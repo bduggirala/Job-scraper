@@ -12,11 +12,9 @@ collector raised CollectorUnavailable skipped this cheap tier entirely and paid
 for a browser - the case where it is most valuable.
 """
 
-import pytest
 
 import ats.router as router
 from ats.base import CollectorUnavailable
-from browser.playwright_scraper import PlaywrightResult
 
 
 def _plan(provider=router.UNKNOWN):

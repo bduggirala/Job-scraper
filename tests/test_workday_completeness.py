@@ -13,7 +13,6 @@ Two behaviours are pinned here:
   kept are the ones the freshness window can still match.
 """
 
-import pytest
 
 import ats.workday as workday_module
 from ats.base import (
