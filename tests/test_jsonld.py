@@ -140,7 +140,7 @@ def _patch_get_text(monkeypatch, html):
 
 def test_single_jobposting_object(monkeypatch):
     _patch_get_text(monkeypatch, SINGLE)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 1
     row = rows[0]
     assert row["title"] == "Staff Software Engineer"
@@ -155,7 +155,7 @@ def test_single_jobposting_object(monkeypatch):
 
 def test_list_of_jobpostings(monkeypatch):
     _patch_get_text(monkeypatch, LIST)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 2
     titles = {r["title"] for r in rows}
     assert titles == {"Backend Engineer", "Frontend Engineer"}
@@ -172,7 +172,7 @@ def test_list_of_jobpostings(monkeypatch):
 
 def test_graph_wrapper_extracts_only_jobposting(monkeypatch):
     _patch_get_text(monkeypatch, GRAPH)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 1
     row = rows[0]
     assert row["title"] == "Data Scientist"
@@ -192,7 +192,7 @@ def test_title_falls_back_to_name(monkeypatch):
     # A JobPosting whose title lives under ``name`` must still be collected,
     # not silently dropped for lacking a ``title`` key.
     _patch_get_text(monkeypatch, NAME_ONLY)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 1
     assert rows[0]["title"] == "Lead Data Engineer"
     assert rows[0]["location"] == "Dallas, TX"
@@ -200,7 +200,7 @@ def test_title_falls_back_to_name(monkeypatch):
 
 def test_malformed_block_skipped_valid_extracted(monkeypatch):
     _patch_get_text(monkeypatch, MALFORMED_PLUS_VALID)
-    rows = _collector().collect()
+    rows = _collector().collect().jobs
     assert len(rows) == 1
     row = rows[0]
     assert row["title"] == "Product Manager"

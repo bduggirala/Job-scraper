@@ -263,3 +263,149 @@ def jsonld_location(node: dict[str, Any]) -> str | None:
     ]
     joined = ", ".join(clean_text(p) for p in parts if clean_text(p))
     return joined or None
+
+
+# --- "is there more than this page?" ---------------------------------------
+
+#: A results count the page states about itself: "1,234 jobs", "234 results",
+#: "Showing 1-10 of 1,234". Captured so a single-GET tier can compare what it
+#: extracted against what the page says exists.
+_RESULT_TOTAL_RES = (
+    # "Showing 1 - 10 of 1,234" / "1-10 of 1234 results"
+    re.compile(r"\b\d[\d,]*\s*[-–]\s*\d[\d,]*\s+of\s+(\d[\d,]*)", re.I),
+    # "1,234 jobs found" / "1234 open positions" / "234 results"
+    re.compile(r"\b(\d[\d,]*)\s+(?:open\s+)?(?:jobs?|positions?|openings?|results?|vacancies)\b", re.I),
+    # "of 1,234 jobs"
+    re.compile(r"\bof\s+(\d[\d,]*)\s+(?:jobs?|positions?|openings?|results?)\b", re.I),
+)
+
+#: Query parameters whose presence on a link means "another page of the same
+#: list". Kept narrow: these are the paging cursors, not filters.
+_PAGE_PARAM_RE = re.compile(
+    r"[?&](?:page|pg|p|start|from|offset|skip|pageno|page_number|pageNumber|"
+    r"currentPage|resultsPage)=\d+", re.I
+)
+
+#: Anchor/button text that offers more of the same list.
+_MORE_TEXT_RE = re.compile(
+    r"^\s*(next|next\s+page|load\s+more|show\s+more|view\s+more|more\s+jobs?|"
+    r"see\s+more|›|»|>|>>)\s*$", re.I
+)
+
+#: Class/id fragments that mark a pagination widget.
+_PAGER_ATTR_RE = re.compile(r"\b(pagination|pager|paging|load-?more|show-?more)\b", re.I)
+
+#: Anchor text advertising a fuller list elsewhere. A careers landing page that
+#: shows its ten newest openings beside a "View all jobs" link is telling us
+#: plainly that what we just extracted is a teaser. UT Southwestern's page
+#: offers exactly this ("View all New Jobs" -> /latest-jobs) with no pagination
+#: markup of any kind, which is why the widget signals above miss it.
+_VIEW_ALL_RE = re.compile(
+    r"^\s*(view|see|browse|search|explore)\s+(all\s+)?"
+    r"(our\s+|current\s+|new\s+|open\s+|available\s+)*"
+    r"(jobs?|openings?|positions?|opportunities|vacancies|careers)\b", re.I
+)
+
+#: Above this many rows, a "view all jobs" link stops being evidence.
+#:
+#: Unlike a stated total, ``rel="next"`` or a pagination widget, such a link is
+#: weak evidence: plenty of real job lists carry one as ordinary navigation.
+#: It means something only when what we hold is small enough to *be* a teaser.
+#: Measured against the live pages this rule was written for - UT Southwestern
+#: (10 rows) and Energy Transfer (22) are teasers beside such a link and must be
+#: caught; Aveanna Healthcare's list is 3,708 rows beside a "View All Jobs Near
+#: Me" link and must not be, or a complete harvest would be thrown away and the
+#: company sent to a browser that returns far less.
+_TEASER_CEILING = 30
+
+
+def _stated_total(text: str) -> int | None:
+    """The largest results count the page states about itself, if any.
+
+    The largest is taken rather than the first because a page often names
+    several numbers ("10 of 1,234", "5 saved jobs"); the list's own size is
+    the one that matters, and a smaller incidental number can never make a
+    harvest look short when it is not.
+    """
+    best: int | None = None
+    for pattern in _RESULT_TOTAL_RES:
+        for match in pattern.finditer(text):
+            try:
+                value = int(match.group(1).replace(",", ""))
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                continue
+            # Six figures of "jobs" is a marketing claim ("2,000,000 jobs
+            # posted"), not this list's length.
+            if value > 100_000:
+                continue
+            if best is None or value > best:
+                best = value
+    return best
+
+
+def detect_more_results(
+    html_text: str, rows_found: int, base_url: str = "",
+) -> tuple[int | None, str | None]:
+    """Decide whether a single-GET harvest saw the whole list.
+
+    The cheap tiers (JSON-LD, static HTML, framework payload) each fetch one
+    URL and cannot follow pagination. Reporting what they found as the complete
+    job list is the one error removal sync cannot survive: a careers landing
+    page that shows its ten most recent openings then looks like a ten-job
+    employer, and every other posting is aged out of the database. Measured
+    live - UT Southwestern Medical Center and Energy Transfer were both reduced
+    to exactly ten stored jobs this way.
+
+    Args:
+        html_text: the page as fetched.
+        rows_found: how many job rows the tier extracted from it.
+        base_url: unused today; accepted so callers need not care.
+
+    Returns:
+        ``(reported_total, reason)``. ``reason`` is None when the page offers
+        no evidence of further results - the harvest may then be treated as
+        complete. Otherwise it names the signal, and ``reported_total`` carries
+        the page's own count when it stated one.
+    """
+    if not html_text:
+        return None, None
+
+    soup = make_soup(html_text)
+    text = soup.get_text(" ", strip=True)
+
+    total = _stated_total(text)
+    if total is not None and total > max(rows_found, 0):
+        return total, f"page reports {total} results, extracted {rows_found}"
+
+    # rel="next" is the unambiguous, standardised signal.
+    for link in soup.find_all(["link", "a"], rel=True):
+        rel = link.get("rel") or []
+        rel_values = {str(v).lower() for v in (rel if isinstance(rel, list) else [rel])}
+        if "next" in rel_values:
+            return total, 'page carries a rel="next" link'
+
+    # A pagination widget, by class or id.
+    for node in soup.find_all(attrs={"class": _PAGER_ATTR_RE}):
+        return total, f"page carries a {node.name} pagination widget"
+    for node in soup.find_all(attrs={"id": _PAGER_ATTR_RE}):
+        return total, f"page carries a {node.name} pagination widget"
+
+    # A link or button offering the next page.
+    for node in soup.find_all(["a", "button"]):
+        label = visible_text(node) or str(node.get("aria-label") or "")
+        if _MORE_TEXT_RE.match(label or ""):
+            return total, f"page offers {label.strip()!r}"
+        href = node.get("href") or ""
+        if href and _PAGE_PARAM_RE.search(str(href)):
+            return total, "page links to a further page of results"
+
+    # Weakest signal, and the only one that is size-conditional: a link
+    # advertising the full list means this page is a teaser - but only while
+    # what we extracted is small enough to be one. See _TEASER_CEILING.
+    if rows_found <= _TEASER_CEILING:
+        for node in soup.find_all("a", href=True):
+            label = visible_text(node) or ""
+            if _VIEW_ALL_RE.match(label):
+                return total, f"page links out to {label.strip()!r}"
+
+    return total, None

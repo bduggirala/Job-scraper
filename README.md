@@ -326,6 +326,14 @@ it in.
 | `SCRAPER_SMTP_USE_TLS` | `true` | STARTTLS on a non-SSL port |
 | `SCRAPER_SMTP_DRY_RUN` | `false` | Render the digest to disk instead of sending |
 
+`.env` is read automatically at startup (`settings.load_env_file`, called from
+`load_settings`), so the values `.env.example` documents take effect just by
+being in the file — no exporting by hand. Anything already set in the real
+environment wins over it, so a scheduled job that sets a variable still
+overrides `.env`. The tracked config carries a **placeholder** recipient and
+the real one lives in `.env` as `SCRAPER_EMAIL_TO`; before the loader existed
+that file was never read, so the digest was addressed to the placeholder.
+
 The configured recipient is `you@example.com` (`config/settings.yaml`
 and `.env.example`).
 
@@ -457,6 +465,7 @@ name a `stop_reason`:
 | `budget_exhausted` | no | `max_jobs_per_company` tripped while rows remained |
 | `page_ceiling` | no | `pagination.MAX_PAGES` (500) tripped first |
 | `short_of_reported_total` | no | The walk ended naturally, but the provider's own total says there was more |
+| `more_results_available` | no | A single-GET tier read page one of a list the page itself advertises as longer |
 
 Two of these are recent and both were silent completeness lies:
 
@@ -478,7 +487,51 @@ requesting offset `total - 5` returned exactly 5 rows on Capital One (1,842),
 Travelers (346) and Texas Capital Bank (81), so the reported total is accurate
 and a large shortfall is evidence of a stall rather than benign over-reporting.
 
-**The browser path carries the same contract.** `playwright.max_pages` (10)
+**The single-GET tiers carry it too.** JSON-LD, static HTML and the framework
+payload each fetch one URL and cannot follow a pagination control, so whether
+what they hold is the whole list is a question about the *page*, not about the
+harvest — and `ats.html_utils.detect_more_results()` asks it. Four signals count
+as evidence of more:
+
+| Signal | Example seen live |
+|--------|-------------------|
+| A stated results count above what we extracted | Randstad USA: "5,358 jobs" beside 132 readable rows |
+| `rel="next"` | the standardised case |
+| A pagination widget (class/id `pagination`, `pager`, `load-more`, …) | Apex Systems |
+| A link advertising the fuller list ("View all jobs") | UT Southwestern, Energy Transfer |
+
+The last one is **size-gated** (`_TEASER_CEILING`, 30 rows) and the others are
+not. A "view all jobs" link is weak evidence — plenty of real job lists carry
+one as ordinary navigation — so it counts only while what we hold is small
+enough to actually *be* a teaser. Aveanna Healthcare's page is 3,708 real rows
+beside a "View All Jobs Near Me" link; ungated, the rule would have thrown that
+complete harvest away and sent the company to a browser returning far less.
+
+Any of them marks the harvest `complete=False` with `more_results_available`,
+which does three things: the router **refuses to end the ladder there** and
+still pays for the browser; if the cheap rows are kept anyway (the browser found
+fewer, or crashed) the caveat rides along so removal sync skips the company; and
+the company is listed in the run summary with its shortfall.
+
+`more_results_available` counts as a *describable* truncation in
+`notify.should_send`, alongside `budget_exhausted` and `page_ceiling`, so it
+does not suppress the digest. Its justification differs from theirs: it is not
+newest-first, so the gap is not simply "the oldest postings". What makes it safe
+is that the gap is **stable** — the same tier fetches the same page every run,
+so the rows it does see are a consistent set and a new posting among them is
+genuinely new. The failure mode is a miss, never a false alarm. Excluding it
+would mean permanent silence for a handful of teaser careers pages that are
+incomplete on every run and always will be.
+
+This was not hypothetical. UT Southwestern's careers page shows its ten newest
+openings beside a "View all New Jobs" link and carries no pagination markup at
+all. The tier read exactly ten rows, cleared the ten-row `hop_good_enough_rows`
+floor, and returned them as complete — after which removal sync aged out
+everything else, leaving that employer with exactly ten stored jobs. Energy
+Transfer went the same way. Clearing the floor says "this looks like a real job
+list"; it never said "and it is all of it", and the router now requires both.
+
+**The browser path carries the same contract.** `playwright.max_pages` (40)
 cuts a long list short exactly as a job budget does, and
 `PlaywrightResult.complete` now reports it. The signal already existed —
 `_paginate_and_extract` returned an `exhausted` flag and the scraper logged
@@ -492,6 +545,31 @@ reached — reading one transient HTTP error as "those postings closed", and
 resetting `first_seen` so they were re-reported as new when they came back.
 
 Incomplete companies are listed in the run summary with their shortfall.
+
+**A fourth condition guards removal sync: the harvest must not have collapsed.**
+`complete` is the collector's own account of itself, and it is only as good as
+the collector's knowledge. A walk that *knows* it stopped short says so. A walk
+that never found the list cannot: the browser traversal renders a careers site,
+lands on a "featured roles" panel instead of the job list, extracts four rows,
+finds no pagination control, and concludes it saw everything there was. Nothing
+inside that scrape can tell it otherwise — but the previous run can.
+
+`pipeline.collapsed_against()` compares this run's count for a company against
+the **previous run's** count (from `last_run.json`). Below `COLLAPSE_RATIO`
+(0.5) of it, removal sync is withheld and the company is listed under
+`COLLAPSED` in the run summary. Companies that collected fewer than
+`COLLAPSE_FLOOR` (20) jobs last run are exempt — going from 6 postings to 2 is
+an ordinary week at a small employer, not a cliff.
+
+Measured live: Caterpillar collected 138 jobs one run and 4 the next, both
+reported `complete`, leaving 143 stored postings one miss from deletion.
+
+The comparison is against the previous *run*, deliberately, not the stored row
+count. Nothing is deleted while the guard holds, so a database-based comparison
+could never clear itself — the guard would be permanent. Comparing against the
+last run gives exactly one run of grace: long enough to absorb a transient
+traversal miss, short enough that a real, sustained halving is accepted on the
+next run and the removals go through.
 
 All 14 paginating collectors return a `CollectionResult`, and all of them get
 there through the one walk in `ats/pagination.py` rather than a hand-written
@@ -623,7 +701,27 @@ one sprawling site cannot burn the per-company timeout:
 
 The last one matters: landing pages routinely show three featured roles.
 Returning those would report 3 jobs for a company with thousands, so a small
-result is kept only as a fallback while the search continues.
+result is kept only as a fallback while the search continues. Note that the
+floor answers "does this look like a real job list?" and nothing more — a
+harvest that clears it can still be page one of many, which is why the cheap
+tiers pair it with `detect_more_results()` (see **Collection completeness**).
+
+Pagination inside a rendered page is bounded twice, for the same reason the
+job budget and the page ceiling both exist:
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `playwright.max_pages` | 40 | "Load more"/next clicks per company |
+| `playwright.pagination_budget_seconds` | 150 | Wall-clock ceiling on that clicking |
+
+A count alone had to stay low (it was 10), because the only other bound was
+`browser_company_timeout_seconds`, and **overshooting that is recorded as a
+Timeout failure, which discards every row already collected** — strictly worse
+than truncation. The wall-clock bound decouples the two: the count can be
+generous, and a genuinely slow paginator gives up at 150s and is reported as
+truncated instead of failing. Measured against a full run at 10 clicks, IBM
+stopped at 280 jobs, CBRE at 420 and Goldman Sachs at 220, each with
+`[budget_exhausted]` and more still available.
 
 ### Two User-Agents, deliberately
 

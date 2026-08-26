@@ -509,7 +509,11 @@ def _is_job_row(title: str | None, href: str | None) -> bool:
 
 
 def _paginate_and_extract(
-    page, initial_rows: list[dict[str, Any]], max_clicks: int, timeout_ms: int
+    page,
+    initial_rows: list[dict[str, Any]],
+    max_clicks: int,
+    timeout_ms: int,
+    budget_seconds: float = 0.0,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Click through "Load more"/next controls, accumulating every page's
     rows rather than keeping only whatever is on screen after the last click.
@@ -555,7 +559,20 @@ def _paginate_and_extract(
     # is tolerated because some sites render asynchronously.
     barren = 0
 
+    # A click count alone is the wrong bound for a large employer: raising it
+    # far enough to finish IBM or CBRE would also let one slow site spend the
+    # whole per-company timeout here and be recorded as a Timeout failure,
+    # which loses the company entirely. Bounding the clicks by wall-clock too
+    # means the limit can be generous without that risk - whichever bound
+    # trips first ends the walk, and either way it is reported as truncated
+    # rather than silently complete.
+    deadline = time.monotonic() + budget_seconds if budget_seconds > 0 else None
+
     for _ in range(max_clicks):
+        if deadline is not None and time.monotonic() >= deadline:
+            log.debug("pagination stopped at its %.0fs budget with %s row(s)",
+                      budget_seconds, len(seen))
+            return list(seen.values()), False
         clicked = False
         for selector in LOAD_MORE_SELECTORS:
             try:
@@ -795,7 +812,10 @@ def _navigate_to_job_list(
         rows = _extract_job_rows(page)
         capped = False
         if rows:
-            rows, exhausted = _paginate_and_extract(page, rows, max_pages, timeout_ms)
+            rows, exhausted = _paginate_and_extract(
+                page, rows, max_pages, timeout_ms,
+                max(0.0, deadline - time.monotonic()),
+            )
             capped = not exhausted
         else:
             rows = _extract_jsonld_rows(page)
@@ -1104,6 +1124,7 @@ def _search_fallback(
             rows, exhausted = _paginate_and_extract(
                 page, _extract_job_rows(page),
                 int(cfg.get("playwright.max_pages", 10)), timeout_ms,
+                float(cfg.get("playwright.pagination_budget_seconds", 120)),
             )
             # Any query whose results were cut short leaves the merged set
             # short too, however many other queries ran to completion.
@@ -1192,6 +1213,7 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
     cfg = load_settings()
     timeout_ms = int(cfg.get("playwright.timeout_ms", 30000))
     max_pages = int(cfg.get("playwright.max_pages", 5))
+    page_budget_s = float(cfg.get("playwright.pagination_budget_seconds", 120))
     settle_ms = int(cfg.get("playwright.wait_after_load_ms", 2500))
     search_enabled = bool(cfg.get("playwright.search_fallback.enabled", True))
 
@@ -1272,11 +1294,14 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         capped = False
         if jobs:
             initial_count = len(jobs)
-            jobs, exhausted = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
+            jobs, exhausted = _paginate_and_extract(
+                page, jobs, max_pages, timeout_ms, page_budget_s,
+            )
             capped = not exhausted
             if capped:
-                log.warning("%s: pagination stopped at the %s-page cap with more "
-                            "results still available", company, max_pages)
+                log.warning("%s: pagination stopped at the %s-page/%.0fs cap with "
+                            "more results still available",
+                            company, max_pages, page_budget_s)
             if len(jobs) != initial_count:
                 log.debug("%s: pagination changed the result count %s -> %s",
                           company, initial_count, len(jobs))

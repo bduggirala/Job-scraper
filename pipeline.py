@@ -97,6 +97,7 @@ def write_run_report(
     out_dir: Path,
     run_id: str,
     prefix: str = "",
+    previous_counts: dict[str, int] | None = None,
 ) -> Path:
     """Write ``last_run.json``: what happened to every company, and why.
 
@@ -139,10 +140,18 @@ def write_run_report(
                 if result.duration_seconds is not None else None
             ),
             # Mirrors sync_completed_companies exactly: success AND jobs AND
-            # complete. Restating the rule here would let the two drift.
+            # complete AND not collapsed. Restating the rule here would let the
+            # two drift, so the collapse check calls the same predicate.
             "removal_sync_allowed": bool(
                 result.success and result.jobs and result.complete
+                and not collapsed_against(
+                    (previous_counts or {}).get(result.company), len(result.jobs)
+                )
             ),
+            "collapsed_vs_previous": collapsed_against(
+                (previous_counts or {}).get(result.company), len(result.jobs)
+            ),
+            "previous_jobs": (previous_counts or {}).get(result.company),
             "discovered_ats_url": result.discovered_ats_url,
             "discovered_provider": result.discovered_provider,
         })
@@ -161,6 +170,7 @@ def write_run_report(
             "removed_jobs": summary.jobs_removed,
             "duplicates_removed": summary.duplicates_removed,
             "incomplete_companies": summary.incomplete_companies,
+            "collapsed_companies": summary.collapsed_companies,
         },
         "companies": rows,
     }
@@ -201,9 +211,66 @@ def retryable_companies(report_path: Path) -> list[str]:
     return names
 
 
+#: A harvest this far below the previous run's is treated as a collection
+#: failure rather than as an employer closing that many postings at once.
+#:
+#: ``complete`` catches a walk that *knows* it stopped short. It cannot catch a
+#: walk that never found the list: the browser traversal renders a careers site,
+#: lands on a "featured roles" panel instead of the job list, and returns four
+#: rows believing it saw everything there was. Measured live - Caterpillar
+#: collected 138 jobs one run and 4 the next, both reported complete, which put
+#: 143 stored postings one miss from deletion.
+#:
+#: 0.5 rather than something tighter because real boards do move: a seasonal
+#: close-out or a hiring freeze can legitimately halve one. Halving is the point
+#: at which "the employer did this" stops being the likelier explanation.
+COLLAPSE_RATIO = 0.5
+
+#: Below this many previously-collected jobs the ratio is not meaningful - going
+#: from 6 postings to 2 is an ordinary week at a small employer, not a cliff.
+COLLAPSE_FLOOR = 20
+
 CHANGE_NEW = "new"
 CHANGE_CHANGED = "changed"
 CHANGE_UNCHANGED = "unchanged"
+
+
+def previous_job_counts(report_path: Path) -> dict[str, int]:
+    """``{company: jobs collected}`` from a previous run's ``last_run.json``.
+
+    Empty when there is no readable report - a first run has nothing to compare
+    against, and that must not block its removal sync.
+
+    Deliberately the *previous run's collected count*, not the stored row count.
+    Comparing against the database would make the guard permanent: nothing is
+    ever deleted, so the stored count never falls, so the collapse never clears.
+    Comparing against the last run gives exactly one run of grace - long enough
+    to absorb a transient traversal miss, short enough that a real, sustained
+    halving is accepted on the next run and the removals go through.
+    """
+    report_path = Path(report_path)
+    if not report_path.exists():
+        return {}
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Could not read %s for collapse detection: %s", report_path, exc)
+        return {}
+
+    counts: dict[str, int] = {}
+    for row in report.get("companies") or []:
+        name = str(row.get("company") or "").strip()
+        jobs = row.get("jobs")
+        if name and isinstance(jobs, int):
+            counts[name] = jobs
+    return counts
+
+
+def collapsed_against(previous: int | None, collected: int) -> bool:
+    """Whether ``collected`` is too far below ``previous`` to be believable."""
+    if not previous or previous < COLLAPSE_FLOOR:
+        return False
+    return collected < previous * COLLAPSE_RATIO
 
 
 def assign_change_status(jobs: list[dict[str, Any]], changed_ids: set[str]) -> None:
@@ -266,6 +333,11 @@ class RunSummary:
     changed_jobs: int = 0
     #: ``(company, collected, reported_total, stop_reason)`` per truncated company.
     truncated: list[tuple[str, int, int | None, str | None]] = field(default_factory=list)
+    #: Companies whose harvest collapsed against the previous run, so removal
+    #: sync was withheld even though the collector claimed a complete walk.
+    collapsed_companies: int = 0
+    #: ``(company, collected, previous)`` per collapsed company.
+    collapsed: list[tuple[str, int, int]] = field(default_factory=list)
 
     def as_digest_counts(self) -> dict[str, Any]:
         """The run's numbers as the digest wants them: four outcomes that do
@@ -345,6 +417,19 @@ class RunSummary:
                 lines.append(
                     f"  {company[:26]:<26} {collected:>6,} of "
                     f"{(f'{total:,}' if total else '?'):>7}  {shortfall}  [{reason}]"
+                )
+        if self.collapsed:
+            lines.extend([
+                "",
+                f"COLLAPSED - {len(self.collapsed)} company(ies) returned far "
+                f"fewer jobs than last run (removal sync withheld):",
+            ])
+            for company, collected, previous in sorted(
+                self.collapsed, key=lambda row: row[1] - row[2]
+            ):
+                lines.append(
+                    f"  {company[:26]:<26} {collected:>6,} this run vs "
+                    f"{previous:>6,} last run"
                 )
         lines.append("=" * 58)
         return "\n".join(lines)
@@ -899,11 +984,13 @@ def send_notifications(
 
 
 def sync_completed_companies(
-    results: Iterable[CompanyResult], database: JobDatabase
+    results: Iterable[CompanyResult],
+    database: JobDatabase,
+    previous_counts: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Upsert each company's jobs and age out the ones it no longer lists.
 
-    Three conditions must all hold before a company is synced, and each guards
+    Four conditions must all hold before a company is synced, and each guards
     a different way of misreading absence as closure:
 
     * ``result.success`` - a company we could not reach tells us nothing.
@@ -913,11 +1000,27 @@ def sync_completed_companies(
       data, not from the employer's site. This is the condition that was absent
       before :class:`ats.base.CollectionResult` existed, and it is why one
       transient HTTP error could delete hundreds of live postings.
+    * **the harvest did not collapse** against the previous run. ``complete``
+      is the collector's own account of itself, and it is only as good as the
+      collector's knowledge: a browser traversal that lands on a "featured
+      roles" panel instead of the job list returns four rows and believes it
+      saw everything. Nothing inside that scrape can tell it otherwise - but
+      the previous run can. See :data:`COLLAPSE_RATIO`.
+
+    Args:
+        previous_counts: ``{company: jobs}`` from the previous run's report.
+            Omitted or empty disables collapse detection, so a first run
+            (which has nothing to compare against) syncs normally.
 
     Returns:
-        ``{"removed": int, "synced": int, "skipped_incomplete": int}``
+        ``{"removed": int, "synced": int, "skipped_incomplete": int,
+        "skipped_collapsed": int}``
     """
-    stats = {"removed": 0, "synced": 0, "skipped_incomplete": 0}
+    stats: dict[str, Any] = {
+        "removed": 0, "synced": 0, "skipped_incomplete": 0,
+        "skipped_collapsed": 0, "collapsed": [],
+    }
+    previous_counts = previous_counts or {}
 
     for result in results:
         if not result.success or not result.jobs:
@@ -930,6 +1033,18 @@ def sync_completed_companies(
                 "%s: scrape incomplete (%s) - upserted %s job(s) but skipping "
                 "removal sync so unreached postings are not deleted",
                 result.company, result.stop_reason or "unknown", len(result.jobs),
+            )
+            continue
+
+        previous = previous_counts.get(result.company)
+        if collapsed_against(previous, len(result.jobs)):
+            stats["skipped_collapsed"] += 1
+            stats["collapsed"].append((result.company, len(result.jobs), int(previous)))
+            log.warning(
+                "%s: collected %s job(s) after %s last run - too steep a drop "
+                "to read as closures, so removal sync is skipped. If the next "
+                "run agrees, the removals go through then.",
+                result.company, len(result.jobs), previous,
             )
             continue
 
@@ -1068,6 +1183,10 @@ def run(
     log.info("Collected %s raw jobs across %s companies", len(all_jobs), len(results))
 
     db_path = cfg.resolve_path("database_path", "data/jobs.db")
+    # Read before write_run_report() overwrites it at the end of this run.
+    previous_counts = previous_job_counts(
+        cfg.resolve_path("output.directory", "output") / f"{output_prefix}last_run.json"
+    )
     with JobDatabase(db_path) as database:
         known_before = database.known_ids()
         first_seen = database.get_first_seen_map([j.get("job_id") for j in all_jobs])
@@ -1092,9 +1211,11 @@ def run(
 
         # Per-company upsert + removal sync, gated on success AND completeness.
         # See sync_completed_companies() for why both matter.
-        sync_stats = sync_completed_companies(results, database)
+        sync_stats = sync_completed_companies(results, database, previous_counts)
         summary.jobs_removed = sync_stats["removed"]
         summary.incomplete_companies = sync_stats["skipped_incomplete"]
+        summary.collapsed_companies = sync_stats["skipped_collapsed"]
+        summary.collapsed = list(sync_stats["collapsed"])
 
         refreshed = database.get_first_seen_map([j.get("job_id") for j in final_jobs])
         for job in final_jobs:
@@ -1128,7 +1249,7 @@ def run(
     # that the spreadsheet it describes is already on disk.
     paths["report"] = write_run_report(
         summary, results, cfg.resolve_path("output.directory", "output"),
-        run_id, prefix=output_prefix,
+        run_id, prefix=output_prefix, previous_counts=previous_counts,
     )
     summary.run_id = run_id
     for label, path in paths.items():

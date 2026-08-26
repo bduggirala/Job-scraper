@@ -46,3 +46,5 @@ Thumbs.db
 # Ad-hoc full-run logs
 run_output*.log
 run_full*.log
+run_final*.log
+retry_run*.log

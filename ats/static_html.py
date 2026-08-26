@@ -22,8 +22,16 @@ the router precisely so it is stated once rather than per tier.
 from __future__ import annotations
 
 import http_client
-from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
-from ats.html_utils import extract_job_links
+from ats.base import (
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+    STOP_MORE_AVAILABLE,
+)
+from ats.html_utils import detect_more_results, extract_job_links
+from logger import get_logger
+
+log = get_logger("ats.static_html")
 
 #: Canonical provider name for records this tier emits.
 STATIC_HTML = "static_html"
@@ -61,6 +69,20 @@ class StaticHTMLCollector(ATSCollector):
         if not jobs:
             raise CollectorUnavailable(f"No job links found at {self.url}")
 
-        # One page, no pagination control to follow: what is here is all this
-        # tier can see. Anything larger belongs to a real collector.
-        return CollectionResult(jobs=jobs, complete=True, pages_fetched=1)
+        # One GET, and this tier cannot follow a pagination control. Whether
+        # what it holds is the whole list is therefore a question about the
+        # page, not about the harvest - so ask the page. Claiming completeness
+        # unconditionally is what let a careers landing page showing its ten
+        # newest openings be read as a ten-job employer, with removal sync
+        # deleting the rest (UT Southwestern, Energy Transfer).
+        total, reason = detect_more_results(html_text, len(jobs), self.url)
+        if reason:
+            log.info("%s: static HTML harvested %s row(s) but %s; "
+                     "marking incomplete", self.company, len(jobs), reason)
+            return CollectionResult(
+                jobs=jobs, complete=False, pages_fetched=1,
+                reported_total=total, stop_reason=STOP_MORE_AVAILABLE,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=True, pages_fetched=1, reported_total=total,
+        )

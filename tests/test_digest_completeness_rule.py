@@ -116,3 +116,39 @@ def test_nothing_new_still_sends_nothing():
 def test_the_rule_defaults_to_the_strict_behaviour():
     """Callers that say nothing about reasons keep the cautious rule."""
     assert should_send(new_jobs=[_job()], changed_jobs=[], run_complete=False) is False
+
+
+# --- more_results_available -------------------------------------------------
+
+def test_a_teaser_page_truncation_still_sends_the_digest():
+    """``more_results_available`` must not mean permanent silence.
+
+    A handful of careers pages are teaser lists on every run and always will
+    be, so treating them as fatal would suppress every digest forever - the
+    same trap ``page_ceiling`` fell into before it was added to the rule.
+
+    It is safe for a different reason than the ceilings: the gap is not
+    newest-first, but it *is* stable, so the rows the tier does see are a
+    consistent set and a new posting among them is genuinely new. The failure
+    mode is a miss, never a false alarm.
+    """
+    from ats.base import STOP_MORE_AVAILABLE
+
+    assert should_send(
+        new_jobs=[{"job_id": "a"}],
+        changed_jobs=[],
+        run_complete=False,
+        stop_reasons={STOP_MORE_AVAILABLE},
+    ) is True
+
+
+def test_a_teaser_truncation_beside_a_failed_page_still_suppresses():
+    """One describable reason cannot launder an undescribable one."""
+    from ats.base import STOP_MORE_AVAILABLE, STOP_PAGE_FAILED
+
+    assert should_send(
+        new_jobs=[{"job_id": "a"}],
+        changed_jobs=[],
+        run_complete=False,
+        stop_reasons={STOP_MORE_AVAILABLE, STOP_PAGE_FAILED},
+    ) is False

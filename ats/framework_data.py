@@ -27,8 +27,13 @@ import re
 from typing import Any, Iterator
 
 import http_client
-from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
-from ats.html_utils import make_soup
+from ats.base import (
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+    STOP_MORE_AVAILABLE,
+)
+from ats.html_utils import detect_more_results, make_soup
 from normalize import join_location
 
 #: Canonical provider name for records this tier emits.
@@ -185,5 +190,17 @@ class FrameworkDataCollector(ATSCollector):
             )
 
         # One document, whatever it hydrated with. Pagination here would mean
-        # replaying the site's own API, which is a real collector's job.
-        return CollectionResult(jobs=jobs, complete=True, pages_fetched=1)
+        # replaying the site's own API, which is a real collector's job - so
+        # when the document itself says there are more results than it
+        # hydrated, say so rather than reporting page one as the whole list.
+        total, reason = detect_more_results(html_text, len(jobs), self.url)
+        if reason:
+            self.log.info("%s: framework payload carried %s row(s) but %s; "
+                     "marking incomplete", self.company, len(jobs), reason)
+            return CollectionResult(
+                jobs=jobs, complete=False, pages_fetched=1,
+                reported_total=total, stop_reason=STOP_MORE_AVAILABLE,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=True, pages_fetched=1, reported_total=total,
+        )

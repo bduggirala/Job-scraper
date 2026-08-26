@@ -234,10 +234,25 @@ def should_send(
     if run_complete:
         return True
 
-    from ats.base import STOP_BUDGET, STOP_PAGE_CEILING
+    from ats.base import STOP_BUDGET, STOP_MORE_AVAILABLE, STOP_PAGE_CEILING
 
     #: Truncations whose shape we know, because we chose where to stop.
-    describable = {STOP_BUDGET, STOP_PAGE_CEILING}
+    #:
+    #: ``more_results_available`` joins them for a different reason than the
+    #: other two, and the difference is worth stating. It is not newest-first,
+    #: so the gap is not merely "the oldest postings" - a single-GET tier stuck
+    #: on page one may never see a recent posting sitting on page two. What
+    #: makes it safe here is that the gap is *stable*: the same tier fetches the
+    #: same page every run, so the rows it does see are a consistent set and a
+    #: genuinely new posting among them is genuinely new. The failure mode is a
+    #: miss, never a false alarm - and the run summary names every such company
+    #: with its shortfall, so the miss is visible rather than silent.
+    #:
+    #: Excluding it would mean permanent silence, which is the same trap
+    #: ``page_ceiling`` fell into: a handful of teaser careers pages are
+    #: incomplete on every run and always will be, and one known limitation
+    #: should not cost all alerting.
+    describable = {STOP_BUDGET, STOP_PAGE_CEILING, STOP_MORE_AVAILABLE}
 
     reasons = stop_reasons or set()
     if reasons and reasons <= describable:

@@ -271,7 +271,7 @@ def collect_via_api(plan: RoutePlan) -> CollectionResult:
     return CollectionResult.coerce(collector.collect())
 
 
-def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
+def collect_via_jsonld(plan: RoutePlan) -> CollectionResult:
     """Try harvesting schema.org JobPosting JSON-LD from the planned page.
 
     A generic, provider-agnostic tier that sits between page resolution and the
@@ -284,10 +284,10 @@ def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
     """
     detection = dict(plan.detection or {})
     detection.setdefault("url", plan.url)
-    return JSONLDCollector(plan.company, detection).collect()
+    return CollectionResult.coerce(JSONLDCollector(plan.company, detection).collect())
 
 
-def collect_via_static_html(plan: RoutePlan) -> list[dict]:
+def collect_via_static_html(plan: RoutePlan) -> CollectionResult:
     """Harvest a server-rendered job list over one GET.
 
     Raises:
@@ -295,10 +295,10 @@ def collect_via_static_html(plan: RoutePlan) -> list[dict]:
     """
     detection = dict(plan.detection or {})
     detection.setdefault("url", plan.url)
-    return StaticHTMLCollector(plan.company, detection).collect().jobs
+    return StaticHTMLCollector(plan.company, detection).collect()
 
 
-def collect_via_framework_data(plan: RoutePlan) -> list[dict]:
+def collect_via_framework_data(plan: RoutePlan) -> CollectionResult:
     """Read a Next.js/Nuxt/Redux hydration payload instead of rendering it.
 
     Raises:
@@ -306,7 +306,7 @@ def collect_via_framework_data(plan: RoutePlan) -> list[dict]:
     """
     detection = dict(plan.detection or {})
     detection.setdefault("url", plan.url)
-    return FrameworkDataCollector(plan.company, detection).collect().jobs
+    return FrameworkDataCollector(plan.company, detection).collect()
 
 
 @dataclass
@@ -324,6 +324,8 @@ class BrowserHarvest:
     blocked: bool = False
     complete: bool = True
     stop_reason: str | None = None
+    #: What the page claimed it had, when a cheap tier read a count off it.
+    reported_total: int | None = None
 
 
 def collect_via_browser(plan: RoutePlan) -> BrowserHarvest:
@@ -483,7 +485,7 @@ def fetch_company_jobs(
     # SEO, and accepting those reports 3 jobs for an employer with thousands.
     # A thin harvest is kept as a fallback while the ladder continues.
     good_enough = _good_enough_rows()
-    best_cheap: list[dict] = []
+    best_cheap: CollectionResult = CollectionResult(jobs=[])
 
     for label, harvest in (
         ("JSON-LD", collect_via_jsonld),
@@ -493,25 +495,43 @@ def fetch_company_jobs(
         if not plan.url:
             break
         try:
-            rows = harvest(plan)
+            # coerce(), not a bare attribute read: these three are the tier
+            # seam, and a harvest that still returns a plain list (or a test
+            # double standing in for one) is taken at face value as complete,
+            # exactly as collect_via_api() treats an unconverted collector.
+            collected = CollectionResult.coerce(harvest(plan))
         except CollectorUnavailable:
             continue
         except Exception as exc:  # a parser hiccup must not sink the company
             log.debug("%s -> %s tier errored (%s)", company, label, exc)
             continue
 
-        if len(rows) >= good_enough:
+        rows = collected.jobs
+
+        # Two conditions, not one. Clearing the floor says "this looks like a
+        # real job list"; ``complete`` says "and it is all of it". A single GET
+        # against a paginated list satisfies the first and fails the second,
+        # and accepting it there ended the ladder on page one - then reported
+        # that page as the company's entire job list, which is what let removal
+        # sync delete every posting behind it.
+        if len(rows) >= good_enough and collected.complete:
             log.info("%s -> %s jobs via %s", company, len(rows), label)
             return CompanyResult(
                 company=company, jobs=rows, plan=plan, success=True,
-                fell_back=fell_back,
+                fell_back=fell_back, reported_total=collected.reported_total,
             )
-        if len(rows) > len(best_cheap):
-            log.debug("%s -> %s found only %s row(s); keeping as a fallback",
-                      company, label, len(rows))
-            best_cheap = rows
 
-    jsonld_jobs = best_cheap
+        if not collected.complete and rows:
+            log.info(
+                "%s -> %s tier found %s row(s) but the page advertises more "
+                "(%s); escalating rather than accepting page one",
+                company, label, len(rows), collected.stop_reason,
+            )
+        if len(rows) > len(best_cheap.jobs):
+            best_cheap = collected
+
+    cheap = best_cheap
+    jsonld_jobs = cheap.jobs
 
     log.info("%s -> Playwright fallback", company)
     try:
@@ -524,11 +544,13 @@ def fetch_company_jobs(
         # A thin JSON-LD harvest is still better than nothing when the browser
         # cannot run at all.
         if jsonld_jobs:
-            log.info("%s -> browser failed (%s); keeping %s JSON-LD row(s)",
+            log.info("%s -> browser failed (%s); keeping %s cheap-tier row(s)",
                      company, exc, len(jsonld_jobs))
             return CompanyResult(
                 company=company, jobs=jsonld_jobs, plan=plan, success=True,
                 fell_back=fell_back,
+                complete=cheap.complete, stop_reason=cheap.stop_reason,
+                reported_total=cheap.reported_total,
             )
         return CompanyResult(
             company=company, jobs=[], plan=plan, success=False, fell_back=fell_back,
@@ -539,10 +561,18 @@ def fetch_company_jobs(
     # harvest is a single GET, so preferring it also discards the browser's
     # truncation - the rows being returned are no longer the capped ones.
     if len(jsonld_jobs) > len(jobs) and not discovered_provider:
-        log.info("%s -> keeping %s JSON-LD row(s) over %s browser row(s)",
+        log.info("%s -> keeping %s cheap-tier row(s) over %s browser row(s)",
                  company, len(jsonld_jobs), len(jobs))
         jobs = jsonld_jobs
-        harvest.complete, harvest.stop_reason = True, None
+        # The browser's truncation no longer applies - these are different
+        # rows - but the cheap tier's own does. Asserting completeness here
+        # unconditionally would re-open the hole this tier was just taught to
+        # report: a page-one harvest preferred over a thin browser result and
+        # then declared the company's whole job list.
+        harvest.complete = cheap.complete
+        harvest.stop_reason = cheap.stop_reason
+        if cheap.reported_total is not None:
+            harvest.reported_total = cheap.reported_total
 
     # Self-healing: the browser found the real ATS behind a branded careers
     # page (e.g. GameStop -> UKG). Collecting through that provider's API now
@@ -604,4 +634,5 @@ def fetch_company_jobs(
         # later pages, exactly as a truncated API walk has not - and removal
         # sync must skip it for the same reason.
         complete=harvest.complete, stop_reason=harvest.stop_reason,
+        reported_total=harvest.reported_total,
     )

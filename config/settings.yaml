@@ -172,7 +172,19 @@ playwright:
   # adding overhead to the common 1-2-page case. Raised from 5 after fixing
   # _paginate_and_extract to accumulate across pages instead of keeping only
   # the last one - confirmed Goldman Sachs 20->120 and IBM 30->162 jobs at 5.
-  max_pages: 10
+  # Raised from 10 once pagination gained a wall-clock bound of its own
+  # (pagination_budget_seconds). A count alone had to stay low because the
+  # only other bound was the 480s per-company limit, and overshooting that
+  # loses the company entirely rather than truncating it. With both bounds
+  # the count can be generous: measured against the previous full run, 10
+  # clicks left IBM at 280 jobs, CBRE at 420 and Goldman Sachs at 220, each
+  # reported [budget_exhausted] with more still available.
+  max_pages: 40
+  # Wall-clock ceiling on one company's pagination clicking, well inside
+  # browser_company_timeout_seconds so a slow paginator is recorded as
+  # truncated (removal sync skipped, listed in the summary) rather than as a
+  # Timeout failure that discards every row it did collect.
+  pagination_budget_seconds: 150
   wait_after_load_ms: 2500  # settle time for client-side rendering
 
   # The browser needs a DIFFERENT User-Agent than requests.user_agent below.

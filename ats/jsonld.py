@@ -31,8 +31,13 @@ import json
 from typing import Any, Iterator
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
-from ats.html_utils import make_soup
+from ats.base import (
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+    STOP_MORE_AVAILABLE,
+)
+from ats.html_utils import detect_more_results, make_soup
 from normalize import clean_text
 
 #: Canonical provider name for records this collector emits. Kept local to this
@@ -172,7 +177,7 @@ class JSONLDCollector(ATSCollector):
 
     provider = JSONLD
 
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         if not self.url:
             raise CollectorUnavailable("No URL available for JSON-LD collection")
 
@@ -196,7 +201,23 @@ class JSONLDCollector(ATSCollector):
             raise CollectorUnavailable(
                 f"No JobPosting JSON-LD found at {self.url}"
             )
-        return finalized
+
+        # SEO structured data describes the page it sits on, so a paginated
+        # list embeds only the current page's postings. Ask the page whether
+        # more exist before letting this count as a company's whole job list.
+        total, reason = detect_more_results(html_text, len(finalized), self.url)
+        if reason:
+            self.log.info(
+                "%s: JSON-LD harvested %s row(s) but %s; marking incomplete",
+                self.company, len(finalized), reason,
+            )
+            return CollectionResult(
+                jobs=finalized, complete=False, pages_fetched=1,
+                reported_total=total, stop_reason=STOP_MORE_AVAILABLE,
+            )
+        return CollectionResult(
+            jobs=finalized, complete=True, pages_fetched=1, reported_total=total,
+        )
 
     def _record_from_node(self, node: dict[str, Any]) -> dict[str, Any] | None:
         job_url = node.get("url") or node.get("@id") or self.url

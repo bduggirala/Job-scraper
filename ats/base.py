@@ -40,6 +40,11 @@ STOP_REPEATED_PAGE = "repeated_page"
 #: provider serves few rows per request: at ten per page the ceiling is 5,000
 #: jobs regardless of how high ``max_jobs_per_company`` is set.
 STOP_PAGE_CEILING = "page_ceiling"
+#: A single-GET tier (JSON-LD, static HTML, framework payload) harvested a page
+#: that advertises more results than it served - a stated results count above
+#: what we extracted, a pagination widget, or a "view all jobs" link. The tier
+#: cannot follow any of those, so what it has is page one.
+STOP_MORE_AVAILABLE = "more_results_available"
 #: The walk ended - naturally, or on a repeat - while the provider's own
 #: reported total says there were more rows. The provider contradicted itself,
 #: so what we have is not the whole list.
