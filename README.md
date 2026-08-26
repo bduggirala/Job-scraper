@@ -225,8 +225,15 @@ exactly the case where a cheap tier helps most.
 ```
 company, title, location, date_posted, job_url, apply_url, employment_type,
 remote, description, ats_provider, scraping_method, date_filter_status,
-location_match_type, remote_scope, source_query, first_seen, is_new
+location_match_type, remote_scope, source_query, fit_score, fit_matched,
+fit_explanation, first_seen, is_new, change_status
 ```
+
+`change_status` is `new`, `changed` or `unchanged`. `new` wins over `changed`:
+a job seen for the first time has no previous state to have moved from.
+Removed jobs are deliberately **not** a status — this file lists what an
+employer is advertising now, and a row for a closed requisition is a link to a
+dead page. Removals are counted in the run summary instead.
 
 `remote_scope` is `remote_us`, `remote_restricted`, `remote_non_us`, `hybrid`
 or `onsite`. Only `remote_us` counts as a remote match: a role tied to one
@@ -274,8 +281,32 @@ Three guards decide whether anything goes out:
 | Guard | Why |
 |-------|-----|
 | Something new or changed | A channel that mails "0 new jobs" every run is one you stop opening |
-| Every company completed | A truncated run never saw the pages it missed, so its "new" set is not a real answer |
-| Not announced before | The `notifications` table records each job once per kind, so a digest never repeats itself |
+| No company stopped short *for an unknown reason* | A `page_failed` run leaves a hole of unknown shape, so what looks new may just be what we reached |
+| Not announced before | The `notifications` table records each job once per state |
+
+The middle guard distinguishes the two kinds of incompleteness. A
+`budget_exhausted` truncation walks newest-first, so what it missed is the
+*oldest* postings and nothing inside a 7-day window sits behind it — the digest
+still sends. Treating it as fatal would mean permanent silence for any employer
+too large to collect in full, and CVS Health (19,246 postings at ten per
+request) is truncated on every run and always will be.
+
+Notification keys are `(job_id, kind)` where `changed` carries a fingerprint of
+the job's tracked fields. Under a bare `"changed"` key a posting that moved city
+in March and was retitled in June produced **one alert ever** — the second was
+filtered out as already announced, permanently. Fingerprinting makes the key
+"this job, in this state", so each distinct change is announced once and a
+re-run reporting the same change stays silent.
+
+### Dry run
+
+`notifications.email.dry_run: true` — or `SCRAPER_SMTP_DRY_RUN=1`, which needs
+no edit to checked-in config — renders the digest to
+`output/digest_preview/` (`digest.txt`, `digest.html`, `digest.eml`) instead of
+sending it. It needs **no SMTP credentials** and opens no connection, which is
+what makes the whole notification path verifiable without mailing a real
+person. A dry run deliberately does *not* mark jobs as announced, so the first
+real send still includes everything a preview has seen.
 
 Partial runs (`--test-company`, `--limit`) never send: they know nothing about
 the companies they skipped.
@@ -286,14 +317,32 @@ the companies they skipped.
 the posting URL rather than the URL itself — retitling a job changes its URL
 slug but not its underlying requisition id, so the same job stays the same row.
 
-Ids are **scoped by company**: `{company}:{provider}:{id}`. The extracted id is
-only unique *within* an employer, and `job_id` is the table's primary key — the
-provider prefix alone is the literal string `unknown` for every browser-routed
-company, so `https://a.com/careers?jobId=55512` and
-`https://b.com/apply?jobid=55512` used to produce the same id and merge two
+Ids are **scoped by company**: `{company}:{id}`. The extracted id is only
+unique *within* an employer, and `job_id` is the table's primary key, so
+without the scope `https://a.com/careers?jobId=55512` and
+`https://b.com/apply?jobid=55512` produced the same id and merged two
 employers' postings into one row. The company key is normalized (suffixes and
 punctuation dropped) so workbook drift — "Acme Inc" one run, "Acme, Inc." the
 next — does not orphan every job that company had.
+
+A generically-extracted id carries **no provider label**. `ats_provider` is the
+literal string `unknown` for every browser-routed row, so labelling made one
+requisition resolve to two identities depending on which route reached it that
+run — `taleo:1001` via the API, `unknown:1001` via Playwright. A company that
+fell back to the browser therefore re-keyed its whole job list, reported all of
+it as new, and aged out the API-keyed copies. Provider-specific strategies
+(Workday's `_R12345` requisition suffix and friends) still carry their label,
+because those ids are provider-shaped and unambiguous.
+
+**The query string is part of the identity.** Several platforms put the
+requisition id there and nothing else distinguishes two postings: UKG serves
+`OpportunityDetail?opportunityId=<uuid>`, Taleo `jobdetail.ftl?job=<id>`, Infor
+`shorturl.do?key=<id>`. Dropping the query gave every job a company lists the
+same key — measured against a real 120,003-row run, GameStop's 5,148 distinct
+postings collapsed to one, BAE Systems' 1,858 to one, and 8,427 real postings
+were lost across 18 companies. Tracking parameters are stripped by
+`normalize.TRACKING_PARAMS` instead, which is narrower and does the job the
+blanket drop was reaching for.
 
 `job_identity.JOB_ID_SCHEME_VERSION` records the format. When it changes, the
 `jobs` table is cleared on open rather than left holding ids nothing will ever
@@ -330,10 +379,46 @@ CollectionResult(jobs, complete, pages_fetched, reported_total, stop_reason)
 ```
 
 `complete` is True only when the collector is confident it saw every row the
-provider would serve. A failed page, a tripped job budget, or a walk that ended
-short of the reported total all set it False and name a `stop_reason`
-(`exhausted`, `reported_total_reached`, `page_failed`, `budget_exhausted`,
-`no_new_rows`).
+provider would serve. A failed page, a tripped job budget, a tripped page
+ceiling, or a walk that ended short of the reported total all set it False and
+name a `stop_reason`:
+
+| `stop_reason` | `complete` | Meaning |
+|---------------|-----------|---------|
+| `exhausted` | yes | The provider served everything it had |
+| `reported_total_reached` | yes | Collected count met the reported total |
+| `no_new_rows` / `repeated_page` | depends | The walk ended on a repeat; complete unless a reported total says otherwise |
+| `page_failed` | no | A page beyond the first failed — hole of unknown shape |
+| `budget_exhausted` | no | `max_jobs_per_company` tripped while rows remained |
+| `page_ceiling` | no | `pagination.MAX_PAGES` (500) tripped first |
+| `short_of_reported_total` | no | The walk ended naturally, but the provider's own total says there was more |
+
+Two of these are recent and both were silent completeness lies:
+
+- **`page_ceiling`.** `MAX_PAGES` bounds the loop independently of the job
+  budget, but the reason was derived from the budget alone, so running out of
+  *pages* reported `exhausted`. On a ten-rows-per-request provider that ceiling
+  is 5,000 jobs however high `max_jobs_per_company` is set — CVS Health lists
+  19,246, so the company cited below as the reason budget truncation must not
+  silence the digest was itself being reported complete.
+- **`short_of_reported_total`.** A tenant that reports 5,000 and stops serving
+  at 200 has contradicted itself, and believing it deletes 4,800 live postings.
+  A shortfall within `TOTAL_RECONCILIATION_TOLERANCE` (2%) is still complete,
+  because totals drift while a walk runs. Only `exhausted` is rewritten —
+  `repeated_page` and `no_new_rows` describe an observed event that stays true,
+  so only their `complete` flag flips.
+
+Checked against three live Workday tenants before adopting this rule:
+requesting offset `total - 5` returned exactly 5 rows on Capital One (1,842),
+Travelers (346) and Texas Capital Bank (81), so the reported total is accurate
+and a large shortfall is evidence of a stall rather than benign over-reporting.
+
+**The browser path carries the same contract.** `playwright.max_pages` (10)
+cuts a long list short exactly as a job budget does, and
+`PlaywrightResult.complete` now reports it. The signal already existed —
+`_paginate_and_extract` returned an `exhausted` flag and the scraper logged
+"pagination stopped at the N-page cap" — but it was discarded at all three call
+sites, so every browser company claimed it had seen the whole list.
 
 This exists because the two cases used to be indistinguishable. A page failing
 partway through pagination produced a partial harvest the router reported as a
@@ -387,6 +472,16 @@ suppresses removal sync for that company and lists it in the run summary with
 its shortfall. `max_pages_per_company` remains for collectors not yet converted
 (iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
 
+A second, independent ceiling sits in the controller itself:
+`ats.pagination.MAX_PAGES` (500) guards a provider that serves one row per page
+forever without repeating content. **Whichever ceiling trips first decides the
+`stop_reason`** — `budget_exhausted` or `page_ceiling` — and both mark the walk
+incomplete. They bind at very different job counts: at 500 rows per request the
+job budget trips first, while at ten rows per request the page ceiling caps the
+walk at 5,000 jobs no matter how high `max_jobs_per_company` goes. Deriving the
+reason from the job budget alone reported the second case as `exhausted`, which
+reads as complete.
+
 What survives a truncated walk should be what the freshness window can still
 match, so collectors that can be truncated ask for newest-first where the
 provider supports it (UKG `postedDateDesc`, Oracle `POSTING_DATES_DESC`,
@@ -408,8 +503,25 @@ regardless of which segment it's in — `Senior Manager, Data Science` is
 rejected even though "Data Science" sits in a different comma segment from
 "Manager"; a per-segment-only exclude would have let it through.
 
-DFW matching rejects same-named cities in other states, so `Westlake Village, CA`
-and `Richardson, UT` do not pass as DFW.
+`config/settings.yaml`'s `locations` list is the **whole** DFW filter — a city
+missing from it is dropped silently. It covers the metro (Dallas, Tarrant,
+Collin, Denton and Rockwall county cities), not just the handful nearest
+downtown: the original twelve entries excluded Arlington, Carrollton,
+Lewisville, Denton, McKinney, Allen, Garland, Southlake, Flower Mound and Grand
+Prairie, all ordinary commutable employer locations.
+
+DFW matching rejects same-named cities in other states, so `Westlake Village, CA`,
+`Richardson, UT` and `Arlington, VA` do not pass as DFW. That guard
+(`enforce_texas_for_city_match`) is what makes it safe to list the more generic
+city names.
+
+A remote role is only `remote_us` when nothing contradicts it. A bare "Remote"
+or "Work from home" has no geography to judge and is trusted; a location that
+still names a place once the remote wording is stripped needs positive U.S.
+evidence — a state, or the country. The blocklist of foreign countries cannot
+be exhaustive, and `_has_us_signal` used to end with "…or the text contains a
+remote token", which every remote posting's text does, so the check returned
+True every time and never ran.
 
 ### Careers-site traversal
 
@@ -491,7 +603,7 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 
 | File | Responsibility |
 |------|----------------|
-| `ats/router.py` | The ladder: `plan_route()` (decide provider+method) and `fetch_company_jobs()` (API → JSON-LD → Playwright, with mid-run self-heal). `COLLECTORS` dict = supported providers |
+| `ats/router.py` | The ladder: `plan_route()` (decide provider+method) and `fetch_company_jobs()` (API → JSON-LD → static HTML → framework data → Playwright, with mid-run self-heal). `COLLECTORS` dict = supported providers. `BrowserHarvest` carries the browser fallback's rows *and* its completeness back to `CompanyResult` |
 | `ats/detector.py` | Lexical ATS detection from a URL, plus HTML fingerprints and embedded-URL extraction. **Add a new provider's host/fingerprint here** |
 | `ats/resolver.py` | One HTTP GET on a branded page → identify the ATS behind it (redirect/fingerprint/embedded URL); 403→browser-UA retry |
 | `ats/url_repair.py` | Swaps a dead `careers.*` subdomain for a live careers page before routing |

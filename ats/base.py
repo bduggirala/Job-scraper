@@ -36,6 +36,20 @@ STOP_NO_NEW_ROWS = "no_new_rows"
 #: The provider served a byte-identical page again, meaning it is ignoring its
 #: own paging parameter. Distinct from NO_NEW_ROWS, which is normal exhaustion.
 STOP_REPEATED_PAGE = "repeated_page"
+#: The page-count ceiling tripped before the job budget did. Reached when a
+#: provider serves few rows per request: at ten per page the ceiling is 5,000
+#: jobs regardless of how high ``max_jobs_per_company`` is set.
+STOP_PAGE_CEILING = "page_ceiling"
+#: The walk ended - naturally, or on a repeat - while the provider's own
+#: reported total says there were more rows. The provider contradicted itself,
+#: so what we have is not the whole list.
+STOP_SHORT_OF_TOTAL = "short_of_reported_total"
+
+#: How far below a reported total a walk may land and still count as complete.
+#: Reported totals drift while a walk is in progress (postings close, a tenant
+#: caches its count), and treating a two-row gap as a failure would suppress
+#: that company's removal sync on every run forever.
+TOTAL_RECONCILIATION_TOLERANCE = 0.02
 
 
 @dataclass

@@ -36,6 +36,12 @@ ENV_HOST = "SCRAPER_SMTP_HOST"
 ENV_PORT = "SCRAPER_SMTP_PORT"
 ENV_USER = "SCRAPER_SMTP_USER"
 ENV_PASSWORD = "SCRAPER_SMTP_PASSWORD"
+#: Set to 1/true/yes to render the digest to disk instead of sending it. A
+#: safety switch that needs no edit to checked-in config, so a verification run
+#: cannot mail a real recipient by accident.
+ENV_DRY_RUN = "SCRAPER_SMTP_DRY_RUN"
+
+_TRUTHY = {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -48,11 +54,18 @@ class EmailConfig:
     password: str = field(repr=False)
     to: list[str] = field(default_factory=list)
     sender: str = ""
+    #: Render the digest to ``preview_dir`` and report success without opening
+    #: an SMTP connection. Makes the whole notification path testable without
+    #: credentials aimed at a real inbox.
+    dry_run: bool = False
+    #: Where a dry run writes its preview.
+    preview_dir: Path | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return (
             f"EmailConfig(host={self.host!r}, port={self.port}, "
-            f"user={self.user!r}, to={self.to!r}, password=<hidden>)"
+            f"user={self.user!r}, to={self.to!r}, dry_run={self.dry_run}, "
+            f"password=<hidden>)"
         )
 
 
@@ -86,25 +99,36 @@ def load_email_config(section: dict[str, Any] | None) -> EmailConfig | None:
     user = os.environ.get(ENV_USER) or section.get("user")
     password = os.environ.get(ENV_PASSWORD)
 
-    missing = [
-        name for name, value in
-        ((ENV_HOST, host), (ENV_USER, user), (ENV_PASSWORD, password))
-        if not value
-    ]
-    if missing:
-        log.warning(
-            "Email notifications enabled but %s not set; skipping send. "
-            "Credentials are read from the environment only.", ", ".join(missing),
-        )
-        return None
+    dry_run = (
+        os.environ.get(ENV_DRY_RUN, "").strip().lower() in _TRUTHY
+        or bool(section.get("dry_run"))
+    )
 
+    # A dry run never opens a connection, so requiring credentials for one
+    # would leave the digest verifiable only by mailing a real person.
+    if not dry_run:
+        missing = [
+            name for name, value in
+            ((ENV_HOST, host), (ENV_USER, user), (ENV_PASSWORD, password))
+            if not value
+        ]
+        if missing:
+            log.warning(
+                "Email notifications enabled but %s not set; skipping send. "
+                "Credentials are read from the environment only.", ", ".join(missing),
+            )
+            return None
+
+    preview = section.get("preview_dir")
     return EmailConfig(
-        host=str(host),
+        host=str(host or ""),
         port=int(os.environ.get(ENV_PORT) or section.get("port") or 587),
-        user=str(user),
-        password=str(password),
+        user=str(user or ""),
+        password=str(password or ""),
         to=recipients,
-        sender=str(section.get("from") or user),
+        sender=str(section.get("from") or user or "scraper@localhost"),
+        dry_run=dry_run,
+        preview_dir=Path(preview) if preview else None,
     )
 
 
@@ -158,10 +182,29 @@ def _line(job: dict[str, Any]) -> str:
     return f"{job.get('company', '?')} - {job.get('title', '?')} ({location})\n    {link}"
 
 
+def _safe_link(value: Any) -> str:
+    """An ``href`` value safe to emit, or empty.
+
+    Escaping made the link *text* safe but said nothing about the scheme, and
+    ``job_url`` is scraped from a third-party page. A ``javascript:`` or
+    ``data:text/html`` URL stayed clickable - inert in most mail clients, but
+    the dry-run preview is an HTML file opened in a browser, where it is not.
+    Only http(s) is allowed through.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    scheme = text.split(":", 1)[0].lower() if ":" in text else ""
+    if scheme and scheme not in ("http", "https"):
+        log.debug("Dropping a job link with an unsupported scheme: %r", scheme)
+        return ""
+    return html.escape(text, quote=True)
+
+
 def _row_html(job: dict[str, Any]) -> str:
     # Every field here is scraped from a third-party page and is going into an
     # HTML email, so all of it is escaped.
-    link = html.escape(str(job.get("apply_url") or job.get("job_url") or ""), quote=True)
+    link = _safe_link(job.get("apply_url") or job.get("job_url"))
     return (
         "<tr>"
         f"<td style='padding:6px 10px'>{html.escape(str(job.get('company') or '?'))}</td>"
@@ -236,6 +279,31 @@ def build_digest(
     return Digest(subject, "\n".join(text_lines), "".join(html_parts))
 
 
+def _write_preview(config: EmailConfig, digest: Digest, message: EmailMessage) -> bool:
+    """Render a dry run's digest to disk and report success.
+
+    Success is the honest answer: the digest was produced and delivered as far
+    as this mode goes. The caller's own dry-run check is what stops these jobs
+    being marked as announced, so a preview never suppresses a later real send.
+    """
+    directory = Path(config.preview_dir or Path("output") / "digest_preview")
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "digest.txt").write_text(
+            f"Subject: {digest.subject}\nTo: {', '.join(config.to)}\n\n{digest.text}",
+            encoding="utf-8",
+        )
+        (directory / "digest.html").write_text(digest.html, encoding="utf-8")
+        (directory / "digest.eml").write_text(message.as_string(), encoding="utf-8")
+    except Exception as exc:
+        log.error("Could not write the digest preview: %s", exc)
+        return False
+
+    log.info("DRY RUN: digest for %s written to %s (nothing was sent)",
+             ", ".join(config.to), directory)
+    return True
+
+
 def send_digest(
     config: EmailConfig,
     digest: Digest,
@@ -267,6 +335,9 @@ def send_digest(
             )
         except Exception as exc:
             log.warning("Could not attach %s: %s", path.name, exc)
+
+    if config.dry_run:
+        return _write_preview(config, digest, message)
 
     try:
         context = ssl.create_default_context()

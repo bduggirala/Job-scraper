@@ -75,6 +75,31 @@ _NON_US_TOKENS = (
 )
 
 
+#: The country named directly. "usa"/"u.s.a."/"u.s."/a standalone "us" all
+#: count; the earlier pattern required literal dots, so a bare "Remote, USA"
+#: was only rescued by the remote-token clause that has now been removed.
+_US_COUNTRY_RE = re.compile(
+    r"\bunited states\b|\bu\.?s\.?a\.?\b|\busa\b|\bus\b", re.I
+)
+
+
+def _geographic_residue(location: str) -> str:
+    """What is left of a location once remote wording is taken out.
+
+    ``"Remote"`` on its own leaves nothing - there is no geography to judge, so
+    the posting is trusted. ``"Remote (Pernambuco, Recife)"`` leaves two place
+    names, which is a claim about where the role sits and therefore something
+    that needs positive U.S. evidence before it counts as U.S.-eligible.
+    """
+    text = location.lower()
+    for token in sorted(_REMOTE_TOKENS, key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(token)}\b", " ", text)
+    # Punctuation, connectives and role-agnostic filler carry no geography.
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\b(in|the|and|or|of|only|based|position|role|usa?)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _named_states(text: str) -> set[str]:
     """U.S. states named in ``text``, by full name or "City, ST" abbreviation.
 
@@ -126,9 +151,13 @@ def classify_remote_scope(record: dict[str, Any]) -> str:
         # ("Remote - NY, NJ, CT") is still a restriction, just a broader one.
         return REMOTE_RESTRICTED
 
-    # A blank or generic location carries no evidence either way and is
-    # trusted; a detailed one needs positive U.S. evidence.
-    if location and not LocationMatcher._has_us_signal(haystack):
+    # A blank or generic location ("Remote", "Work from home") carries no
+    # evidence either way and is trusted. A location that still names a place
+    # after the remote wording is removed is making a claim about where the
+    # role sits, and that needs positive U.S. evidence - a blocklist of foreign
+    # countries cannot be exhaustive, and every city name it misses would
+    # otherwise pass as U.S.-eligible.
+    if _geographic_residue(location) and not LocationMatcher._has_us_signal(haystack):
         return REMOTE_NON_US
     return REMOTE_US
 
@@ -198,20 +227,30 @@ class LocationMatcher:
         Alegre...) named none of our blocked tokens (only the country name
         "brazil" is blocked, not its city names) and slipped through as
         "remote_us". This is the positive-evidence counterpart: a detailed,
-        non-generic location listing is only trusted as U.S.-eligible when
-        it actually names a U.S. state, "United States"/"USA", or a bare
-        remote marker.
+        non-generic location listing is only trusted as U.S.-eligible when it
+        actually names a U.S. state or the country.
+
+        This deliberately does **not** accept a remote marker as evidence.
+        It used to end with ``any(token in text for token in _REMOTE_TOKENS)``,
+        and since the text being tested is a remote job's location, that clause
+        matched every single time - so the function returned True for every
+        remote posting and the guard above it never ran at all. A bare
+        "Remote" with nothing else in it is handled by the caller, which can
+        see that there is no other geography to judge.
         """
-        if re.search(r"\bunited states\b|\bu\.s\.a?\.?\b", text):
+        if _US_COUNTRY_RE.search(text):
             return True
         for abbrev, name in _STATE_TOKENS.items():
-            if re.search(rf"\b{re.escape(name)}\b", text):
+            # re.I: _STATE_TOKENS holds lowercase names and the text reaching
+            # here is not always lowercased, so a case-sensitive match silently
+            # ignored every state spelled out in full.
+            if re.search(rf"\b{re.escape(name)}\b", text, re.I):
                 return True
             if re.search(rf",\s*{abbrev}\b", text, re.I):
                 return True
             if re.search(rf"\bremote[\s-]*{abbrev}\b", text, re.I):
                 return True
-        return any(token in text for token in _REMOTE_TOKENS)
+        return False
 
     def is_remote_us(self, record: dict[str, Any]) -> bool:
         """True only for remote roles open anywhere in the U.S.
@@ -226,11 +265,19 @@ class LocationMatcher:
         return classify_remote_scope(record) == REMOTE_US
 
     def _conflicting_state(self, text: str, matched_city: str) -> bool:
-        """True when the string names a U.S. state other than Texas."""
+        """True when the string names a U.S. state other than Texas.
+
+        The abbreviation branch below has always been case-insensitive; this
+        one was not, and ``_STATE_TOKENS`` holds lowercase names while
+        ``text`` is the location exactly as scraped. Every state written out
+        in full therefore went unnoticed, so the guard only ever worked on the
+        "City, ST" form - confirmed against a real harvest, where eight Amazon
+        postings in "Arlington, Virginia, USA" matched as DFW.
+        """
         for abbrev, name in _STATE_TOKENS.items():
             if abbrev == "tx":
                 continue
-            if re.search(rf"\b{re.escape(name)}\b", text):
+            if re.search(rf"\b{re.escape(name)}\b", text, re.I):
                 return True
             # Abbreviations only count in a "City, ST" shape to avoid matching
             # random two-letter words.

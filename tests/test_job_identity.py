@@ -54,10 +54,30 @@ def test_company_naming_variants_resolve_to_the_same_scope():
     assert jid(url, "unknown", "Acme Inc") == jid(url, "unknown", "Acme, Inc.")
 
 
-def test_different_providers_at_one_company_stay_distinct():
+def test_one_url_is_one_job_whatever_route_reached_it():
+    """Scheme v3: a generically-extracted id no longer carries the provider.
+
+    This replaces an earlier assertion that the same URL under two provider
+    labels was two different jobs. That premise was wrong - one URL is one
+    posting - and it had a real cost: ``ats_provider`` is the literal string
+    "unknown" for every browser-routed row, so a company that fell back to
+    Playwright re-keyed its entire job list, reported all of it as new, and
+    aged out the API-keyed copies of the very same requisitions.
+    """
+    url = "https://acme.com/careers?jobId=1"
+    assert jid(url, "workday", "Acme") == jid(url, "icims", "Acme")
+    assert jid(url, "taleo", "Acme") == jid(url, "unknown", "Acme")
+
+
+def test_the_same_id_at_two_employers_stays_distinct():
+    """What the provider label was really protecting: cross-company collisions.
+
+    The company scope does this job, and does it better - the label could not
+    separate two employers whose rows were both labelled "unknown".
+    """
     assert (
-        jid("https://acme.com/careers?jobId=1", "workday", "Acme")
-        != jid("https://acme.com/careers?jobId=1", "icims", "Acme")
+        jid("https://a.com/careers?jobId=55512", "unknown", "Alpha Foods")
+        != jid("https://b.com/apply?jobid=55512", "unknown", "Beta Health")
     )
 
 

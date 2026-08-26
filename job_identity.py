@@ -28,14 +28,23 @@ from normalize import normalize_url
 
 #: Bumped whenever the id format changes, so a database keyed on the old scheme
 #: is cleared rather than silently accumulating two generations of ids that can
-#: never match. Version 2 added the company scope prefix.
-JOB_ID_SCHEME_VERSION = 2
+#: never match. Version 2 added the company scope prefix; version 3 stopped
+#: discarding the query string (which is the entire identity on several
+#: platforms) and dropped the provider label from generically-extracted ids.
+JOB_ID_SCHEME_VERSION = 3
 
 # Trailing Workday requisition id, e.g. "..._R246063-2" -> "R246063-2".
 _WORKDAY_REQ_RE = re.compile(r"_([Rr]\d+(?:-\d+)?)(?:/|$)")
 
 # Generic query-param identifiers used by several enterprise ATS platforms.
-_QUERY_ID_KEYS = ("id", "jobid", "reqid", "requisitionid", "jobseqno", "opportunityid")
+# ``job`` is Taleo's (``jobdetail.ftl?job=12345``), ``key`` is Infor's
+# (``shorturl.do?key=ZB0``), ``params`` is the opaque blob TEKsystems encodes a
+# whole posting into - all three are the only thing distinguishing one of that
+# platform's postings from another.
+_QUERY_ID_KEYS = (
+    "jobid", "reqid", "requisitionid", "jobseqno", "opportunityid",
+    "job", "id", "key", "params",
+)
 
 # A bare trailing numeric or UUID path segment.
 _TRAILING_NUMERIC_RE = re.compile(r"(\d{4,})/?$")
@@ -135,12 +144,26 @@ def extract_stable_job_id(
     if workday_id:
         return f"{prefix}{WORKDAY}:{workday_id}"
 
+    # Generic extractions carry no provider label. ``ats_provider`` is the
+    # literal string "unknown" for every browser-routed row, so labelling a
+    # generically-extracted id with it made the *same requisition* resolve to
+    # two different identities depending on which route reached it that run -
+    # "taleo:1001" via the API, "unknown:1001" via Playwright. A company that
+    # fell back to the browser therefore reported its whole job list as new and
+    # aged out the API-keyed copies. The company scope already prevents the
+    # cross-employer collisions the label was there to stop; within one
+    # employer two systems issuing the same numeric id is the residual risk,
+    # and it is much smaller than the one being fixed.
     query_id = _query_id(job_url)
     if query_id:
-        return f"{prefix}{ats_provider}:{query_id}"
+        return f"{prefix}{query_id}"
 
     segment_id = _last_segment_id(job_url)
     if segment_id:
-        return f"{prefix}{ats_provider}:{segment_id}"
+        return f"{prefix}{segment_id}"
 
-    return f"{prefix}{normalize_url(job_url, drop_query=True) or job_url}"
+    # The query is kept: on Infor, TEKsystems and similar it is the only thing
+    # that differs between two postings, and dropping it gave every job a
+    # company lists the same primary key. normalize_url has already stripped
+    # the tracking parameters that would otherwise split one job in two.
+    return f"{prefix}{normalize_url(job_url) or job_url}"

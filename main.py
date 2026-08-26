@@ -17,7 +17,6 @@ import os
 import sys
 import threading
 import time
-from pathlib import Path
 
 from ats.router import METHOD_API, METHOD_BROWSER
 from logger import get_logger, setup_logging

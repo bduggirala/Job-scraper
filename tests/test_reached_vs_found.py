@@ -27,7 +27,7 @@ def _plan():
 
 def test_a_clean_render_with_no_jobs_is_not_a_failure(monkeypatch):
     monkeypatch.setattr(router, "collect_via_jsonld", lambda plan: [])
-    monkeypatch.setattr(router, "collect_via_browser", lambda plan: ([], None, None, False))
+    monkeypatch.setattr(router, "collect_via_browser", lambda plan: router.BrowserHarvest())
 
     result = router.fetch_company_jobs("Acme", plan=_plan())
 
@@ -38,7 +38,7 @@ def test_a_clean_render_with_no_jobs_is_not_a_failure(monkeypatch):
 
 def test_a_blocked_site_is_still_a_failure(monkeypatch):
     monkeypatch.setattr(router, "collect_via_jsonld", lambda plan: [])
-    monkeypatch.setattr(router, "collect_via_browser", lambda plan: ([], None, None, True))
+    monkeypatch.setattr(router, "collect_via_browser", lambda plan: router.BrowserHarvest(blocked=True))
 
     result = router.fetch_company_jobs("Acme", plan=_plan())
 
