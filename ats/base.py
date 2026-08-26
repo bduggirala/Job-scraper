@@ -50,6 +50,27 @@ STOP_MORE_AVAILABLE = "more_results_available"
 #: so what we have is not the whole list.
 STOP_SHORT_OF_TOTAL = "short_of_reported_total"
 
+#: Truncations whose *shape* we know, so a run carrying only these can still be
+#: trusted to say what is new.
+#:
+#: ``budget_exhausted`` and ``page_ceiling`` are ceilings we imposed ourselves,
+#: and the walks that hit them are newest-first, so what was missed is the
+#: oldest postings - nothing a freshness window would have matched.
+#: ``more_results_available`` is here for a different reason: it is not
+#: newest-first, but the gap is *stable* (the same single-GET tier fetches the
+#: same page every run), so the rows it does see are a consistent set and a new
+#: posting among them is genuinely new.
+#:
+#: Everything absent from this set - a failed page, a provider contradicting
+#: its own reported total - leaves a hole of unknown shape.
+#:
+#: Lives here rather than in notify.py because two callers need it and a second
+#: copy would drift: notify decides whether to send, and pipeline counts how
+#: many companies are affected.
+DESCRIBABLE_STOP_REASONS = frozenset({
+    STOP_BUDGET, STOP_PAGE_CEILING, STOP_MORE_AVAILABLE,
+})
+
 #: How far below a reported total a walk may land and still count as complete.
 #: Reported totals drift while a walk is in progress (postings close, a tenant
 #: caches its count), and treating a two-row gap as a failure would suppress

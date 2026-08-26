@@ -334,6 +334,22 @@ overrides `.env`. The tracked config carries a **placeholder** recipient and
 the real one lives in `.env` as `SCRAPER_EMAIL_TO`; before the loader existed
 that file was never read, so the digest was addressed to the placeholder.
 
+### When the digest is held back
+
+A run that could not see everything cannot always be trusted to say what is
+*new*, so `notify.should_send()` decides. Truncations in
+`ats.base.DESCRIBABLE_STOP_REASONS` never suppress it — their shape is known.
+The rest (a failed page, a provider contradicting its own reported total) leave
+a hole of unknown shape, and the digest is held **only once more than
+`UNTRUSTWORTHY_COMPANY_LIMIT` (3) companies** are in that state.
+
+The count matters, not just the reason. Suppressing on the first one treated a
+run of 180 companies as unusable because TEKsystems served 122 of the 136 it
+reported — 14 jobs at one employer silenced every alert for the whole workbook.
+Below the limit the digest goes out and the run summary names each affected
+company with its shortfall; above it the pattern is systemic and the run
+genuinely does not know what it saw.
+
 The configured recipient is `you@example.com` (`config/settings.yaml`
 and `.env.example`).
 
@@ -513,9 +529,10 @@ still pays for the browser; if the cheap rows are kept anyway (the browser found
 fewer, or crashed) the caveat rides along so removal sync skips the company; and
 the company is listed in the run summary with its shortfall.
 
-`more_results_available` counts as a *describable* truncation in
-`notify.should_send`, alongside `budget_exhausted` and `page_ceiling`, so it
-does not suppress the digest. Its justification differs from theirs: it is not
+`more_results_available` counts as a *describable* truncation
+(`ats.base.DESCRIBABLE_STOP_REASONS`, the one definition both `notify` and
+`pipeline` read), alongside `budget_exhausted` and `page_ceiling`, so it does
+not suppress the digest. Its justification differs from theirs: it is not
 newest-first, so the gap is not simply "the oldest postings". What makes it safe
 is that the gap is **stable** — the same tier fetches the same page every run,
 so the rows it does see are a consistent set and a new posting among them is

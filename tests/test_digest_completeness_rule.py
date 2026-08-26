@@ -152,3 +152,86 @@ def test_a_teaser_truncation_beside_a_failed_page_still_suppresses():
         run_complete=False,
         stop_reasons={STOP_MORE_AVAILABLE, STOP_PAGE_FAILED},
     ) is False
+
+
+# --- scaling the rule to the size of the run --------------------------------
+
+def _untrustworthy(count: int | None):
+    """One run, ``count`` companies truncated in a way we cannot describe."""
+    from ats.base import STOP_BUDGET, STOP_SHORT_OF_TOTAL
+
+    return should_send(
+        new_jobs=[{"job_id": "a"}],
+        changed_jobs=[],
+        run_complete=False,
+        stop_reasons={STOP_BUDGET, STOP_SHORT_OF_TOTAL},
+        untrustworthy_companies=count,
+    )
+
+
+def test_one_company_short_of_its_total_does_not_silence_the_run():
+    """TEKsystems served 122 of the 136 it reported - 14 jobs, one employer.
+
+    That alone used to suppress every alert for a 180-company workbook.
+    """
+    assert _untrustworthy(1) is True
+
+
+def test_the_limit_itself_still_sends():
+    from notify import UNTRUSTWORTHY_COMPANY_LIMIT
+    assert _untrustworthy(UNTRUSTWORTHY_COMPANY_LIMIT) is True
+
+
+def test_beyond_the_limit_is_systemic_and_suppresses():
+    from notify import UNTRUSTWORTHY_COMPANY_LIMIT
+    assert _untrustworthy(UNTRUSTWORTHY_COMPANY_LIMIT + 1) is False
+
+
+def test_many_companies_short_still_suppresses():
+    assert _untrustworthy(30) is False
+
+
+def test_an_uncounted_run_keeps_the_cautious_behaviour():
+    """A caller that has not been taught to count stays strict."""
+    assert _untrustworthy(None) is False
+
+
+def test_the_count_is_irrelevant_when_every_reason_is_describable():
+    """Ceilings we set ourselves never suppress, however many companies hit them."""
+    from ats.base import STOP_BUDGET, STOP_MORE_AVAILABLE
+
+    assert should_send(
+        new_jobs=[{"job_id": "a"}], changed_jobs=[], run_complete=False,
+        stop_reasons={STOP_BUDGET, STOP_MORE_AVAILABLE},
+        untrustworthy_companies=99,
+    ) is True
+
+
+def test_a_complete_run_ignores_the_count_entirely():
+    assert should_send(
+        new_jobs=[{"job_id": "a"}], changed_jobs=[], run_complete=True,
+        stop_reasons=set(), untrustworthy_companies=99,
+    ) is True
+
+
+def test_nothing_to_announce_still_sends_nothing():
+    """The count must never manufacture a digest out of an empty run."""
+    assert _untrustworthy(0) is True  # sanity: reasons are describable-only path
+    assert should_send(
+        new_jobs=[], changed_jobs=[], run_complete=True,
+        stop_reasons=set(), untrustworthy_companies=0,
+    ) is False
+
+
+def test_the_describable_set_has_one_definition():
+    """notify and pipeline must not keep separate copies of it."""
+    import notify as notify_module
+    from ats.base import DESCRIBABLE_STOP_REASONS
+
+    source = (notify_module.__file__ or "")
+    assert source, "notify must be importable from a file"
+    with open(source, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "DESCRIBABLE_STOP_REASONS" in text
+    assert "describable = {STOP_BUDGET" not in text, "a second copy has crept back"
+    assert "short_of_reported_total" not in DESCRIBABLE_STOP_REASONS

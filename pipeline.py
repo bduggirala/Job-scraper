@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable
 
 import pandas as pd
 
+from ats.base import DESCRIBABLE_STOP_REASONS
 from ats.router import (
     METHOD_API,
     METHOD_BROWSER,
@@ -930,6 +931,13 @@ def _prepare_notification(
         # gap of known shape. See notify.should_send.
         "run_complete": summary.incomplete_companies == 0,
         "stop_reasons": {r for _, _, _, r in summary.truncated if r},
+        # How many companies - not just which reasons. One employer short of
+        # its own reported total is not the same fact as thirty of them, and
+        # the reason set alone cannot tell them apart.
+        "untrustworthy_companies": sum(
+            1 for _, _, _, reason in summary.truncated
+            if reason and reason not in DESCRIBABLE_STOP_REASONS
+        ),
     }
 
 
@@ -952,6 +960,7 @@ def send_notifications(
         new_jobs=new_jobs, changed_jobs=changed_jobs,
         run_complete=payload["run_complete"],
         stop_reasons=payload.get("stop_reasons"),
+        untrustworthy_companies=payload.get("untrustworthy_companies"),
     ):
         log.info("Nothing new to announce; no email sent")
         return False

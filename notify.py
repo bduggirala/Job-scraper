@@ -194,12 +194,25 @@ def load_email_config(section: dict[str, Any] | None) -> EmailConfig | None:
     )
 
 
+#: How many companies may end a run with a truncation of *unknown shape*
+#: before the digest is suppressed.
+#:
+#: The rule exists to stop "new" becoming noise. One employer landing short of
+#: its own reported total cannot do that to a run of 180: measured live,
+#: TEKsystems served 122 of the 136 it reported - 14 jobs at one company - and
+#: that alone suppressed every alert for the whole workbook. Several companies
+#: doing it at once is a different signal: that is systemic, and then the run
+#: genuinely does not know what it saw.
+UNTRUSTWORTHY_COMPANY_LIMIT = 3
+
+
 def should_send(
     *,
     new_jobs: list[dict],
     changed_jobs: list[dict],
     run_complete: bool,
     stop_reasons: set[str] | None = None,
+    untrustworthy_companies: int | None = None,
 ) -> bool:
     """Whether this run has something worth mailing.
 
@@ -221,12 +234,26 @@ def should_send(
     was not added to it, which is how a full-workbook run came to log
     "suppressing the digest" with those two companies as the only reason.
 
-    A provider **contradicting its own reported total** stays fatal, alongside
-    a failed page: it said 679 and served 140, and nothing says which 539 are
-    missing or whether they are old.
+    A provider **contradicting its own reported total** is the untrustworthy
+    kind, alongside a failed page: it said 679 and served 140, and nothing says
+    which 539 are missing or whether they are old.
+
+    But *how many* companies are in that state decides whether the run as a
+    whole is untrustworthy. Suppressing on the first one treats a run of 180 as
+    unusable because one employer was 14 jobs short - the same disproportion
+    ``page_ceiling`` and ``more_results_available`` were each corrected for.
+    Up to :data:`UNTRUSTWORTHY_COMPANY_LIMIT` of them, the digest goes out and
+    the run summary names every affected company with its shortfall; beyond
+    that the pattern is systemic and the digest is held.
 
     ``stop_reasons`` omitted keeps the strict behaviour, so a caller that has
-    not been taught the distinction stays cautious.
+    not been taught the distinction stays cautious. ``untrustworthy_companies``
+    omitted keeps the older all-or-nothing behaviour for the same reason.
+
+    Args:
+        untrustworthy_companies: how many companies ended with a truncation of
+            unknown shape. None means "not counted", which is treated as "at
+            least one" - the cautious reading.
     """
     if not (new_jobs or changed_jobs):
         return False
@@ -234,25 +261,7 @@ def should_send(
     if run_complete:
         return True
 
-    from ats.base import STOP_BUDGET, STOP_MORE_AVAILABLE, STOP_PAGE_CEILING
-
-    #: Truncations whose shape we know, because we chose where to stop.
-    #:
-    #: ``more_results_available`` joins them for a different reason than the
-    #: other two, and the difference is worth stating. It is not newest-first,
-    #: so the gap is not merely "the oldest postings" - a single-GET tier stuck
-    #: on page one may never see a recent posting sitting on page two. What
-    #: makes it safe here is that the gap is *stable*: the same tier fetches the
-    #: same page every run, so the rows it does see are a consistent set and a
-    #: genuinely new posting among them is genuinely new. The failure mode is a
-    #: miss, never a false alarm - and the run summary names every such company
-    #: with its shortfall, so the miss is visible rather than silent.
-    #:
-    #: Excluding it would mean permanent silence, which is the same trap
-    #: ``page_ceiling`` fell into: a handful of teaser careers pages are
-    #: incomplete on every run and always will be, and one known limitation
-    #: should not cost all alerting.
-    describable = {STOP_BUDGET, STOP_PAGE_CEILING, STOP_MORE_AVAILABLE}
+    from ats.base import DESCRIBABLE_STOP_REASONS as describable
 
     reasons = stop_reasons or set()
     if reasons and reasons <= describable:
@@ -261,8 +270,22 @@ def should_send(
                  "the digest anyway", ", ".join(sorted(reasons)))
         return True
 
-    log.info("Run incomplete for reasons that make 'new' untrustworthy (%s); "
-             "suppressing the digest", ", ".join(sorted(reasons)) or "unknown")
+    unknown = sorted(reasons - describable)
+    affected = untrustworthy_companies
+    if affected is None:
+        affected = UNTRUSTWORTHY_COMPANY_LIMIT + 1 if unknown else 0
+
+    if unknown and affected <= UNTRUSTWORTHY_COMPANY_LIMIT:
+        log.info("%s company(ies) truncated in a way we cannot describe (%s) - "
+                 "within the limit of %s, so the digest is sent and those "
+                 "companies are named in the run summary",
+                 affected, ", ".join(unknown), UNTRUSTWORTHY_COMPANY_LIMIT)
+        return True
+
+    log.info("Run incomplete for reasons that make 'new' untrustworthy (%s) at "
+             "%s company(ies), over the limit of %s; suppressing the digest",
+             ", ".join(unknown) or "unknown", affected,
+             UNTRUSTWORTHY_COMPANY_LIMIT)
     return False
 
 
