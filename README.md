@@ -33,11 +33,20 @@ companies.xlsx
       ▼                                                                 │
   JSON-LD tier ──▶ page embeds schema.org JobPosting? ──▶ harvest ──────┤
       │                                                                 │
+      ▼  still nothing                                                  │
+  static HTML ──▶ job-link patterns in the served markup? ──────────────┤
+      │                                                                 │
+      ▼  still nothing                                                  │
+  framework data ─▶ __NEXT_DATA__ / Nuxt / Angular state? ──────────────┤
+      │                                                                 │
       │  still nothing                                                  │
       ▼                                                                 │
   Playwright ──▶ extract job links                                      │
-      ├──▶ nothing? type "Data Engineer" into the page's search box     │
       ├──▶ nothing? hop to "Search jobs" / "View openings" page         │
+      ├──▶ nothing? submit the page's own search box, one query per     │
+      │             configured term ("Data", "Engineer", "Analytics",   │
+      │             "ETL"), merging and de-duplicating the results      │
+      ├──▶ walk every result page (next / load-more / infinite scroll)  │
       └──▶ found an ATS link? ──▶ switch to its API mid-run ────────────┤
                                                                         │
                                         ┌───────────────────────────────┘
@@ -54,10 +63,18 @@ companies.xlsx
                                         ▼
                           internal deduplication
                                         ▼
-                    SQLite tracking (new / removed jobs)
+                    SQLite tracking (new / changed / removed)
                                         ▼
-                          output/company_jobs.csv
+        output/company_jobs.{csv,xlsx,json} + last_run.json
+                                        ▼
+                     email digest (only if EMAIL_ENABLED)
 ```
+
+The search terms stay deliberately broad. On a site whose jobs only exist
+behind its own search, that search is the *only* view of its postings we ever
+get — so a narrow query is a coverage ceiling, not a filter. A "Snowflake
+Engineer" or "ETL Developer" is invisible to a "Data Engineer" query, and
+`target_role_patterns` can only ever filter what was actually fetched.
 
 ### Self-healing ATS discovery
 
@@ -103,7 +120,7 @@ it, not separate codebases.
 ATS URLs on its own. `find_ats_urls.py` is an optional *pre-pass*: bulk-fill or
 repair the URL column up front (especially companies stuck on the slow Playwright
 path), review suggestions before trusting them, and get an explicit `NOT FOUND`
-list to fix by hand — all without a full ~15-minute scrape. Typical loop: run
+list to fix by hand — all without a full ~34-minute scrape. Typical loop: run
 `find_ats_urls.py --only-failures` occasionally to enrich the workbook, eyeball
 and `--apply` the good ones, then every `main.py` run is faster and hits more
 direct APIs. Never run it during a full run — both write `config/companies.xlsx`.
@@ -153,6 +170,7 @@ python main.py
 | `--resolve` | With `--dry-run`, also probe branded pages (1 GET each) |
 | `--test-company NAME` | Only companies matching NAME, with diagnostics |
 | `--test-provider P` | Only companies routed to provider P |
+| `--retry-failed` | Re-run only the companies `output/last_run.json` recorded as `failed` or `partial`. Blocked companies are skipped — a site that issued a challenge is not fixed by asking again. |
 | `--limit N` | Process only the first N companies |
 | `--no-playwright` | Disable browser fallback |
 | `--no-resolve` | Skip page resolution and URL repair |
@@ -164,7 +182,9 @@ python main.py
 
 Partial runs (`--test-company`, `--test-provider`, `--limit`) write to
 `test_`-prefixed output files and never modify the workbook, so they cannot
-clobber a full run's results.
+clobber a full run's results. `--retry-failed` uses a `retry_` prefix for the
+same reason: it knows nothing about the companies that already succeeded, so
+its spreadsheet is a slice rather than a replacement.
 
 ---
 
@@ -181,8 +201,8 @@ clobber a full run's results.
 | Eightfold | `/api/apply/v2/jobs` | Uses `?domain=` when present |
 | UKG Pro | `JobBoardView/LoadSearchResults` | `ultipro.com` and `*.ukg.net` hosts |
 | Phenom | `phApp.ddo` on `/search-results` | Page-embedded JSON, not the dead `/widgets` endpoint |
-| Oracle Cloud | `recruitingCEJobRequisitions` | Requires `expand=requisitionList` |
-| Taleo (legacy) | HTML via browser | REST API needs session/CSRF state; browser path used instead |
+| Oracle Cloud | `recruitingCEJobRequisitions` | Requires `expand=requisitionList`; reports `TotalJobsCount`, which the walk reconciles against |
+| Taleo (legacy) | `careersection/rest/jobboard/searchjobs` | POST search. Row fields arrive as a positional `column` array whose order is configured per portal, so parsing is heuristic and any shape mismatch raises `CollectorUnavailable` |
 | iCIMS | HTML + JSON-LD | No public API |
 | SuccessFactors | HTML + JSON-LD | OData requires tenant auth |
 | Avature | HTML + JSON-LD | No public API; self-hosted portals detected via `avature.portal` fingerprint |
@@ -206,8 +226,8 @@ applied once in the router: a thin harvest is kept as a fallback while the
 ladder continues, never accepted as a company's whole job list.
 
 Any collector that cannot serve a tenant raises `CollectorUnavailable`, and the
-router falls back to the next tier (JSON-LD, then Playwright) rather than
-failing the company.
+router falls back to the next tier (JSON-LD → static HTML → framework data →
+Playwright) rather than failing the company.
 
 The JSON-LD tier applies the same `hop_good_enough_rows` floor the browser
 traversal uses: a landing page embedding two or three "featured" roles for SEO
@@ -226,8 +246,15 @@ exactly the case where a cheap tier helps most.
 company, title, location, date_posted, job_url, apply_url, employment_type,
 remote, description, ats_provider, scraping_method, date_filter_status,
 location_match_type, remote_scope, source_query, fit_score, fit_matched,
-fit_explanation, first_seen, is_new, change_status
+fit_explanation, first_seen, is_new, change_status, run_id
 ```
+
+`output/company_jobs.xlsx` carries the same rows and is what the digest
+attaches; the CSV is the machine-readable export.
+
+`run_id` (e.g. `20260826T044813Z`) names the run that produced the file. A
+spreadsheet that has been copied somewhere else previously identified itself by
+filename alone, so yesterday's export and last month's were indistinguishable.
 
 `change_status` is `new`, `changed` or `unchanged`. `new` wins over `changed`:
 a job seen for the first time has no previous state to have moved from.
@@ -256,25 +283,63 @@ date, and inventing one would corrupt the freshness filter.
 `output/scraper_failures.csv` — one row per failed company with `error_type`,
 `error_message` and `timestamp`.
 
+`output/last_run.json` — one row per company **attempted**, not just the failed
+ones: provider, extraction method, jobs collected, the provider's reported
+total, `stop_reason`, duration, and `removal_sync_allowed`. That last field is
+the one that most needed surfacing — it is the difference between "this
+company's removals are real" and "removals were skipped here", and nothing
+reported it. The file also carries the `run_id`, `status_counts` and
+`method_counts` for the run.
+
+Company status is one of five, deliberately not two:
+
+| Status | Meaning | What it calls for |
+|--------|---------|-------------------|
+| `success` | Reached, complete, returned jobs | nothing |
+| `partial` | Rows are real, coverage is not | a clean re-run (`--retry-failed`) |
+| `failed` | Timeout or error | investigation |
+| `blocked` | Bot challenge or explicit denial | a different route in, never a workaround |
+| `no_jobs` | Read correctly; not hiring | nothing |
+
 ---
 
 ## Notifications
 
 A full run emails a digest of new and changed matching jobs with
-`output/company_jobs.xlsx` attached. Configure the recipient in
-`config/settings.yaml` under `notifications.email`; **credentials come from the
-environment only**, since that file is in git:
+`output/company_jobs.xlsx` attached (the CSV stands in if the workbook could
+not be written — a digest with no attachment at all is the worst of the three
+outcomes).
 
-```bash
-export SCRAPER_SMTP_HOST=smtp.gmail.com
-export SCRAPER_SMTP_PORT=587
-export SCRAPER_SMTP_USER=you@gmail.com
-export SCRAPER_SMTP_PASSWORD=your-app-password   # Gmail: an App Password, not your login
-```
+**Email is off by default and every value comes from the environment.**
+`.env.example` is the tracked template; copy it to `.env` (gitignored) and fill
+it in.
 
-Without those three variables the run logs what it *would* have sent and
-carries on — a mail problem never fails a scrape, because the spreadsheet on
-disk is the real deliverable.
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EMAIL_ENABLED` | `false` | Master switch. Overrides `notifications.email.enabled` **in both directions**, so a file in git never decides on its own whether a run mails a human. |
+| `SCRAPER_EMAIL_TO` | from config | Recipient(s), comma- or semicolon-separated |
+| `SCRAPER_SMTP_HOST` | — | e.g. `smtp.gmail.com` |
+| `SCRAPER_SMTP_PORT` | `587` | 587 STARTTLS, 465 implicit SSL |
+| `SCRAPER_SMTP_USER` | — | The authenticating account |
+| `SCRAPER_SMTP_PASSWORD` | — | Gmail: an App Password, not your login |
+| `SCRAPER_SMTP_FROM` | `SCRAPER_SMTP_USER` | Envelope sender when it differs |
+| `SCRAPER_SMTP_USE_TLS` | `true` | STARTTLS on a non-SSL port |
+| `SCRAPER_SMTP_DRY_RUN` | `false` | Render the digest to disk instead of sending |
+
+The configured recipient is `you@example.com` (`config/settings.yaml`
+and `.env.example`).
+
+**Missing credentials never fail a scrape.** With `EMAIL_ENABLED` unset or
+false the run logs that delivery is disabled and completes normally; with it
+true but credentials absent, the run logs exactly which variables are missing
+and skips the send. The spreadsheet on disk is the real deliverable either way.
+No credential value is ever logged, and `EmailConfig.__repr__` hides the
+password.
+
+The digest body carries the run's own numbers — run id, companies attempted,
+and `success` / `partial` / `failed` / `blocked` separately, because 3 new jobs
+out of a clean sweep and 3 new jobs out of the 40 companies that didn't time
+out are very different runs.
 
 Three guards decide whether anything goes out:
 
@@ -308,8 +373,8 @@ what makes the whole notification path verifiable without mailing a real
 person. A dry run deliberately does *not* mark jobs as announced, so the first
 real send still includes everything a preview has seen.
 
-Partial runs (`--test-company`, `--limit`) never send: they know nothing about
-the companies they skipped.
+Partial runs (`--test-company`, `--test-provider`, `--limit`, `--retry-failed`)
+never send: they know nothing about the companies they skipped.
 
 ## Job tracking (SQLite)
 
@@ -442,10 +507,27 @@ get wrong; they stay on the `CollectionResult.coerce` shim.
 - **repeated-page detection.** A tenant that ignores its own paging parameter
   serves page 1 forever; a content hash stops on the first repeat instead of
   parsing and de-duplicating every one.
+- **the provider's page size, not ours.** A walk ends when a page comes back
+  short — but short *of what*. The `page_size` a collector passes is only its
+  assumption; measuring against it ended the walk after page one for any
+  provider serving fewer rows than assumed, and called that complete. Probing
+  six live iCIMS tenants against the collector's hard-coded `ROWS_PER_PAGE = 20`
+  found 13, 20, 20, 21, 50 and 50 rows per page — four of six wrong. The walk
+  now learns the real size from page one. The cost is exactly one extra
+  request, and only for a company whose *first* page is short.
 
 A first-page failure always propagates so the collector can raise
 `CollectorUnavailable` and let the router fall back; later pages are retried
 and then tolerated as an incomplete walk.
+
+**All fourteen paginating collectors now use it**, Taleo included. Both of
+Taleo's paths (Oracle Cloud Recruiting and the legacy career section) walked by
+hand until they were migrated, which left the ten workbook companies routed
+there — JPMorgan Chase, Texas Instruments, Honeywell, Oracle, Digital Realty,
+Baylor Scott &amp; White Health, Texas Health Resources, Tenet Healthcare, Molina
+Healthcare and PlainsCapital Bank — without per-page retry, without
+reconciliation against the `TotalJobsCount` that ORC reports on every response,
+and without repeated-page detection.
 
 ---
 
@@ -458,8 +540,8 @@ fallback term), and concurrency (`http_workers: 10`, `playwright_workers: 3`).
 
 ### Pagination ceilings
 
-`requests.max_jobs_per_company` (default 10,000) bounds how much a converted
-collector will fetch for one company. It is expressed in **jobs, not pages**,
+`requests.max_jobs_per_company` (default 10,000) bounds how much any collector
+will fetch for one company. It is expressed in **jobs, not pages**,
 deliberately: a shared *page* budget means a different job ceiling for every
 provider, because page sizes differ. The old `max_pages_per_company: 25` meant
 250 jobs on Phenom (10/page) and 5,000 on Oracle (200/page) — which silently
@@ -469,8 +551,9 @@ exactly 250.
 
 Tripping the ceiling is not an error, but it marks the scrape incomplete, which
 suppresses removal sync for that company and lists it in the run summary with
-its shortfall. `max_pages_per_company` remains for collectors not yet converted
-(iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
+its shortfall. (The older `requests.max_pages_per_company` knob is gone: once
+Taleo moved onto the shared controller nothing read it, and a config key that
+does nothing is worse than no key at all.)
 
 A second, independent ceiling sits in the controller itself:
 `ats.pagination.MAX_PAGES` (500) guards a provider that serves one row per page
@@ -593,8 +676,8 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 
 | File | Responsibility |
 |------|----------------|
-| `main.py` | CLI: arg parsing, `--dry-run`/`--test-*` modes, wiring to `pipeline.run()` |
-| `pipeline.py` | Run orchestration — load workbook → route → execute (2 thread pools) → filter/dedupe/store → write outputs & workbook write-back |
+| `main.py` | CLI: arg parsing, `--dry-run`/`--test-*`/`--retry-failed` modes, wiring to `pipeline.run()` |
+| `pipeline.py` | Run orchestration — load workbook → route → execute (2 thread pools) → filter/dedupe/store → write outputs, `last_run.json` and workbook write-back. Also `company_status()` (the five outcomes), `write_run_report()`, `retryable_companies()` and `select_attachments()` |
 | `settings.py` | Loads `config/settings.yaml`; path resolution and config access |
 | `logger.py` | Logging setup |
 | `http_client.py` | Shared `requests` session, retries/backoff, `get_json`/`get_text`/`post_json` |
@@ -608,7 +691,7 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | `ats/resolver.py` | One HTTP GET on a branded page → identify the ATS behind it (redirect/fingerprint/embedded URL); 403→browser-UA retry |
 | `ats/url_repair.py` | Swaps a dead `careers.*` subdomain for a live careers page before routing |
 | `ats/base.py` | `ATSCollector` base class, `CollectionResult` (the completeness contract) + `CollectorUnavailable`; `record()`/`finalize()`/`result()` helpers every collector uses |
-| `ats/pagination.py` | The shared pagination walk: per-page retry, repeated-page detection, total reconciliation, budget. **Every paginating collector uses this** |
+| `ats/pagination.py` | The shared pagination walk: per-page retry, repeated-page detection, total reconciliation, the provider's real page size, budget. **All fourteen paginating collectors use this**, Taleo included |
 | `ats/html_utils.py` | Shared HTML/JSON-LD parsing helpers for collectors |
 | `ats/discovery.py` | On-demand ATS-URL discovery engine (used by `tools/find_ats_urls.py`, **not** the live pipeline) |
 
@@ -642,7 +725,7 @@ returns real jobs through it.
 | `enrich.py` | Fill coarse locations (e.g. Workday detail fetch) |
 | `deduplicate.py` | Collapse duplicate postings within a run |
 | `fit.py` | Explainable fit scoring against a configurable skill list |
-| `notify.py` | Email digest of new/changed jobs; SMTP credentials from env only |
+| `notify.py` | Email digest of new/changed jobs; the `EMAIL_ENABLED` gate, recipient/sender/TLS resolution, dry-run rendering. Every value from env only |
 | `job_identity.py` | Stable, company-scoped per-job id derived from the posting URL; `JOB_ID_SCHEME_VERSION` |
 | `database.py` | SQLite tracking — upsert, per-company removal sync, new/first-seen |
 | `export_ats_urls.py` | Write verified discovered ATS URLs, verified dead-URL repairs, and run status back into the workbook |
@@ -652,7 +735,8 @@ returns real jobs through it.
 | Path | Responsibility |
 |------|----------------|
 | `config/settings.yaml` | All tunables (freshness, roles, DFW cities, HTTP, Playwright, concurrency) |
-| `config/companies.xlsx` | Input workbook (Company / ATS URL / Live Jobs Page) |
+| `config/companies.xlsx` | Input workbook (Company / ATS URL / Live Jobs Page) — 180 companies, all names unique |
+| `.env.example` | Tracked template for the email variables; carries no values. Copy to `.env` (gitignored) |
 | `tools/canary.py` | ~2-min smoke test: one company per collection path (run before a full run) |
 | `tools/find_ats_urls.py` | Crawl + verify missing ATS URLs, write suggestions into the workbook |
 | `tools/probe_site.py` | Diagnostic: dump what a single page actually contains |
@@ -661,16 +745,21 @@ returns real jobs through it.
 
 ## Before trusting a full run
 
-A full run takes ~15 minutes. `tools/canary.py` checks one company per
-collection path in about two minutes and exits non-zero if any path returns
-zero jobs — it catches the case where a whole provider (or the browser path)
-breaks silently:
+A full run over all 180 companies takes **~34 minutes** (measured: 131,730 jobs
+collected, 120 direct-API and 60 browser companies, 3 Playwright workers).
+`tools/canary.py` checks one company per collection path in about two minutes
+and exits non-zero if any path returns zero jobs — it catches the case where a
+whole provider (or the browser path) breaks silently:
 
 ```bash
 python tools/canary.py
 ```
 
-Unit tests: `python -m pytest tests/ -v`
+Unit tests: `python -m pytest tests/ -q` (~4 minutes).
+
+After a run, `output/last_run.json` is the fastest way to see what happened:
+the `status_counts` block, and `removal_sync_allowed` per company. Re-run just
+the ones that did not finish with `python main.py --retry-failed`.
 
 Test-only dependencies live in `requirements-dev.txt` (which includes
 `requirements.txt`), so a deployment does not install a test runner it will
@@ -717,7 +806,8 @@ describes. When you change the code, update the matching section:
 | An entry-point script or tool in `tools/` | [Entry points & tools](#entry-points--tools) |
 | Any module's purpose, or add/remove a file | [Codebase map](#codebase-map) |
 | A setting in `config/settings.yaml` | [Configuration](#configuration) |
-| Output columns or filtering behaviour | [Output](#output) |
+| Output columns, `last_run.json`, or filtering behaviour | [Output](#output) |
+| Email configuration or an env variable | [Notifications](#notifications) table + `.env.example` |
 | A design decision worth recording | add/refresh a doc under [`docs/superpowers/`](docs/superpowers/README.md) |
 
 If a change makes a section wrong, fixing the doc is part of finishing the

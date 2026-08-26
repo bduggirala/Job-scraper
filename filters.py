@@ -48,6 +48,39 @@ _REMOTE_TOKENS = (
     "us-remote", "remote - us", "nationwide", "distributed",
 )
 
+#: Street-type words. A remote token directly followed by one of these is part
+#: of an address, not a statement about how the job is worked: "400 W.
+#: Nationwide Blvd" is Nationwide Boulevard in Columbus, Ohio, and it made an
+#: Accenture posting listing Nashville, Dallas, Atlanta and Columbus classify as
+#: ``remote_non_us``. Nobody writes "Remote Boulevard" to mean remote.
+_STREET_SUFFIX = (
+    r"(?:blvd|boulevard|st|street|ave|avenue|rd|road|dr|drive|way|ln|lane|"
+    r"pkwy|parkway|ct|court|pl|place|plaza|cir|circle|sq|square|ter|terrace|"
+    r"hwy|highway|ste|suite|bldg|building|tower|center|centre|campus)"
+)
+_ADDRESS_TOKEN_RES = tuple(
+    (token, re.compile(rf"\b{re.escape(token)}\b[\s,.]*{_STREET_SUFFIX}\b", re.I))
+    for token in _REMOTE_TOKENS
+)
+
+
+def _remote_tokens_present(haystack: str) -> bool:
+    """Whether the text carries a genuine remote signal.
+
+    A token that only ever appears as part of a street name in this text does
+    not count; a second, real occurrence elsewhere still does.
+    """
+    for token in _REMOTE_TOKENS:
+        if token not in haystack:
+            continue
+        pattern = dict(_ADDRESS_TOKEN_RES)[token]
+        # Every occurrence of this token is inside an address, so it says
+        # nothing about the working arrangement.
+        if len(pattern.findall(haystack)) >= haystack.count(token):
+            continue
+        return True
+    return False
+
 # --- workplace / remote scope ---------------------------------------------
 # "Remote" is not one thing, and collapsing it to a boolean let the wrong jobs
 # through: "Remote - must reside in New York" satisfied both a remote token and
@@ -138,7 +171,7 @@ def classify_remote_scope(record: dict[str, Any]) -> str:
         return WORKPLACE_HYBRID
 
     explicit = record.get("remote")
-    has_token = any(token in haystack for token in _REMOTE_TOKENS)
+    has_token = _remote_tokens_present(haystack)
     if explicit is not True and not has_token:
         return WORKPLACE_ONSITE
 

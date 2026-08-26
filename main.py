@@ -20,7 +20,13 @@ import time
 
 from ats.router import METHOD_API, METHOD_BROWSER
 from logger import get_logger, setup_logging
-from pipeline import build_plans, filter_companies_by_name, load_companies, run
+from pipeline import (
+    build_plans,
+    filter_companies_by_name,
+    load_companies,
+    retryable_companies,
+    run,
+)
 from settings import load_settings
 
 log = get_logger("main")
@@ -56,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--test-provider", metavar="PROVIDER",
         help="Scrape only companies routed to PROVIDER (e.g. workday, greenhouse)",
+    )
+    parser.add_argument(
+        "--retry-failed", action="store_true",
+        help="Re-run only the companies the last run recorded as failed or partial "
+             "(from output/last_run.json). Blocked companies are skipped.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N companies")
     parser.add_argument(
@@ -136,14 +147,31 @@ def cmd_dry_run(args: argparse.Namespace, settings) -> int:
 def cmd_scrape(args: argparse.Namespace, settings) -> int:
     """Run the full pipeline."""
     diagnostic = bool(args.test_company or args.test_provider)
-    # A partial run must not overwrite a full run's outputs.
-    partial = diagnostic or bool(args.limit)
-    prefix = "test_" if partial else ""
+
+    names = None
+    if args.retry_failed:
+        report = settings.resolve_path("output.directory", "output") / "last_run.json"
+        names = retryable_companies(report)
+        if not names:
+            print(f"\nNothing to retry: no failed or partial company in {report}")
+            return 0
+        print(f"\nRetrying {len(names)} company(ies) from {report}:")
+        for name in names:
+            print(f"  {name}")
+
+    # A partial run must not overwrite a full run's outputs. A retry is one:
+    # it knows nothing about the companies that already succeeded, so its
+    # spreadsheet is a slice, not a replacement.
+    partial = diagnostic or bool(args.limit) or bool(args.retry_failed)
+    prefix = "retry_" if args.retry_failed and not diagnostic else (
+        "test_" if partial else ""
+    )
 
     summary, jobs, results = run(
         settings,
         excel_path=args.excel,
         company_filter=args.test_company,
+        company_names=names,
         provider_filter=args.test_provider,
         limit=args.limit,
         resolve_pages=not args.no_resolve,
@@ -193,6 +221,8 @@ def cmd_scrape(args: argparse.Namespace, settings) -> int:
     if prefix:
         print(f"\nPartial run - outputs written to: {out_dir} (prefixed '{prefix}')")
         print("Full-run outputs were left untouched.")
+        if args.retry_failed:
+            print("Re-run the full workbook to refresh output/company_jobs.xlsx.")
     else:
         print(f"\nOutputs written to: {out_dir}")
     return 0

@@ -53,14 +53,28 @@ def test_paylocity_walks_past_the_first_page(monkeypatch):
     assert [c["pageNumber"] for c in calls][:3] == [1, 2, 3]
 
 
-def test_paylocity_stops_on_a_short_page(monkeypatch):
+def test_paylocity_confirms_a_short_first_page_instead_of_assuming_it(monkeypatch):
+    """Replaces an assertion that a short first page means there is no page 2.
+
+    That reading and the one in ``test_taleo_confirms_the_end_rather_than_
+    assuming_it`` below are opposite policies for the same ambiguity, and only
+    one of them can be right. A first page smaller than the size we asked for
+    means either "that is every job" or "this provider caps its page size below
+    our request" - and the second is common enough to have been measured: six
+    live iCIMS tenants serve 13, 20, 20, 21, 50 and 50 rows a page against a
+    collector assuming 20.
+
+    Guessing wrong in the safe direction costs one request. Guessing wrong in
+    the other direction reports a truncated scrape as complete, which is what
+    lets removal sync delete postings that were never missing.
+    """
     collector, calls = _paylocity(monkeypatch, total=150)
 
     result = collector.collect()
 
     assert len(result.jobs) == 150
-    assert len(calls) == 1, "a short first page means there is no page 2"
     assert result.complete is True
+    assert len(calls) == 2, "confirming the end should cost one request, not a walk"
 
 
 def test_paylocity_marks_a_failed_later_page_incomplete(monkeypatch):

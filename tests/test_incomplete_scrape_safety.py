@@ -152,6 +152,47 @@ def test_pipeline_does_not_sync_a_company_whose_scrape_was_incomplete(tmp_path, 
         assert db.company_ids("Acme") == {"keep-1", "keep-2", "keep-3"}
 
 
+def test_a_timed_out_browser_company_never_removes_its_stored_jobs(tmp_path):
+    """Pins the guarantee for the deferred Slalom defect.
+
+    A Playwright company can finish its traversal and still be recorded as a
+    Timeout, because the browser-context teardown under three-worker
+    concurrency has been observed taking minutes after the rows were already
+    logged. That loses the run's work for that company - a real bug, deferred
+    here because a safe fix runs into Playwright's thread affinity.
+
+    What must *not* also happen is the timeout being read as "this employer
+    closed everything". The pipeline sees ``success=False`` and skips the
+    company entirely, so the stored jobs are untouched and no miss counter
+    advances. This test exists so that stays true while the underlying defect
+    waits.
+    """
+    import pipeline
+
+    with JobDatabase(tmp_path / "jobs.db") as db:
+        _seed(db, "Slalom", ["slalom-1", "slalom-2", "slalom-3"])
+
+    timed_out = router.CompanyResult(
+        company="Slalom", jobs=[], plan=_plan("unknown"), success=False,
+        error_type="Timeout",
+        error_message="Exceeded the 480s per-company limit",
+    )
+
+    with JobDatabase(tmp_path / "jobs.db") as db:
+        for _ in range(5):
+            stats = pipeline.sync_completed_companies([timed_out], db)
+            assert stats["removed"] == 0
+
+        assert db.company_ids("Slalom") == {"slalom-1", "slalom-2", "slalom-3"}, (
+            "repeated timeouts aged out jobs that were never confirmed absent"
+        )
+
+    # ...and it is surfaced as retryable rather than quietly absorbed, so the
+    # lost work can be recovered with `--retry-failed`.
+    assert pipeline.company_status(timed_out) == pipeline.STATUS_FAILED
+    assert pipeline.STATUS_FAILED in pipeline.RETRYABLE_STATUSES
+
+
 def test_pipeline_syncs_a_company_whose_scrape_was_complete(tmp_path, monkeypatch):
     import pipeline
 

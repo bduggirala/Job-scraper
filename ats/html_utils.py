@@ -31,6 +31,44 @@ _JOB_HREF_HINTS = (
 )
 
 
+#: Classes that mark an element as present for assistive technology only. Such
+#: an element names a field ("Job Posting Title", "Job Locations"); it is never
+#: the field's value. Reading it as text prefixed every iCIMS title with its own
+#: column header - "Job Posting Title Senior Manager, Service Design".
+_SR_ONLY_CLASS_RE = re.compile(
+    r"\b(sr-only|sronly|visually-hidden|visuallyhidden|screen-reader-text|"
+    r"screenreader|a11y-hidden|field-label|hidden-label|assistive-text)\b", re.I
+)
+
+#: A screen-reader label whose text names a location field. Used to find the
+#: value sitting next to it, since such markup carries the field name in the
+#: label's *text* rather than in any class an element search could match.
+_LOCATION_LABEL_RE = re.compile(r"\b(job\s+)?locations?\b|\bcity\b|\bwork\s+site\b", re.I)
+
+
+def _is_sr_only(node: Any) -> bool:
+    classes = node.get("class") if hasattr(node, "get") else None
+    if not classes:
+        return False
+    return bool(_SR_ONLY_CLASS_RE.search(" ".join(classes)))
+
+
+def visible_text(node: Any) -> str:
+    """``node``'s text with screen-reader-only labels left out.
+
+    ``get_text()`` returns everything, including the ``sr-only`` spans that
+    label a field for assistive technology. Those are field *names*, so they
+    belong in neither a title nor a location.
+    """
+    if node is None:
+        return ""
+    parts = [
+        text for text in node.find_all(string=True)
+        if not any(_is_sr_only(parent) for parent in text.parents)
+    ]
+    return clean_text(" ".join(parts).strip()) or ""
+
+
 def make_soup(html_text: str) -> BeautifulSoup:
     """Parse HTML with lxml, degrading to the stdlib parser if unavailable."""
     try:
@@ -79,7 +117,7 @@ def extract_job_links(
         href = anchor.get("href")
         if not href:
             continue
-        title = clean_text(anchor.get_text(" ", strip=True))
+        title = visible_text(anchor)
         if not selector and not looks_like_job_link(href, title):
             continue
         if not title:
@@ -114,10 +152,34 @@ def _nearby_location(anchor: Any) -> str | None:
             attrs={"class": location_pattern}
         ) or container.find(attrs={"data-ph-at-id": location_pattern})
         if node:
-            text = clean_text(node.get_text(" ", strip=True))
+            text = visible_text(node)
             if text:
                 return text
+        labelled = _location_beside_its_label(container)
+        if labelled:
+            return labelled
         container = container.parent
+    return None
+
+
+def _location_beside_its_label(container: Any) -> str | None:
+    """A location sitting next to a screen-reader label that names it.
+
+    The class-based search above cannot see this markup: the element holding
+    "US-TX-Westlake" carries no location-ish class, and the only thing
+    identifying it is a sibling ``<span class="sr-only field-label">Job
+    Locations</span>``. Every iCIMS tenant renders its job cards this way, and
+    a blank location fails the DFW match - so 309 of Charles Schwab's 309
+    postings were dropped, all of them in Westlake, Texas.
+    """
+    for label in container.find_all(_is_sr_only):
+        if not _LOCATION_LABEL_RE.search(label.get_text(" ", strip=True)):
+            continue
+        # The value is whatever the label's own container says once the label
+        # itself is removed from consideration.
+        text = visible_text(label.parent)
+        if text:
+            return text
     return None
 
 

@@ -126,16 +126,6 @@ class ATSCollector:
 
     # -- helpers ----------------------------------------------------------
     @property
-    def max_pages(self) -> int:
-        """Legacy page budget, still used by collectors not yet converted.
-
-        Prefer :attr:`max_jobs`: a shared *page* count means wildly different
-        job ceilings per collector (25 pages is 250 jobs on Phenom and 5,000 on
-        Oracle), which is what silently truncated 23 companies.
-        """
-        return int(self.settings.get("requests.max_pages_per_company", 25))
-
-    @property
     def max_jobs(self) -> int:
         """How many jobs this collector may collect for one company.
 

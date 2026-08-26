@@ -20,8 +20,15 @@ import http_client
 from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
 from ats.detector import WORKDAY
 from ats.pagination import PageRequest, paginate
+from normalize import join_location
 
 PAGE_SIZE = 20
+
+#: A ``bulletFields`` entry that is a requisition id rather than a location:
+#: an optional short letter prefix, then digits and separators only. Observed
+#: live as R999094, 26031220, JR0148744, 1645097, R00352812, JREQ201133.
+#: A location token ("Heredia", "New South Wales") never takes this shape.
+_REQ_ID_RE = re.compile(r"^[A-Za-z]{0,6}[-_]?\d[\d\-_]*$")
 
 
 class WorkdayCollector(ATSCollector):
@@ -46,6 +53,47 @@ class WorkdayCollector(ATSCollector):
                 locale = segment
                 break
         return f"https://{self.host}/{locale}/{self.site}"
+
+    @staticmethod
+    def _location_from_bullets(posting: dict[str, Any]) -> str | None:
+        """Location from ``bulletFields``, for tenants sending no locationsText.
+
+        Some tenants omit ``locationsText`` and ``locations`` entirely and put
+        the location in ``bulletFields`` alongside the requisition id. Reading
+        only the first two fields left every posting from those employers with
+        a blank location, which the DFW filter drops - so no job from Accenture
+        (1,130 postings) or Thomson Reuters (468) could match, wherever it was.
+
+        The split is clean: a tenant that sends ``locationsText`` puts *only*
+        the requisition id in ``bulletFields``, so this can only fire where
+        there is nothing to lose. The id to discard is the token
+        ``externalPath`` already ends with (``..._R00352812``), which makes the
+        exclusion exact rather than a guess at what a job id looks like; the
+        digits-dominated check behind it covers a tenant whose path does not
+        carry one.
+        """
+        bullets = posting.get("bulletFields")
+        if not isinstance(bullets, list):
+            return None
+
+        path = str(posting.get("externalPath") or "")
+        req_id = path.rsplit("_", 1)[-1] if "_" in path else ""
+
+        parts = []
+        for bullet in bullets:
+            text = str(bullet or "").strip()
+            if not text:
+                continue
+            # "R999094" against an externalPath ending "_R999094-2", and the
+            # reverse, are the same requisition.
+            if req_id and (text == req_id or req_id.startswith(text)
+                           or text.startswith(req_id)):
+                continue
+            if _REQ_ID_RE.match(text):
+                continue
+            parts.append(text)
+
+        return join_location(*parts) if parts else None
 
     def _job_url(self, external_path: str | None) -> str | None:
         if not external_path:
@@ -110,7 +158,8 @@ class WorkdayCollector(ATSCollector):
         records = [
             self.record(
                 title=posting.get("title"),
-                location=posting.get("locationsText") or posting.get("locations"),
+                location=(posting.get("locationsText") or posting.get("locations")
+                          or self._location_from_bullets(posting)),
                 date_posted=self._extract_posted(posting),
                 job_url=self._job_url(posting.get("externalPath")),
                 employment_type=posting.get("timeType"),

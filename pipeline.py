@@ -59,7 +59,147 @@ OUTPUT_FIELDS = list(RECORD_FIELDS) + [
     # email digest but never the spreadsheet, so the file most people actually
     # open could not say which rows had moved since the last run.
     "change_status",
+    # Which run produced this file. A company_jobs.xlsx that has been copied
+    # somewhere else identified itself by filename alone, so a reader had no
+    # way to tell yesterday's export from last month's.
+    "run_id",
 ]
+
+#: Per-company outcomes. Deliberately five rather than success/failure, because
+#: they call for different responses: ``failed`` needs a fix, ``blocked`` needs
+#: a different route in (never a workaround), ``partial`` means the rows are
+#: real but the coverage is not, and ``no_jobs`` means the site was read
+#: correctly and simply is not hiring.
+STATUS_SUCCESS = "success"
+STATUS_PARTIAL = "partial"
+STATUS_FAILED = "failed"
+STATUS_BLOCKED = "blocked"
+STATUS_NO_JOBS = "no_jobs"
+
+
+def company_status(result: CompanyResult) -> str:
+    """Classify one company's outcome."""
+    if not result.success:
+        return STATUS_BLOCKED if result.error_type == "AccessDenied" else STATUS_FAILED
+    if not result.jobs:
+        return STATUS_NO_JOBS
+    return STATUS_SUCCESS if result.complete else STATUS_PARTIAL
+
+
+def new_run_id(moment: datetime | None = None) -> str:
+    """A sortable identifier for one run, e.g. ``20260826T101500Z``."""
+    return (moment or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+
+
+def write_run_report(
+    summary: "RunSummary",
+    results: list[CompanyResult],
+    out_dir: Path,
+    run_id: str,
+    prefix: str = "",
+) -> Path:
+    """Write ``last_run.json``: what happened to every company, and why.
+
+    ``scraper_failures.csv`` covers failures only, so the successes - which
+    provider answered, how it was extracted, how long it took, whether it
+    finished - existed solely as log lines. The field that most needed
+    surfacing is ``removal_sync_allowed``: it is the difference between "this
+    company's removals are real" and "removals were skipped here", and nothing
+    reported it.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    method_counts: dict[str, int] = {}
+
+    for result in results:
+        status = company_status(result)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        method = result.plan.method
+        method_counts[method] = method_counts.get(method, 0) + 1
+        rows.append({
+            "company": result.company,
+            "url": result.plan.url,
+            "provider": result.plan.provider,
+            "method": method,
+            "source_column": result.plan.source,
+            "resolved_via_page": bool(result.plan.resolved_via_page),
+            "fell_back_to_browser": bool(result.fell_back),
+            "jobs": len(result.jobs),
+            "reported_total": result.reported_total,
+            "complete": bool(result.complete),
+            "stop_reason": result.stop_reason,
+            "status": status,
+            "error_type": result.error_type,
+            "error_message": (result.error_message or "")[:300] or None,
+            "duration_seconds": (
+                round(result.duration_seconds, 2)
+                if result.duration_seconds is not None else None
+            ),
+            # Mirrors sync_completed_companies exactly: success AND jobs AND
+            # complete. Restating the rule here would let the two drift.
+            "removal_sync_allowed": bool(
+                result.success and result.jobs and result.complete
+            ),
+            "discovered_ats_url": result.discovered_ats_url,
+            "discovered_provider": result.discovered_provider,
+        })
+
+    report = {
+        "run_id": run_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "companies_attempted": len(results),
+        "status_counts": status_counts,
+        "method_counts": method_counts,
+        "totals": {
+            "jobs_collected": summary.jobs_collected,
+            "matching_jobs": summary.location_matches,
+            "new_jobs": summary.new_jobs,
+            "changed_jobs": summary.changed_jobs,
+            "removed_jobs": summary.jobs_removed,
+            "duplicates_removed": summary.duplicates_removed,
+            "incomplete_companies": summary.incomplete_companies,
+        },
+        "companies": rows,
+    }
+
+    path = out_dir / f"{prefix}last_run.json"
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, ensure_ascii=False, default=str)
+    return path
+
+
+#: Statuses worth a second attempt. ``blocked`` is deliberately absent: the
+#: site issued a challenge or an explicit denial, and asking again is not a fix.
+RETRYABLE_STATUSES = (STATUS_FAILED, STATUS_PARTIAL)
+
+
+def retryable_companies(report_path: Path) -> list[str]:
+    """Companies from a previous run's ``last_run.json`` worth re-running.
+
+    Raises rather than returning an empty list when the report is missing or
+    unreadable - "nothing failed" and "there is no report" are opposite facts
+    and must not look alike.
+    """
+    report_path = Path(report_path)
+    if not report_path.exists():
+        raise FileNotFoundError(
+            f"No run report at {report_path}. Run the scraper once first."
+        )
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{report_path} is not readable JSON: {exc}") from exc
+
+    names: list[str] = []
+    for row in report.get("companies") or []:
+        name = str(row.get("company") or "").strip()
+        if name and row.get("status") in RETRYABLE_STATUSES and name not in names:
+            names.append(name)
+    return names
+
 
 CHANGE_NEW = "new"
 CHANGE_CHANGED = "changed"
@@ -94,9 +234,17 @@ FAILURE_FIELDS = [
 class RunSummary:
     """Counts reported at the end of a run."""
 
+    #: Sortable identifier for this run, stamped onto every exported row.
+    run_id: str = ""
     companies_scanned: int = 0
     companies_successful: int = 0
     companies_failed: int = 0
+    #: A scrape that worked but stopped short of the provider's full job list.
+    #: Distinct from failed: the rows are real, the coverage is not.
+    companies_partial: int = 0
+    #: Turned away by a bot challenge or an explicit denial. Distinct from
+    #: failed because it needs a different route in, never a workaround.
+    companies_blocked: int = 0
     jobs_collected: int = 0
     target_role_jobs: int = 0
     location_matches: int = 0
@@ -119,15 +267,40 @@ class RunSummary:
     #: ``(company, collected, reported_total, stop_reason)`` per truncated company.
     truncated: list[tuple[str, int, int | None, str | None]] = field(default_factory=list)
 
+    def as_digest_counts(self) -> dict[str, Any]:
+        """The run's numbers as the digest wants them: four outcomes that do
+        not overlap.
+
+        ``companies_successful`` counts every company that was reached, which
+        includes the truncated ones; ``companies_failed`` includes the blocked
+        ones. Both are the right shape for the console summary and the wrong
+        shape for a reader deciding whether to trust this digest, so the
+        overlaps are subtracted out here rather than in the renderer.
+        """
+        return {
+            "run_id": self.run_id,
+            "companies_scanned": self.companies_scanned,
+            "companies_successful": self.companies_successful - self.companies_partial,
+            "companies_partial": self.companies_partial,
+            "companies_failed": self.companies_failed - self.companies_blocked,
+            "companies_blocked": self.companies_blocked,
+            "jobs_collected": self.jobs_collected,
+            "new_jobs": self.new_jobs,
+            "changed_jobs": self.changed_jobs,
+        }
+
     def render(self) -> str:
         lines = [
             "",
             "=" * 58,
             "  COMPANY ATS SCRAPER - RUN SUMMARY",
             "=" * 58,
+            f"Run id:                 {self.run_id or '-'}",
             f"Companies scanned:      {self.companies_scanned:,}",
             f"Companies successful:   {self.companies_successful:,}",
+            f"  of which partial:     {self.companies_partial:,}",
             f"Companies failed:       {self.companies_failed:,}",
+            f"  of which blocked:     {self.companies_blocked:,}",
             "",
             f"Jobs collected:         {self.jobs_collected:,}",
             f"Target data jobs:       {self.target_role_jobs:,}",
@@ -224,6 +397,20 @@ def filter_companies_by_name(companies: pd.DataFrame, needle: str) -> pd.DataFra
     of literal text silently returns zero matches for names like those.
     """
     return companies[companies["company"].str.lower().str.contains(needle.strip().lower(), regex=False, na=False)]
+
+
+def select_companies_by_name(
+    companies: pd.DataFrame, names: Iterable[str]
+) -> pd.DataFrame:
+    """Rows whose company name is exactly one of ``names`` (case-insensitive).
+
+    Distinct from :func:`filter_companies_by_name`, which is a substring search
+    for interactive use. A retry works from names the pipeline itself wrote, so
+    an exact match is both possible and safer - "Oracle" as a substring would
+    also pull in any company whose name contains it.
+    """
+    wanted = {str(name).strip().lower() for name in names if str(name).strip()}
+    return companies[companies["company"].str.strip().str.lower().isin(wanted)]
 
 
 def build_plans(
@@ -335,7 +522,11 @@ def _run_pool(
     def _tracked(plan: RoutePlan) -> CompanyResult:
         with started_lock:
             started[plan.company] = time.monotonic()
-        return runner(plan)
+        begin = time.monotonic()
+        result = runner(plan)
+        if result.duration_seconds is None:
+            result.duration_seconds = time.monotonic() - begin
+        return result
 
     futures = {pool.submit(_tracked, plan): plan for plan in plans}
     pending = set(futures)
@@ -509,14 +700,21 @@ def write_outputs(
     *,
     raw_jobs: list[dict[str, Any]] | None = None,
     prefix: str = "",
+    run_id: str | None = None,
 ) -> dict[str, Path]:
     """Write company_jobs.csv / .json and scraper_failures.csv.
 
     ``prefix`` namespaces the filenames so a partial run (``--test-company``,
     ``--test-provider``, ``--limit``) cannot overwrite the outputs of a full
     run with its much smaller result set.
+
+    ``run_id`` is stamped onto every row so a copy of the spreadsheet still
+    says which run produced it.
     """
     cfg = settings or load_settings()
+    if run_id:
+        for job in jobs:
+            job["run_id"] = run_id
     out_dir = cfg.resolve_path("output.directory", "output")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -597,6 +795,36 @@ def unannounced_matching_jobs(
     return database.filter_unnotified(final_jobs, kind="new")
 
 
+#: Output kinds that may be mailed, best first. The spreadsheet is what a
+#: person opens; the CSV is the machine-readable export and stands in only when
+#: the workbook could not be written.
+_ATTACHMENT_PREFERENCE = ("xlsx", "csv")
+
+
+def select_attachments(
+    paths: dict[str, Path], attach: bool = True
+) -> list[Path]:
+    """The one output file to attach to the digest, if any.
+
+    Previously ``[p for k, p in paths.items() if k == "xlsx"]``, which mails a
+    digest with no spreadsheet at all when the workbook could not be written -
+    the case where the attachment matters most, since the reader then has only
+    the links in the email body. The CSV carries the same rows, so it stands in.
+
+    A path is only offered once it exists on disk: ``write_outputs`` records
+    what it intended to write, and attaching a name whose file is missing costs
+    the reader a warning instead of a file.
+    """
+    if not attach:
+        return []
+    for kind in _ATTACHMENT_PREFERENCE:
+        path = paths.get(kind)
+        if path and Path(path).exists():
+            return [Path(path)]
+    log.warning("No output file was available to attach to the digest")
+    return []
+
+
 def _prepare_notification(
     database: JobDatabase,
     summary: "RunSummary",
@@ -651,11 +879,7 @@ def send_notifications(
         )
         return False
 
-    digest = build_digest(new_jobs, changed_jobs, {
-        "companies_scanned": summary.companies_scanned,
-        "jobs_collected": summary.jobs_collected,
-        "incomplete_companies": summary.incomplete_companies,
-    })
+    digest = build_digest(new_jobs, changed_jobs, summary.as_digest_counts())
 
     if not send_digest(config, digest, attachments):
         return False
@@ -748,6 +972,7 @@ def run(
     *,
     excel_path: Path | str | None = None,
     company_filter: str | None = None,
+    company_names: Iterable[str] | None = None,
     provider_filter: str | None = None,
     limit: int | None = None,
     resolve_pages: bool = True,
@@ -761,12 +986,23 @@ def run(
     Returns ``(summary, final_jobs, company_results)``.
     """
     cfg = settings or load_settings()
+    run_id = new_run_id()
+    log.info("Run %s starting", run_id)
     companies = load_companies(cfg, excel_path)
 
     if company_filter:
         companies = filter_companies_by_name(companies, company_filter)
         if companies.empty:
             raise ValueError(f"No company in the workbook matches {company_filter!r}")
+
+    if company_names is not None:
+        wanted = list(company_names)
+        companies = select_companies_by_name(companies, wanted)
+        if companies.empty:
+            raise ValueError(
+                f"None of the {len(wanted)} named company(ies) are in the workbook"
+            )
+        log.info("Retrying %s of %s named company(ies)", len(companies), len(wanted))
 
     if limit:
         companies = companies.head(limit)
@@ -789,6 +1025,12 @@ def run(
     all_jobs: list[dict[str, Any]] = []
 
     for result in results:
+        status = company_status(result)
+        if status == STATUS_PARTIAL:
+            summary.companies_partial += 1
+        elif status == STATUS_BLOCKED:
+            summary.companies_blocked += 1
+
         if result.success:
             summary.companies_successful += 1
         else:
@@ -880,7 +1122,15 @@ def run(
     paths = write_outputs(
         final_jobs, results, cfg,
         raw_jobs=all_jobs if save_raw else None, prefix=output_prefix,
+        run_id=run_id,
     )
+    # Written after the job files so a reader who sees last_run.json can trust
+    # that the spreadsheet it describes is already on disk.
+    paths["report"] = write_run_report(
+        summary, results, cfg.resolve_path("output.directory", "output"),
+        run_id, prefix=output_prefix,
+    )
+    summary.run_id = run_id
     for label, path in paths.items():
         log.info("Wrote %s -> %s", label, path)
 
@@ -892,7 +1142,7 @@ def run(
         # and never read - the workbook was attached unconditionally, so
         # turning it off had no effect.
         attach = bool(cfg.get("notifications.email.attach_spreadsheet", True))
-        attachments = [p for k, p in paths.items() if k == "xlsx"] if attach else []
+        attachments = select_attachments(paths, attach)
         send_notifications(notify_payload, summary, db_path, cfg, attachments)
 
     # Search-fallback ATS discovery, written back so the next run routes these

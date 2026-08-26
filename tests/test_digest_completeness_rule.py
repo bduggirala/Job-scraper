@@ -19,7 +19,12 @@ unknown shape.
 
 import pytest
 
-from ats.base import STOP_BUDGET, STOP_PAGE_FAILED
+from ats.base import (
+    STOP_BUDGET,
+    STOP_PAGE_CEILING,
+    STOP_PAGE_FAILED,
+    STOP_SHORT_OF_TOTAL,
+)
 from notify import should_send
 
 
@@ -49,6 +54,50 @@ def test_a_failed_page_anywhere_wins_over_a_budget_truncation():
     assert should_send(
         new_jobs=[_job()], changed_jobs=[], run_complete=False,
         stop_reasons={STOP_BUDGET, STOP_PAGE_FAILED},
+    ) is False
+
+
+def test_the_page_ceiling_is_the_same_kind_of_hole_as_the_job_budget():
+    """Found by running the whole workbook: the digest could never send.
+
+    ``page_ceiling`` was added after this rule was written and never added to
+    it, so any run touching it was treated as untrustworthy. CVS Health and
+    Signify Health each list 19,254 postings against a provider serving ten per
+    request, so both trip the 500-page ceiling on *every* run and always will -
+    which silenced the digest permanently, the exact outcome the budget carve-
+    out above exists to prevent. A real run confirmed it:
+
+        Run incomplete for reasons that make 'new' untrustworthy
+        (budget_exhausted, page_ceiling, short_of_reported_total);
+        suppressing the digest
+
+    Both are ceilings *we* impose on a newest-first walk. The gap is the oldest
+    postings, and nothing inside a 7-day freshness window sits behind it.
+    """
+    assert should_send(
+        new_jobs=[_job()], changed_jobs=[], run_complete=False,
+        stop_reasons={STOP_PAGE_CEILING},
+    ) is True
+
+
+def test_the_two_self_imposed_ceilings_together_still_send():
+    assert should_send(
+        new_jobs=[_job()], changed_jobs=[], run_complete=False,
+        stop_reasons={STOP_BUDGET, STOP_PAGE_CEILING},
+    ) is True
+
+
+def test_a_provider_contradicting_its_own_total_still_silences_the_digest():
+    """Deliberately *not* tolerated, unlike the two ceilings above.
+
+    ``short_of_reported_total`` is the provider saying it has 679 postings and
+    then serving 140. Nothing tells us which 539 are missing or whether they
+    are old, so the hole has unknown shape - the same reason a failed page is
+    fatal here.
+    """
+    assert should_send(
+        new_jobs=[_job()], changed_jobs=[], run_complete=False,
+        stop_reasons={STOP_SHORT_OF_TOTAL},
     ) is False
 
 

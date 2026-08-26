@@ -9,13 +9,17 @@ merged; the code is the source of truth, these explain the decisions.
 The pipeline reads a company workbook, and for each company walks a ladder of
 increasingly expensive attempts, stopping at the first that yields jobs:
 (1) lexical ATS detection on the URL → direct API collector; (2) one HTTP GET
-to resolve a branded page to an embedded/redirected ATS; (3) a generic
-schema.org JobPosting (JSON-LD) tier; (4) a Playwright fallback that types a
-search keyword and hops through the careers site, and — if it sniffs out a real
-ATS behind a custom page — hands that back to the collector and writes the
-verified URL into the workbook. Everything after job collection
-(normalize → filter for role + location + freshness → dedupe → CSV/JSON) is a
-fixed tail. See `ats/router.py` for the ladder and `pipeline.py` for orchestration.
+to resolve a branded page to an embedded/redirected ATS; (3) three generic
+single-GET tiers in ascending cost — schema.org JobPosting (JSON-LD), a
+server-rendered job list, and a `__NEXT_DATA__`/Nuxt hydration payload;
+(4) a Playwright fallback that hops through the careers site and submits its
+search box once per configured term, and — if it sniffs out a real ATS behind a
+custom page — hands that back to the collector and writes the verified URL into
+the workbook. Every paginating collector walks its pages through the one shared
+controller in `ats/pagination.py`. Everything after job collection
+(normalize → filter for role + location + freshness → dedupe → SQLite →
+CSV/XLSX/JSON → optional email digest) is a fixed tail. See `ats/router.py` for
+the ladder and `pipeline.py` for orchestration.
 
 ## Documents
 

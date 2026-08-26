@@ -161,10 +161,27 @@ def paginate(
     total: int | None = None
     pages = 0
     index = 0
+    #: What the provider actually serves per page, learned from page one.
+    #: ``page_size`` is only this collector's *assumption*; see the short-page
+    #: check below for why the difference matters.
+    served_page_size = page_size
+    #: Rows the provider has handed over, counted before de-duplication. This
+    #: is the row cursor, and it must follow what was *received* rather than
+    #: what was requested - see the ``offset`` note below.
+    rows_seen = 0
 
     while len(items) < max_jobs and index < MAX_PAGES:
         request = PageRequest(
-            offset=index * page_size,
+            # Rows received so far, NOT ``index * page_size``. The latter is
+            # the offset we would have reached had the provider honoured our
+            # page size, and a provider that caps below it makes that stride
+            # step straight over the rows in between. Eightfold honours
+            # ``start`` and ignores ``num``, serving ten rows whatever is
+            # asked: requesting start=0,50,100,... collected ten of every
+            # fifty, losing 172 of Liberty Mutual's 222 postings and 539 of
+            # Fluor's 679. Stepping by rows received cannot skip; where it is
+            # wrong it re-fetches, which ``key`` de-duplication absorbs.
+            offset=rows_seen,
             page_index=index,
             page_number=index + 1,
             page_size=page_size,
@@ -197,6 +214,12 @@ def paginate(
         seen_pages.add(fingerprint)
 
         pages += 1
+        rows_seen += len(rows)
+        if pages == 1:
+            # Page one is the only honest measurement of this provider's page
+            # size. Trusting our own request instead is what made a tenant
+            # serving 15 rows a page look like a 15-job employer.
+            served_page_size = len(rows)
         fresh = rows
         if key is not None:
             fresh = []
@@ -214,13 +237,21 @@ def paginate(
         if total is not None and len(items) >= total:
             return PageWalk(items, True, pages, total, STOP_TOTAL_REACHED)
 
-        # A page shorter than requested usually means the provider is done -
+        # A page shorter than the provider's own page size means it is done -
         # but only trust that when nothing contradicts it. When a total was
         # reported and we are still short of it, a short page is ambiguous
         # (an over-reported total, or a provider quirk), so spend one more
         # request: the empty page that follows ends the walk honestly, while
         # stopping here would report 2 of 200 rows as a complete scrape.
-        if len(rows) < page_size and total is None:
+        #
+        # The yardstick is what page one *served*, not what we asked for.
+        # ``page_size`` is a per-collector constant guessing at a provider we
+        # do not control - six live iCIMS tenants serve 13, 20, 20, 21, 50 and
+        # 50 rows a page against a hard-coded 20 - so measuring against it
+        # ended the walk after page one for every provider that serves fewer
+        # rows than we assumed, and called the result complete. That is the
+        # one error removal sync cannot survive.
+        if len(rows) < max(1, served_page_size) and total is None:
             return _reconcile(items, total, pages, STOP_EXHAUSTED)
 
         index += 1

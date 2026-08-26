@@ -1,13 +1,18 @@
 """Email digest for newly discovered and changed jobs.
 
-Three rules shape this module, and they matter more than the formatting:
+Four rules shape this module, and they matter more than the formatting:
 
+* **Delivery is opt-in.** ``EMAIL_ENABLED`` gates every send and overrides the
+  config file in both directions. "May this run mail a human" is not a question
+  a file in git should answer on its own.
 * **Nothing is sent when there is nothing to say.** A channel that mails
   "0 new jobs" every run is one you stop opening, and then it is worse than no
   channel at all.
-* **Nothing is sent from an incomplete run.** A truncated scrape's "new" set is
-  untrustworthy for the same reason its "removed" set is - it never saw the
-  pages it did not reach.
+* **Nothing is sent from a run whose gaps have unknown shape.** A failed page
+  or a provider contradicting its own total leaves a hole we cannot describe,
+  so the "new" set is untrustworthy for the same reason the "removed" set is.
+  A ceiling *we* set on a newest-first walk is different: the gap is the oldest
+  postings, and suppressing on it would mean permanent silence.
 * **Credentials come from the environment only.** ``settings.yaml`` is checked
   into the repository; an SMTP password must never be able to land there.
 
@@ -20,6 +25,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 import smtplib
 import ssl
 from dataclasses import dataclass, field
@@ -41,7 +47,44 @@ ENV_PASSWORD = "SCRAPER_SMTP_PASSWORD"
 #: cannot mail a real recipient by accident.
 ENV_DRY_RUN = "SCRAPER_SMTP_DRY_RUN"
 
+#: The master switch. ``settings.yaml`` is checked into git, so "may this run
+#: mail a human" was previously answered by whatever the last commit said.
+#: Set explicitly, this wins in both directions.
+ENV_ENABLED = "EMAIL_ENABLED"
+#: Recipient(s), comma- or semicolon-separated. Overrides the config file so a
+#: run can be pointed at a different mailbox without editing tracked config.
+ENV_TO = "SCRAPER_EMAIL_TO"
+#: Envelope sender, when it differs from the authenticating account.
+ENV_FROM = "SCRAPER_SMTP_FROM"
+#: STARTTLS on a non-SSL port. Defaults on; set false only for a relay that
+#: does not offer it (a local MTA on 25, typically).
+ENV_USE_TLS = "SCRAPER_SMTP_USE_TLS"
+
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _env_flag(name: str) -> bool | None:
+    """A tri-state environment flag: True, False, or "not set"."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    text = raw.strip().lower()
+    if text in _TRUTHY:
+        return True
+    if text in _FALSY:
+        return False
+    log.warning("%s=%r is not a boolean; ignoring it", name, raw)
+    return None
+
+
+def _split_recipients(value: Any) -> list[str]:
+    """Recipients from a string (comma/semicolon separated) or a list."""
+    if isinstance(value, str):
+        parts: Iterable[Any] = re.split(r"[,;]", value)
+    else:
+        parts = value or []
+    return [str(part).strip() for part in parts if str(part).strip()]
 
 
 @dataclass
@@ -60,12 +103,16 @@ class EmailConfig:
     dry_run: bool = False
     #: Where a dry run writes its preview.
     preview_dir: Path | None = None
+    #: Issue STARTTLS on a non-SSL port. Port 465 is implicit SSL and ignores
+    #: this; every other port previously assumed STARTTLS with no way to say
+    #: otherwise.
+    use_tls: bool = True
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return (
             f"EmailConfig(host={self.host!r}, port={self.port}, "
             f"user={self.user!r}, to={self.to!r}, dry_run={self.dry_run}, "
-            f"password=<hidden>)"
+            f"use_tls={self.use_tls}, password=<hidden>)"
         )
 
 
@@ -84,15 +131,22 @@ def load_email_config(section: dict[str, Any] | None) -> EmailConfig | None:
     mailer must not fail a scrape that otherwise worked.
     """
     section = section or {}
-    if not section.get("enabled"):
+
+    # The environment wins in both directions: it is the only switch an
+    # operator has that does not mean editing a file tracked in git.
+    enabled = _env_flag(ENV_ENABLED)
+    if enabled is None:
+        enabled = bool(section.get("enabled"))
+    if not enabled:
+        log.info("Email delivery is disabled (%s unset or false); the run's "
+                 "outputs are still written to disk", ENV_ENABLED)
         return None
 
-    recipients = section.get("to")
-    if isinstance(recipients, str):
-        recipients = [recipients]
-    recipients = [str(r).strip() for r in (recipients or []) if str(r).strip()]
+    recipients = _split_recipients(os.environ.get(ENV_TO)) or \
+        _split_recipients(section.get("to"))
     if not recipients:
-        log.warning("Email notifications enabled but no recipient configured")
+        log.warning("Email notifications enabled but no recipient configured "
+                    "(set %s or notifications.email.to)", ENV_TO)
         return None
 
     host = os.environ.get(ENV_HOST) or section.get("host")
@@ -119,6 +173,10 @@ def load_email_config(section: dict[str, Any] | None) -> EmailConfig | None:
             )
             return None
 
+    use_tls = _env_flag(ENV_USE_TLS)
+    if use_tls is None:
+        use_tls = bool(section.get("use_tls", True))
+
     preview = section.get("preview_dir")
     return EmailConfig(
         host=str(host or ""),
@@ -126,9 +184,13 @@ def load_email_config(section: dict[str, Any] | None) -> EmailConfig | None:
         user=str(user or ""),
         password=str(password or ""),
         to=recipients,
-        sender=str(section.get("from") or user or "scraper@localhost"),
+        sender=str(
+            os.environ.get(ENV_FROM) or section.get("from") or user
+            or "scraper@localhost"
+        ),
         dry_run=dry_run,
         preview_dir=Path(preview) if preview else None,
+        use_tls=use_tls,
     )
 
 
@@ -146,13 +208,22 @@ def should_send(
     A **failed page** leaves a hole of unknown shape: what looks new may just
     be what we happened to reach this time, so the digest is suppressed.
 
-    A **budget truncation** leaves a hole we can describe. The walk is
-    newest-first, so what was missed is the oldest postings, and nothing inside
-    a 7-day freshness window sits behind it. Treating that as fatal would mean
-    permanent silence for any employer too large to collect in full - CVS
-    Health lists 19,246 postings against a provider serving ten per request,
-    so it is truncated on every run and always will be. One known limitation
+    A **ceiling we imposed ourselves** leaves a hole we can describe. Both the
+    job budget and the 500-page ceiling stop a newest-first walk, so what was
+    missed is the oldest postings, and nothing inside a 7-day freshness window
+    sits behind it. Treating that as fatal would mean permanent silence for any
+    employer too large to collect in full - CVS Health and Signify Health each
+    list 19,254 postings against a provider serving ten per request, so both
+    trip the page ceiling on every run and always will. One known limitation
     should not cost all alerting.
+
+    ``page_ceiling`` was added to the vocabulary after this rule was written and
+    was not added to it, which is how a full-workbook run came to log
+    "suppressing the digest" with those two companies as the only reason.
+
+    A provider **contradicting its own reported total** stays fatal, alongside
+    a failed page: it said 679 and served 140, and nothing says which 539 are
+    missing or whether they are old.
 
     ``stop_reasons`` omitted keeps the strict behaviour, so a caller that has
     not been taught the distinction stays cautious.
@@ -163,12 +234,16 @@ def should_send(
     if run_complete:
         return True
 
-    from ats.base import STOP_BUDGET
+    from ats.base import STOP_BUDGET, STOP_PAGE_CEILING
+
+    #: Truncations whose shape we know, because we chose where to stop.
+    describable = {STOP_BUDGET, STOP_PAGE_CEILING}
 
     reasons = stop_reasons or set()
-    if reasons and reasons <= {STOP_BUDGET}:
-        log.info("Run truncated by the job budget only (newest-first, so the "
-                 "gap is the oldest postings); sending the digest anyway")
+    if reasons and reasons <= describable:
+        log.info("Run truncated only by ceilings we set (%s); the walk is "
+                 "newest-first, so the gap is the oldest postings - sending "
+                 "the digest anyway", ", ".join(sorted(reasons)))
         return True
 
     log.info("Run incomplete for reasons that make 'new' untrustworthy (%s); "
@@ -258,25 +333,80 @@ def build_digest(
             )
         html_parts.append("</table>")
 
-    if summary:
-        scanned = summary.get("companies_scanned", "?")
-        collected = summary.get("jobs_collected", "?")
-        text_lines += [
-            "-" * 40,
-            f"{scanned} companies scanned, {collected} jobs collected.",
-        ]
-        if summary.get("incomplete_companies"):
-            text_lines.append(
-                f"{summary['incomplete_companies']} company(ies) stopped short - "
-                "their removals were not synced."
-            )
+    if not (new_jobs or changed_jobs):
+        # Reachable on a summary-only send. A body that is just a horizontal
+        # rule reads as a broken template rather than as good news.
+        text_lines += ["No new or changed matching jobs this run.", ""]
         html_parts.append(
-            f"<p style='color:#555;font-size:13px'>{scanned} companies scanned, "
-            f"{collected} jobs collected.</p>"
+            "<p>No new or changed matching jobs this run.</p>"
         )
+
+    if summary:
+        text_lines.append("-" * 40)
+        for label, value in _summary_rows(summary):
+            text_lines.append(f"{label:<26}{value}")
+        html_parts.append(_summary_html(summary))
 
     html_parts.append("</div>")
     return Digest(subject, "\n".join(text_lines), "".join(html_parts))
+
+
+def _count(summary: dict[str, Any], key: str) -> Any:
+    value = summary.get(key)
+    return f"{value:,}" if isinstance(value, int) else value
+
+
+def _summary_rows(summary: dict[str, Any]) -> list[tuple[str, Any]]:
+    """The run's own numbers, in the order a reader needs them.
+
+    Four company outcomes rather than two: 3 new jobs out of a clean sweep and
+    3 new jobs out of the 40 companies that did not time out are very different
+    runs, and the old two-number block could not tell them apart.
+    """
+    rows: list[tuple[str, Any]] = []
+    if summary.get("run_id"):
+        rows.append(("Run", summary["run_id"]))
+    rows.append(("Companies attempted", _count(summary, "companies_scanned")))
+    for label, key in (
+        ("Success", "companies_successful"),
+        ("Partial", "companies_partial"),
+        ("Failed", "companies_failed"),
+        ("Blocked", "companies_blocked"),
+    ):
+        if summary.get(key) is not None:
+            rows.append((f"  {label}", _count(summary, key)))
+    rows.append(("Jobs fetched", _count(summary, "jobs_collected")))
+    for label, key in (("New matching jobs", "new_jobs"),
+                       ("Changed jobs", "changed_jobs")):
+        if summary.get(key) is not None:
+            rows.append((label, _count(summary, key)))
+
+    # Partial companies are the ones whose absent jobs were never confirmed
+    # absent, so their removals were deliberately not applied. Saying so is the
+    # difference between a trustworthy removal count and a silent one.
+    stopped_short = summary.get("companies_partial")
+    if stopped_short is None:
+        stopped_short = summary.get("incomplete_companies")
+    if stopped_short:
+        rows.append((
+            "Note",
+            f"{stopped_short} company(ies) stopped short - "
+            f"their removals were not synced.",
+        ))
+    return rows
+
+
+def _summary_html(summary: dict[str, Any]) -> str:
+    cells = "".join(
+        f"<tr><td style='padding:2px 12px 2px 0;color:#555'>"
+        f"{html.escape(str(label).strip())}</td>"
+        f"<td style='padding:2px 0'>{html.escape(str(value))}</td></tr>"
+        for label, value in _summary_rows(summary)
+    )
+    return (
+        "<h3 style='margin-top:24px;font-size:14px;color:#333'>This run</h3>"
+        f"<table style='font-size:13px;color:#555'>{cells}</table>"
+    )
 
 
 def _write_preview(config: EmailConfig, digest: Digest, message: EmailMessage) -> bool:
@@ -347,7 +477,8 @@ def send_digest(
                 server.send_message(message)
         else:
             with smtplib.SMTP(config.host, config.port, timeout=60) as server:
-                server.starttls(context=context)
+                if config.use_tls:
+                    server.starttls(context=context)
                 server.login(config.user, config.password)
                 server.send_message(message)
     except Exception as exc:

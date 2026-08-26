@@ -152,6 +152,9 @@ class CompanyResult:
     #: verified discoveries, so a URL that merely *looks* like an ATS never
     #: lands in the workbook.
     discovery_verified: bool = False
+    #: Wall-clock seconds this company took, measured from when it actually
+    #: started rather than when it was queued. None when it was never started.
+    duration_seconds: float | None = None
 
 
 def _good_enough_rows() -> int:

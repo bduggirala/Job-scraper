@@ -88,6 +88,12 @@ def test_collect_stops_when_offset_reaches_hits(monkeypatch):
 def test_collect_paginates_until_offset_exceeds_hits(monkeypatch):
     # A larger hits count forces a second page; the second page repeats the
     # same URLs so dedupe keeps the row count at 2 while proving pagination ran.
+    #
+    # The second offset is 2, not RESULT_LIMIT: this fake serves two rows to a
+    # request for RESULT_LIMIT, which is a provider capping below the size it
+    # was asked for. Requesting RESULT_LIMIT next would step over rows 2..99 -
+    # the defect that lost 172 of Liberty Mutual's 222 Eightfold postings. The
+    # cursor follows rows actually received, so the next request is offset 2.
     payload = dict(SEARCH_PAYLOAD, hits=RESULT_LIMIT + 1)
     calls = {"offsets": []}
 
@@ -98,7 +104,7 @@ def test_collect_paginates_until_offset_exceeds_hits(monkeypatch):
     monkeypatch.setattr(AmazonJobsCollector, "_fetch_page", fake_fetch)
     jobs = _collector().collect().jobs
     assert len(jobs) == 2
-    assert calls["offsets"] == [0, RESULT_LIMIT]  # walked one extra page
+    assert calls["offsets"] == [0, 2]  # walked one extra page, from where it got to
 
 
 def test_collect_raises_on_empty_response(monkeypatch):

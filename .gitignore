@@ -10,6 +10,13 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# --- Secrets ---
+# SMTP credentials are read from the environment; .env is the usual way to load
+# them locally. .env.example is the tracked template and carries no values.
+.env
+.env.*
+!.env.example
+
 # --- Runtime state (regenerated every run; never useful in version control) ---
 data/
 logs/
@@ -23,6 +30,8 @@ output/
 #config/companies.xlsx
 config/companies.xlsx.bak-*
 config/*.bak-*
+# Excel's lock file, created whenever the workbook is open in the GUI.
+~$*.xlsx
 
 # --- Editors / OS ---
 .vscode/
@@ -36,3 +45,4 @@ Thumbs.db
 
 # Ad-hoc full-run logs
 run_output*.log
+run_full*.log

@@ -14,6 +14,13 @@ Two distinct Oracle recruiting products share this module:
 
 Both paths raise CollectorUnavailable on any shape mismatch so the router
 falls back to Playwright instead of emitting garbage rows.
+
+Both also walk their pages through :func:`ats.pagination.paginate` rather than
+by hand. Ten of the workbook's companies route here, and the hand-rolled loops
+were the last ones in the codebase without per-page retry (one 503 mid-walk
+suppressed that company's removal sync), total reconciliation (ORC reports
+``TotalJobsCount`` and nothing compared the harvest against it) or
+repeated-page detection.
 """
 
 from __future__ import annotations
@@ -24,15 +31,12 @@ from urllib.parse import urlsplit
 
 import http_client
 from ats.base import (
-    STOP_BUDGET,
-    STOP_EXHAUSTED,
-    STOP_PAGE_FAILED,
-    STOP_TOTAL_REACHED,
     ATSCollector,
     CollectionResult,
     CollectorUnavailable,
 )
 from ats.detector import TALEO
+from ats.pagination import PageRequest, paginate
 
 ORC_PATH = "/hcmRestApi/resources/latest/recruitingCEJobRequisitions"
 ORC_PAGE_SIZE = 200
@@ -65,6 +69,55 @@ class TaleoCollector(ATSCollector):
             return match.group(1)
         return "CX_1"
 
+    def _orc_page(self, endpoint: str, host: str, site: str, request: PageRequest):
+        """One ORC page: ``(rows, TotalJobsCount)``."""
+        finder = (
+            f"findReqs;siteNumber={site},limit={request.page_size},"
+            f"offset={request.offset},sortBy=POSTING_DATES_DESC"
+        )
+        data = http_client.get_json(
+            endpoint,
+            # expand=requisitionList is required: without it the response
+            # carries only facet counts and TotalJobsCount, and the job array
+            # is omitted entirely.
+            params={
+                "onlyData": "true",
+                "expand": "requisitionList",
+                "finder": finder,
+            },
+            headers={"Accept": "application/json"},
+        )
+
+        items = (data or {}).get("items") or []
+        if not items:
+            return [], None
+
+        total = items[0].get("TotalJobsCount")
+        rows = []
+        for req in items[0].get("requisitionList") or []:
+            if not isinstance(req, dict):
+                continue
+            job_id = req.get("Id") or req.get("RequisitionId")
+            job_url = (
+                f"https://{host}/hcmUI/CandidateExperience/en/sites/{site}"
+                f"/job/{job_id}" if job_id else None
+            )
+            workplace = req.get("WorkplaceType")
+            rows.append(
+                self.record(
+                    title=req.get("Title"),
+                    location=req.get("PrimaryLocation") or req.get("Location"),
+                    date_posted=req.get("PostedDate") or req.get("PostingStartDate"),
+                    job_url=job_url,
+                    employment_type=req.get("JobType") or req.get("WorkerType")
+                    or req.get("JobSchedule"),
+                    remote=("remote" in workplace.lower())
+                    if isinstance(workplace, str) and workplace else None,
+                    description=req.get("ShortDescriptionStr"),
+                )
+            )
+        return [r for r in rows if r], total
+
     def _collect_oracle_cloud(self) -> CollectionResult:
         host = self.host or urlsplit(self.url or "").netloc
         if not host:
@@ -72,98 +125,22 @@ class TaleoCollector(ATSCollector):
 
         endpoint = f"https://{host}{ORC_PATH}"
         site = self._site_number()
-        records: list[dict | None] = []
-        offset = 0
-        pages = 0
-        total: int | None = None
-        complete = True
-        stop_reason = STOP_EXHAUSTED
 
-        while len(records) < self.max_jobs:
-            finder = (
-                f"findReqs;siteNumber={site},limit={ORC_PAGE_SIZE},"
-                f"offset={offset},sortBy=POSTING_DATES_DESC"
+        try:
+            walk = paginate(
+                lambda request: self._orc_page(endpoint, host, site, request),
+                page_size=ORC_PAGE_SIZE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/oracle-cloud",
             )
-            try:
-                data = http_client.get_json(
-                    endpoint,
-                    # expand=requisitionList is required: without it the
-                    # response carries only facet counts and TotalJobsCount,
-                    # and the job array is omitted entirely.
-                    params={
-                        "onlyData": "true",
-                        "expand": "requisitionList",
-                        "finder": finder,
-                    },
-                    headers={"Accept": "application/json"},
-                )
-            except Exception as exc:
-                if pages == 0:
-                    raise CollectorUnavailable(f"Oracle Cloud API unavailable: {exc}") from exc
-                self.log.warning(
-                    "%s: Oracle Cloud page %s failed (%s); marking incomplete",
-                    self.company, pages, exc,
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Oracle Cloud API unavailable: {exc}") from exc
 
-            items = (data or {}).get("items") or []
-            if not items:
-                break
-
-            if total is None:
-                total = items[0].get("TotalJobsCount")
-
-            requisitions = items[0].get("requisitionList") or []
-            if not requisitions:
-                break
-            pages += 1
-
-            for req in requisitions:
-                if not isinstance(req, dict):
-                    continue
-                job_id = req.get("Id") or req.get("RequisitionId")
-                job_url = (
-                    f"https://{host}/hcmUI/CandidateExperience/en/sites/{site}"
-                    f"/job/{job_id}" if job_id else None
-                )
-                workplace = req.get("WorkplaceType")
-                records.append(
-                    self.record(
-                        title=req.get("Title"),
-                        location=req.get("PrimaryLocation") or req.get("Location"),
-                        date_posted=req.get("PostedDate") or req.get("PostingStartDate"),
-                        job_url=job_url,
-                        employment_type=req.get("JobType") or req.get("WorkerType")
-                        or req.get("JobSchedule"),
-                        remote=("remote" in workplace.lower())
-                        if isinstance(workplace, str) and workplace else None,
-                        description=req.get("ShortDescriptionStr"),
-                    )
-                )
-
-            offset += ORC_PAGE_SIZE
-            if len(requisitions) < ORC_PAGE_SIZE:
-                break
-            if total is not None and offset >= int(total):
-                stop_reason = STOP_TOTAL_REACHED
-                break
-        else:
-            complete, stop_reason = False, STOP_BUDGET
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Oracle Cloud API returned zero requisitions")
-
-        jobs = self.finalize(records)
-        if not complete:
-            self.log.warning(
-                "%s: Oracle Cloud scrape INCOMPLETE (%s) - collected %s of %s",
-                self.company, stop_reason, len(jobs), total,
-            )
-        return CollectionResult(
-            jobs=jobs, complete=complete, pages_fetched=pages,
-            reported_total=total, stop_reason=stop_reason,
-        )
+        return self.result(walk, walk.items)
 
     # -- Legacy Taleo career section --------------------------------------
     @staticmethod
@@ -175,98 +152,86 @@ class TaleoCollector(ATSCollector):
             mapped[key] = values[index] if index < len(values) else None
         return mapped
 
+    def _legacy_page(self, endpoint: str, host: str, request: PageRequest):
+        """One legacy career-section page: ``(rows, None)``.
+
+        The endpoint reports no total, so the walk ends on a short page - and
+        the shared controller judges "short" against what page one actually
+        served rather than what was asked for, which is what keeps a portal
+        capping below ``LEGACY_PAGE_SIZE`` from reading as a one-page employer.
+        """
+        payload = {
+            "multilineEnabled": False,
+            "sortingSelection": {
+                "sortBySelectionParam": "3",
+                "ascendingSortingOrder": "false",
+            },
+            "fieldData": {
+                "fields": {"KEYWORD": "", "LOCATION": ""},
+                "valid": True,
+            },
+            "filterSelectionParam": {"searchFilterSelections": []},
+            "advancedSearchFiltersSelectionParam": {"searchFilterSelections": []},
+            "pageNo": request.page_number,
+            # Sent explicitly so end-of-results is judged against a size we
+            # chose. Previously nothing was sent and the loop compared against
+            # a hard-coded 25, so a portal serving 15 a page stopped after page
+            # one and reported success.
+            "pageSize": request.page_size,
+        }
+        data = http_client.post_json(
+            endpoint,
+            payload,
+            params={"lang": "en", "portal": self.site or ""},
+            headers={"Accept": "application/json"},
+        )
+
+        rows = []
+        for req in (data or {}).get("requisitionList") or []:
+            if not isinstance(req, dict):
+                continue
+            # Column order is portal-configured; this is the common default.
+            mapped = self._pick_from_columns(
+                req.get("column"), ["title", "location", "date_posted"]
+            )
+            job_id = req.get("jobId") or req.get("contestNo")
+            job_url = (
+                f"https://{host}/careersection/{self.site or '2'}/jobdetail.ftl?job={job_id}"
+                if job_id else None
+            )
+            rows.append(
+                self.record(
+                    title=mapped.get("title"),
+                    location=mapped.get("location"),
+                    date_posted=mapped.get("date_posted"),
+                    job_url=job_url,
+                    description=req.get("descriptionTeaser"),
+                )
+            )
+        return [r for r in rows if r], None
+
     def _collect_legacy_taleo(self) -> CollectionResult:
         host = self.host
         if not host:
             raise CollectorUnavailable("No Taleo host available")
 
         endpoint = f"https://{host}/careersection/rest/jobboard/searchjobs"
-        records: list[dict | None] = []
-        complete = True
-        stop_reason = STOP_EXHAUSTED
-        observed_page_size = LEGACY_PAGE_SIZE
 
-        page = 0
-        while len(records) < self.max_jobs:
-            page += 1
-            payload = {
-                "multilineEnabled": False,
-                "sortingSelection": {
-                    "sortBySelectionParam": "3",
-                    "ascendingSortingOrder": "false",
-                },
-                "fieldData": {
-                    "fields": {"KEYWORD": "", "LOCATION": ""},
-                    "valid": True,
-                },
-                "filterSelectionParam": {"searchFilterSelections": []},
-                "advancedSearchFiltersSelectionParam": {"searchFilterSelections": []},
-                "pageNo": page,
-                # Sent explicitly so end-of-results can be judged against a
-                # size we chose. Previously nothing was sent and the loop
-                # compared against a hard-coded 25, so a portal serving 15 a
-                # page stopped after page one and reported success.
-                "pageSize": LEGACY_PAGE_SIZE,
-            }
-            try:
-                data = http_client.post_json(
-                    endpoint,
-                    payload,
-                    params={"lang": "en", "portal": self.site or ""},
-                    headers={"Accept": "application/json"},
-                )
-            except Exception as exc:
-                if page == 1:
-                    raise CollectorUnavailable(f"Taleo searchjobs unavailable: {exc}") from exc
-                self.log.warning(
-                    "%s: Taleo page %s failed (%s); marking incomplete",
-                    self.company, page, exc,
-                )
-                complete, stop_reason = False, STOP_PAGE_FAILED
-                break
+        try:
+            walk = paginate(
+                lambda request: self._legacy_page(endpoint, host, request),
+                page_size=LEGACY_PAGE_SIZE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/taleo",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Taleo searchjobs unavailable: {exc}") from exc
 
-            requisitions = (data or {}).get("requisitionList") or []
-            if not requisitions:
-                break
-
-            for req in requisitions:
-                if not isinstance(req, dict):
-                    continue
-                # Column order is portal-configured; this is the common default.
-                mapped = self._pick_from_columns(
-                    req.get("column"), ["title", "location", "date_posted"]
-                )
-                job_id = req.get("jobId") or req.get("contestNo")
-                job_url = (
-                    f"https://{host}/careersection/{self.site or '2'}/jobdetail.ftl?job={job_id}"
-                    if job_id else None
-                )
-                records.append(
-                    self.record(
-                        title=mapped.get("title"),
-                        location=mapped.get("location"),
-                        date_posted=mapped.get("date_posted"),
-                        job_url=job_url,
-                        description=req.get("descriptionTeaser"),
-                    )
-                )
-
-            # A page shorter than the size we asked for is the last page. The
-            # first page also tells us what this portal actually honours, in
-            # case it caps below our request.
-            if page == 1:
-                observed_page_size = len(requisitions)
-            if len(requisitions) < max(1, observed_page_size):
-                break
-        else:
-            complete, stop_reason = False, STOP_BUDGET
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Taleo searchjobs returned zero requisitions")
-        return CollectionResult(
-            jobs=self.finalize(records), complete=complete,
-            pages_fetched=page, stop_reason=stop_reason,
-        )
+        return self.result(walk, walk.items)
 
     def collect(self) -> CollectionResult:
         if self._is_oracle_cloud():
