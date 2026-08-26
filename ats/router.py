@@ -26,6 +26,7 @@ from ats.base import (
 from ats.cornerstone import CornerstoneCollector
 from ats.detector import UNKNOWN, detect_ats
 from ats.eightfold import EightfoldCollector
+from ats.framework_data import FrameworkDataCollector
 from ats.greenhouse import GreenhouseCollector
 from ats.icims import ICIMSCollector
 from ats.jibe import JibeCollector
@@ -37,6 +38,7 @@ from ats.phenom import PhenomCollector
 from ats.radancy import RadancyCollector
 from ats.resolver import resolve_from_page
 from ats.smartrecruiters import SmartRecruitersCollector
+from ats.static_html import StaticHTMLCollector
 from ats.url_repair import repair_careers_url
 from ats.successfactors import SuccessFactorsCollector
 from ats.taleo import TaleoCollector
@@ -104,6 +106,12 @@ class RoutePlan:
     #: this run - lets the pipeline write the verified live URL back over
     #: the dead one it replaced (see ``pipeline.py``'s write-back step).
     was_repaired: bool = False
+    #: The workbook's ``Live Jobs Page`` value, kept even when the ``ATS URL``
+    #: column won the routing decision. A tenant retired by an acquisition or
+    #: an ATS migration leaves a dead ATS URL next to a careers page that still
+    #: works, and re-rendering the dead URL in the browser finds nothing -
+    #: confirmed against McAfee (Workday answers total:0) and HCLTech.
+    live_jobs_url: str | None = None
 
     @property
     def uses_browser(self) -> bool:
@@ -180,10 +188,12 @@ def plan_route(
     jobs page, and use Playwright only when no supported direct collector can
     be identified.
     """
+    live_page = None if _blank(live_jobs_url) else str(live_jobs_url).strip()
+
     if not _blank(ats_url):
         url, source = str(ats_url).strip(), SOURCE_ATS_URL
-    elif not _blank(live_jobs_url):
-        url, source = str(live_jobs_url).strip(), SOURCE_LIVE_PAGE
+    elif live_page:
+        url, source = live_page, SOURCE_LIVE_PAGE
     else:
         return RoutePlan(
             company=company, url=None, provider=UNKNOWN, method=METHOD_BROWSER,
@@ -215,7 +225,7 @@ def plan_route(
         return RoutePlan(
             company=company, url=url, provider=provider, method=METHOD_API,
             source=source, detection=detection, original_url=original_url,
-            raw_url=raw_url, was_repaired=was_repaired,
+            raw_url=raw_url, was_repaired=was_repaired, live_jobs_url=live_page,
         )
 
     # Unknown from the URL alone: probe the page for an embedded/redirected ATS.
@@ -226,7 +236,7 @@ def plan_route(
                 company=company, url=resolved.get("url") or url,
                 provider=resolved["provider"], method=METHOD_API, source=source,
                 detection=resolved, resolved_via_page=True, original_url=original_url,
-                raw_url=raw_url, was_repaired=was_repaired,
+                raw_url=raw_url, was_repaired=was_repaired, live_jobs_url=live_page,
             )
 
     method = METHOD_BROWSER if playwright_enabled else METHOD_API
@@ -234,7 +244,7 @@ def plan_route(
     return RoutePlan(
         company=company, url=url, provider=UNKNOWN, method=method,
         source=source, detection=detection, note=note, original_url=original_url,
-        raw_url=raw_url, was_repaired=was_repaired,
+        raw_url=raw_url, was_repaired=was_repaired, live_jobs_url=live_page,
     )
 
 
@@ -272,6 +282,28 @@ def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
     detection = dict(plan.detection or {})
     detection.setdefault("url", plan.url)
     return JSONLDCollector(plan.company, detection).collect()
+
+
+def collect_via_static_html(plan: RoutePlan) -> list[dict]:
+    """Harvest a server-rendered job list over one GET.
+
+    Raises:
+        CollectorUnavailable: the page carries no job-shaped links.
+    """
+    detection = dict(plan.detection or {})
+    detection.setdefault("url", plan.url)
+    return StaticHTMLCollector(plan.company, detection).collect().jobs
+
+
+def collect_via_framework_data(plan: RoutePlan) -> list[dict]:
+    """Read a Next.js/Nuxt/Redux hydration payload instead of rendering it.
+
+    Raises:
+        CollectorUnavailable: no framework payload, or none carrying jobs.
+    """
+    detection = dict(plan.detection or {})
+    detection.setdefault("url", plan.url)
+    return FrameworkDataCollector(plan.company, detection).collect().jobs
 
 
 def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None, bool]:
@@ -392,6 +424,21 @@ def fetch_company_jobs(
             plan.method = METHOD_BROWSER
             plan.note = f"direct API unavailable: {exc}"
             fell_back = True
+
+            # A collector that failed on the workbook's ATS URL usually means
+            # that tenant is gone - retired by an acquisition, a rebrand or an
+            # ATS migration. Re-rendering the same dead URL finds nothing,
+            # while the Live Jobs Page column often holds a careers site that
+            # still works and has never been tried. Confirmed against McAfee,
+            # whose Workday tenant answers total:0 beside a live careers page,
+            # and HCLTech.
+            if (plan.source == SOURCE_ATS_URL and plan.live_jobs_url
+                    and plan.live_jobs_url != plan.url):
+                log.info("%s: ATS URL is not serving; switching the browser to "
+                         "the Live Jobs Page (%s)", company, plan.live_jobs_url[:90])
+                plan.url = plan.live_jobs_url
+                plan.original_url = plan.live_jobs_url
+                plan.source = SOURCE_LIVE_PAGE
         except Exception as exc:
             return CompanyResult(
                 company=company, jobs=[], plan=plan, success=False,
@@ -402,30 +449,45 @@ def fetch_company_jobs(
     # HTTP GET before paying for a browser. Runs for an unrecognised provider
     # *and* for a known provider whose collector just failed - that is the case
     # where a cheap tier is most valuable, and it used to be skipped.
-    jsonld_jobs: list[dict] = []
-    if plan.url:
-        try:
-            jsonld_jobs = collect_via_jsonld(plan)
-        except CollectorUnavailable:
-            jsonld_jobs = []
-        except Exception as exc:  # a parser hiccup must not sink the company
-            log.debug("%s -> JSON-LD tier errored (%s)", company, exc)
-            jsonld_jobs = []
-
-    # A landing page routinely embeds two or three "featured" roles for SEO.
-    # Accepting those as the company's job list reports 3 jobs for an employer
-    # with thousands, so apply the same floor the browser traversal uses: a
-    # small harvest is kept as a fallback while the search continues.
+    # The cheap tiers, in ascending cost: structured data, then a
+    # server-rendered list, then a framework hydration payload. All three are
+    # one GET and provider-agnostic, and every company they answer is a
+    # company that never has to pay for a Chromium instance.
+    #
+    # The "is this a real job list?" floor is applied here, once, for all of
+    # them - a landing page routinely embeds two or three featured roles for
+    # SEO, and accepting those reports 3 jobs for an employer with thousands.
+    # A thin harvest is kept as a fallback while the ladder continues.
     good_enough = _good_enough_rows()
-    if len(jsonld_jobs) >= good_enough:
-        log.info("%s -> %s jobs via JSON-LD", company, len(jsonld_jobs))
-        return CompanyResult(
-            company=company, jobs=jsonld_jobs, plan=plan, success=True,
-            fell_back=fell_back,
-        )
-    if jsonld_jobs:
-        log.debug("%s -> JSON-LD found only %s row(s); keeping as a fallback "
-                  "and continuing to Playwright", company, len(jsonld_jobs))
+    best_cheap: list[dict] = []
+
+    for label, harvest in (
+        ("JSON-LD", collect_via_jsonld),
+        ("static HTML", collect_via_static_html),
+        ("framework data", collect_via_framework_data),
+    ):
+        if not plan.url:
+            break
+        try:
+            rows = harvest(plan)
+        except CollectorUnavailable:
+            continue
+        except Exception as exc:  # a parser hiccup must not sink the company
+            log.debug("%s -> %s tier errored (%s)", company, label, exc)
+            continue
+
+        if len(rows) >= good_enough:
+            log.info("%s -> %s jobs via %s", company, len(rows), label)
+            return CompanyResult(
+                company=company, jobs=rows, plan=plan, success=True,
+                fell_back=fell_back,
+            )
+        if len(rows) > len(best_cheap):
+            log.debug("%s -> %s found only %s row(s); keeping as a fallback",
+                      company, label, len(rows))
+            best_cheap = rows
+
+    jsonld_jobs = best_cheap
 
     log.info("%s -> Playwright fallback", company)
     try:

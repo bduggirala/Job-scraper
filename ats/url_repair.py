@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import re
 import socket
+import time
 from functools import lru_cache
 from urllib.parse import urljoin, urlsplit
 
 import http_client
-from ats.html_utils import make_soup
+from ats.html_utils import extract_job_links, make_soup
 from logger import get_logger
 
 log = get_logger("ats.url_repair")
@@ -41,17 +42,43 @@ CAREERS_PATH_GUESSES = (
 # Subdomain labels worth stripping when the full host is dead.
 _STRIPPABLE_LABELS = {"careers", "career", "jobs", "job", "apply", "recruiting", "www"}
 
+#: Pause before re-checking a host that failed to resolve. Long enough to ride
+#: out a momentary resolver hiccup, short enough not to slow a real run.
+_RESOLVE_RETRY_DELAY = 1.0
 
-@lru_cache(maxsize=512)
-def host_resolves(host: str) -> bool:
-    """True when a hostname resolves in DNS. Cached - repair retries a lot."""
-    if not host:
-        return False
+
+def _resolves_once(host: str) -> bool:
+    """A single DNS lookup. Split out so the retry logic is testable."""
     try:
         socket.getaddrinfo(host, None)
         return True
     except (socket.gaierror, UnicodeError, OSError):
         return False
+
+
+@lru_cache(maxsize=512)
+def host_resolves(host: str) -> bool:
+    """True when a hostname resolves in DNS. Cached - repair retries a lot.
+
+    A *failure* is confirmed with a second lookup after a short pause, because
+    declaring a host dead is consequential: it triggers repair, and a verified
+    repair is written back over the workbook's URL. The README documents
+    Chromium's resolver buckling under concurrent browser instances, and the
+    same conditions make getaddrinfo fail spuriously here - so one bad lookup
+    must not be enough to permanently rewrite a working URL.
+
+    A host that resolves costs exactly one lookup, which is the common case.
+    """
+    if not host:
+        return False
+    if _resolves_once(host):
+        return True
+
+    time.sleep(_RESOLVE_RETRY_DELAY)
+    if _resolves_once(host):
+        log.debug("%s failed one DNS lookup then resolved; not treating as dead", host)
+        return True
+    return False
 
 
 def _root_domain(host: str) -> str:
@@ -86,21 +113,30 @@ def _candidate_hosts(host: str) -> list[str]:
 
 
 def _looks_like_careers_page(html_text: str) -> bool:
-    """True when a page plausibly hosts or links to job openings.
+    """True when a page actually links to job openings.
 
     Guards the repair against "successfully" landing on a corporate homepage,
     which returns HTTP 200 and plenty of HTML but no jobs.
+
+    Counting generic word hits was far too weak for that job: "job", "career"
+    and "position" appear on almost every corporate page, so three hits was
+    close to always true. The page must now carry links that look like
+    individual postings, or a search control - structure, not vocabulary.
     """
     if not html_text or len(html_text) < 2000:
         return False
 
+    if extract_job_links(html_text, "https://example.invalid/"):
+        return True
+
+    # No individual postings, but a job *search* entry point is still a
+    # careers page - the listing lives one interaction away.
     lowered = html_text.lower()
-    signals = (
-        "job", "career", "opening", "position", "vacanc", "apply now",
-        "join our team", "search jobs",
+    return any(
+        marker in lowered
+        for marker in ("search jobs", "search for jobs", "job search",
+                       "view all jobs", "current openings", "/job-search")
     )
-    hits = sum(1 for signal in signals if signal in lowered)
-    return hits >= 3
 
 
 def _find_careers_link(html_text: str, base_url: str) -> str | None:

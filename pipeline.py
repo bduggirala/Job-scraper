@@ -568,8 +568,10 @@ def _prepare_notification(
         "new": database.filter_unnotified(new_jobs, kind="new"),
         "changed": database.filter_unnotified(changed_jobs, kind="changed"),
         # A run with any truncated company cannot be trusted to know what is
-        # new, so the digest is suppressed rather than sent with a caveat.
+        # new - unless the only truncation was the job budget, which leaves a
+        # gap of known shape. See notify.should_send.
         "run_complete": summary.incomplete_companies == 0,
+        "stop_reasons": {r for _, _, _, r in summary.truncated if r},
     }
 
 
@@ -591,6 +593,7 @@ def send_notifications(
     if not should_send(
         new_jobs=new_jobs, changed_jobs=changed_jobs,
         run_complete=payload["run_complete"],
+        stop_reasons=payload.get("stop_reasons"),
     ):
         log.info("Nothing new to announce; no email sent")
         return False

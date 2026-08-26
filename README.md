@@ -192,10 +192,18 @@ clobber a full run's results.
 | Cornerstone (CSOD) | `career-site/v1/search` | Token-gated; JWT lifted from the careersite home page |
 | Jibe (iCIMS) | `{tenant}.jibeapply.com/api/jobs` | Public JSON search API |
 
-Beyond these host/fingerprint-matched providers, a **generic JSON-LD tier**
-(`ats/jsonld.py`) harvests any page's `schema.org/JobPosting` structured data
-over a single HTTP GET before the browser fallback runs — so an unknown
-provider that embeds JobPosting markup is still collected cheaply.
+Beyond these host/fingerprint-matched providers, **three generic tiers** run
+over a single HTTP GET each before the browser fallback, in ascending cost:
+
+1. `ats/jsonld.py` — `schema.org/JobPosting` structured data;
+2. `ats/static_html.py` — a server-rendered job list;
+3. `ats/framework_data.py` — a `__NEXT_DATA__` / `__NUXT__` / `__INITIAL_STATE__`
+   hydration payload (the generic form of the trick `ats/phenom.py` uses).
+
+Every company one of these answers is a company that never pays for a Chromium
+instance. All three are judged against the same `hop_good_enough_rows` floor,
+applied once in the router: a thin harvest is kept as a fallback while the
+ladder continues, never accepted as a company's whole job list.
 
 Any collector that cannot serve a tenant raises `CollectorUnavailable`, and the
 router falls back to the next tier (JSON-LD, then Playwright) rather than

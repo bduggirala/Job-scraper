@@ -109,13 +109,47 @@ def load_email_config(section: dict[str, Any] | None) -> EmailConfig | None:
 
 
 def should_send(
-    *, new_jobs: list[dict], changed_jobs: list[dict], run_complete: bool
+    *,
+    new_jobs: list[dict],
+    changed_jobs: list[dict],
+    run_complete: bool,
+    stop_reasons: set[str] | None = None,
 ) -> bool:
-    """Whether this run has something worth mailing."""
-    if not run_complete:
-        log.info("Run was incomplete; suppressing the digest")
+    """Whether this run has something worth mailing.
+
+    Incompleteness comes in two kinds and they deserve opposite treatment.
+
+    A **failed page** leaves a hole of unknown shape: what looks new may just
+    be what we happened to reach this time, so the digest is suppressed.
+
+    A **budget truncation** leaves a hole we can describe. The walk is
+    newest-first, so what was missed is the oldest postings, and nothing inside
+    a 7-day freshness window sits behind it. Treating that as fatal would mean
+    permanent silence for any employer too large to collect in full - CVS
+    Health lists 19,246 postings against a provider serving ten per request,
+    so it is truncated on every run and always will be. One known limitation
+    should not cost all alerting.
+
+    ``stop_reasons`` omitted keeps the strict behaviour, so a caller that has
+    not been taught the distinction stays cautious.
+    """
+    if not (new_jobs or changed_jobs):
         return False
-    return bool(new_jobs or changed_jobs)
+
+    if run_complete:
+        return True
+
+    from ats.base import STOP_BUDGET
+
+    reasons = stop_reasons or set()
+    if reasons and reasons <= {STOP_BUDGET}:
+        log.info("Run truncated by the job budget only (newest-first, so the "
+                 "gap is the oldest postings); sending the digest anyway")
+        return True
+
+    log.info("Run incomplete for reasons that make 'new' untrustworthy (%s); "
+             "suppressing the digest", ", ".join(sorted(reasons)) or "unknown")
+    return False
 
 
 def _line(job: dict[str, Any]) -> str:
