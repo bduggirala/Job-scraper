@@ -37,6 +37,7 @@ from deduplicate import deduplicate
 from enrich import enrich_records
 from export_ats_urls import write_discovered_urls, write_repaired_urls, write_run_status
 from filters import apply_filters
+from fit import score_fit
 from job_identity import extract_stable_job_id
 from logger import get_logger
 from normalize import RECORD_FIELDS
@@ -47,6 +48,11 @@ log = get_logger("pipeline")
 OUTPUT_FIELDS = list(RECORD_FIELDS) + [
     "date_filter_status",
     "location_match_type",
+    "remote_scope",
+    "source_query",
+    "fit_score",
+    "fit_matched",
+    "fit_explanation",
     "first_seen",
     "is_new",
 ]
@@ -78,6 +84,12 @@ class RunSummary:
     ats_urls_written: int = 0
     hours_old: int = 72
     provider_counts: dict[str, int] = field(default_factory=dict)
+    #: Companies whose scrape stopped short of the provider's full job list.
+    incomplete_companies: int = 0
+    #: Matching jobs whose title, location or URL moved since the last run.
+    changed_jobs: int = 0
+    #: ``(company, collected, reported_total, stop_reason)`` per truncated company.
+    truncated: list[tuple[str, int, int | None, str | None]] = field(default_factory=list)
 
     def render(self) -> str:
         lines = [
@@ -96,6 +108,7 @@ class RunSummary:
             f"Date unavailable:       {self.date_unavailable:,}",
             f"Duplicates removed:     {self.duplicates_removed:,}",
             f"Newly discovered:       {self.new_jobs:,}",
+            f"Changed since last run: {self.changed_jobs:,}",
             f"Removed (no longer listed): {self.jobs_removed:,}",
             "",
             f"Direct API companies:   {self.direct_api_companies:,}",
@@ -114,6 +127,24 @@ class RunSummary:
                 self.provider_counts.items(), key=lambda kv: (-kv[1], kv[0])
             ):
                 lines.append(f"  {provider:<18} {count:>4}")
+
+        # Truncation used to be invisible: eleven Workday tenants all returned
+        # exactly 500 jobs for months without anything saying so. Report it
+        # loudly, sorted by how much was missed.
+        if self.truncated:
+            lines.extend([
+                "",
+                f"INCOMPLETE - {len(self.truncated)} company(ies) stopped short "
+                f"(removal sync skipped for these):",
+            ])
+            for company, collected, total, reason in sorted(
+                self.truncated, key=lambda row: -((row[2] or 0) - row[1])
+            ):
+                shortfall = f"{total - collected:,} missed" if total else "unknown shortfall"
+                lines.append(
+                    f"  {company[:26]:<26} {collected:>6,} of "
+                    f"{(f'{total:,}' if total else '?'):>7}  {shortfall}  [{reason}]"
+                )
         lines.append("=" * 58)
         return "\n".join(lines)
 
@@ -409,6 +440,40 @@ def execute_plans(
     return results
 
 
+#: Leading characters a spreadsheet treats as the start of a formula.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def escape_formulas(frame: pd.DataFrame) -> pd.DataFrame:
+    """Neutralise spreadsheet formulas in scraped text before writing a CSV.
+
+    Titles, locations and descriptions arrive verbatim from third-party pages,
+    and this output exists to be opened in Excel or Sheets. A value starting
+    ``=``, ``+``, ``-`` or ``@`` is evaluated as a formula on open, so a
+    crafted job title becomes code running on the reader's machine.
+
+    Prefixing with an apostrophe is the standard defence: the spreadsheet
+    treats the cell as literal text and does not display the apostrophe, while
+    the value stays readable to anything reading the CSV directly.
+    """
+    if frame.empty:
+        return frame
+
+    def _escape(value: Any) -> Any:
+        if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+            return f"'{value}"
+        return value
+
+    # Every column is walked and the isinstance check does the filtering. An
+    # earlier version skipped columns whose dtype was not ``object``, which
+    # silently disabled the whole guard under pandas 2.x - it infers ``str``
+    # for text columns, so nothing was ever escaped.
+    escaped = frame.copy()
+    for column in escaped.columns:
+        escaped[column] = escaped[column].map(_escape)
+    return escaped
+
+
 def write_outputs(
     jobs: list[dict[str, Any]],
     results: list[CompanyResult],
@@ -437,6 +502,8 @@ def write_outputs(
             "date_posted", ascending=False, na_position="last"
         ).reset_index(drop=True)
 
+    jobs_frame = escape_formulas(jobs_frame)
+
     jobs_frame.to_csv(csv_path, index=False, encoding="utf-8")
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(jobs, handle, indent=2, ensure_ascii=False, default=str)
@@ -460,12 +527,137 @@ def write_outputs(
 
     written = {"csv": csv_path, "json": json_path, "failures": failures_path}
 
+    # Excel alongside the CSV: it is what actually gets opened and mailed, and
+    # openpyxl is already a dependency for the workbook.
+    xlsx_name = cfg.get("output.xlsx", "company_jobs.xlsx")
+    if xlsx_name:
+        xlsx_path = out_dir / f"{prefix}{xlsx_name}"
+        try:
+            with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+                jobs_frame.to_excel(writer, sheet_name="Matching jobs", index=False)
+                if failure_rows:
+                    pd.DataFrame(failure_rows, columns=FAILURE_FIELDS).to_excel(
+                        writer, sheet_name="Failures", index=False
+                    )
+            written["xlsx"] = xlsx_path
+        except Exception as exc:  # never fail a run over a spreadsheet
+            log.warning("Could not write %s: %s", xlsx_path.name, exc)
+
     if raw_jobs is not None:
         raw_path = out_dir / f"{prefix}{cfg.get('output.raw_csv', 'company_jobs_raw.csv')}"
         pd.DataFrame(raw_jobs).to_csv(raw_path, index=False, encoding="utf-8")
         written["raw"] = raw_path
 
     return written
+
+
+def _prepare_notification(
+    database: JobDatabase,
+    summary: "RunSummary",
+    final_jobs: list[dict[str, Any]],
+    changed_jobs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Work out what this run would announce, without announcing it yet.
+
+    Split from the send so the decision is made while the database is open and
+    the send happens after the outputs exist on disk - the attachment has to be
+    written before it can be attached.
+    """
+    new_jobs = [j for j in final_jobs if j.get("is_new")]
+    return {
+        "new": database.filter_unnotified(new_jobs, kind="new"),
+        "changed": database.filter_unnotified(changed_jobs, kind="changed"),
+        # A run with any truncated company cannot be trusted to know what is
+        # new, so the digest is suppressed rather than sent with a caveat.
+        "run_complete": summary.incomplete_companies == 0,
+    }
+
+
+def send_notifications(
+    payload: dict[str, Any],
+    summary: "RunSummary",
+    database_path: Path,
+    settings: Settings,
+    attachments: Iterable[Path] = (),
+) -> bool:
+    """Send the digest, then record what was announced.
+
+    Jobs are marked notified **only after** a successful send: doing it before
+    would let one SMTP failure suppress those jobs permanently.
+    """
+    from notify import build_digest, load_email_config, send_digest, should_send
+
+    new_jobs, changed_jobs = payload["new"], payload["changed"]
+    if not should_send(
+        new_jobs=new_jobs, changed_jobs=changed_jobs,
+        run_complete=payload["run_complete"],
+    ):
+        log.info("Nothing new to announce; no email sent")
+        return False
+
+    config = load_email_config(settings.get("notifications.email"))
+    if config is None:
+        log.info(
+            "%s new and %s changed job(s) to announce, but email is not "
+            "configured; skipping send", len(new_jobs), len(changed_jobs),
+        )
+        return False
+
+    digest = build_digest(new_jobs, changed_jobs, {
+        "companies_scanned": summary.companies_scanned,
+        "jobs_collected": summary.jobs_collected,
+        "incomplete_companies": summary.incomplete_companies,
+    })
+
+    if not send_digest(config, digest, attachments):
+        return False
+
+    with JobDatabase(database_path) as database:
+        database.record_notified(new_jobs, kind="new")
+        database.record_notified(changed_jobs, kind="changed")
+    return True
+
+
+def sync_completed_companies(
+    results: Iterable[CompanyResult], database: JobDatabase
+) -> dict[str, int]:
+    """Upsert each company's jobs and age out the ones it no longer lists.
+
+    Three conditions must all hold before a company is synced, and each guards
+    a different way of misreading absence as closure:
+
+    * ``result.success`` - a company we could not reach tells us nothing.
+    * ``result.jobs`` - an empty harvest is not evidence every posting closed.
+    * ``result.complete`` - a scrape that stopped partway through pagination
+      never saw the later pages, so the jobs on them are missing from *our*
+      data, not from the employer's site. This is the condition that was absent
+      before :class:`ats.base.CollectionResult` existed, and it is why one
+      transient HTTP error could delete hundreds of live postings.
+
+    Returns:
+        ``{"removed": int, "synced": int, "skipped_incomplete": int}``
+    """
+    stats = {"removed": 0, "synced": 0, "skipped_incomplete": 0}
+
+    for result in results:
+        if not result.success or not result.jobs:
+            continue
+        database.upsert_jobs(result.jobs)
+
+        if not result.complete:
+            stats["skipped_incomplete"] += 1
+            log.warning(
+                "%s: scrape incomplete (%s) - upserted %s job(s) but skipping "
+                "removal sync so unreached postings are not deleted",
+                result.company, result.stop_reason or "unknown", len(result.jobs),
+            )
+            continue
+
+        ids = {j["job_id"] for j in result.jobs if j.get("job_id")}
+        stats["removed"] += database.sync_company(result.company, ids)["removed"]
+        stats["synced"] += 1
+
+    return stats
 
 
 def verified_repair(result: CompanyResult) -> tuple[str, str, str] | None:
@@ -506,6 +698,7 @@ def run(
     save_raw: bool = False,
     output_prefix: str = "",
     write_back: bool = True,
+    notify: bool = True,
 ) -> tuple[RunSummary, list[dict[str, Any]], list[CompanyResult]]:
     """Execute a full scrape and write outputs.
 
@@ -553,6 +746,12 @@ def run(
         else:
             summary.direct_api_companies += 1
 
+        if result.success and not result.complete:
+            summary.truncated.append((
+                result.company, len(result.jobs),
+                result.reported_total, result.stop_reason,
+            ))
+
         provider = result.plan.provider
         summary.provider_counts[provider] = summary.provider_counts.get(provider, 0) + 1
         all_jobs.extend(result.jobs)
@@ -560,8 +759,12 @@ def run(
     # job_id is a database-layer identity, never part of the spec'd normalized
     # record - computed once here and carried alongside each dict, but never
     # written into RECORD_FIELDS/OUTPUT_FIELDS (see write_outputs()).
+    # Scoped by company: the extracted ids are only unique *within* an
+    # employer, and job_id is the jobs-table primary key.
     for job in all_jobs:
-        job["job_id"] = extract_stable_job_id(job.get("job_url"), job.get("ats_provider"))
+        job["job_id"] = extract_stable_job_id(
+            job.get("job_url"), job.get("ats_provider"), job.get("company"),
+        )
 
     summary.jobs_collected = len(all_jobs)
     log.info("Collected %s raw jobs across %s companies", len(all_jobs), len(results))
@@ -580,23 +783,20 @@ def run(
         summary.within_window = counts["within_window"]
         summary.date_unavailable = counts["date_unavailable"]
 
+        # Explainable fit scoring, on the filtered set only - it reads
+        # descriptions, and most collected jobs never reach the output.
+        for job in filtered["jobs"]:
+            job.update(score_fit(job, cfg).as_dict())
+
         deduped = deduplicate(filtered["jobs"])
         summary.duplicates_removed = deduped["removed"]
         final_jobs = deduped["jobs"]
 
-        # Per-company upsert + removal sync. Only for companies scraped
-        # successfully this run - a failed company's jobs must never be
-        # deleted just because this run couldn't reach its page (that would
-        # read as "all jobs closed" when it was really a scraping hiccup).
-        # sync_company() only ever touches that one company's rows, via
-        # idx_jobs_company - never a full-table scan.
-        for result in results:
-            if not result.success or not result.jobs:
-                continue
-            database.upsert_jobs(result.jobs)
-            ids = {j["job_id"] for j in result.jobs if j.get("job_id")}
-            sync_stats = database.sync_company(result.company, ids)
-            summary.jobs_removed += sync_stats["removed"]
+        # Per-company upsert + removal sync, gated on success AND completeness.
+        # See sync_completed_companies() for why both matter.
+        sync_stats = sync_completed_companies(results, database)
+        summary.jobs_removed = sync_stats["removed"]
+        summary.incomplete_companies = sync_stats["skipped_incomplete"]
 
         refreshed = database.get_first_seen_map([j.get("job_id") for j in final_jobs])
         for job in final_jobs:
@@ -606,12 +806,33 @@ def run(
 
         summary.new_jobs = sum(1 for job in final_jobs if job.get("is_new"))
 
+        # Changes are reported only for jobs that survived filtering - a
+        # retitled warehouse role is a change, but not one worth an email.
+        matching_ids = {j.get("job_id") for j in final_jobs}
+        changed_jobs = [
+            c for c in database.changed_since_last_run()
+            if c["job_id"] in matching_ids
+        ]
+        summary.changed_jobs = len(changed_jobs)
+        database.clear_change_marks()
+
+        notify_payload = _prepare_notification(
+            database, summary, final_jobs, changed_jobs,
+        )
+
     paths = write_outputs(
         final_jobs, results, cfg,
         raw_jobs=all_jobs if save_raw else None, prefix=output_prefix,
     )
     for label, path in paths.items():
         log.info("Wrote %s -> %s", label, path)
+
+    # Sent after the outputs exist, so the spreadsheet can be attached. Only on
+    # a full run: a --limit or --test-company slice knows nothing about the
+    # companies it skipped, so its "new" set is not a real answer.
+    if notify and not output_prefix:
+        attachments = [p for k, p in paths.items() if k == "xlsx"]
+        send_notifications(notify_payload, summary, db_path, cfg, attachments)
 
     # Search-fallback ATS discovery, written back so the next run routes these
     # companies straight to a direct-API collector instead of Playwright.

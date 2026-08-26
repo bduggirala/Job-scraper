@@ -23,7 +23,13 @@ from ats.detector import (
     SMARTRECRUITERS,
     WORKDAY,
 )
+from deduplicate import normalize_company
 from normalize import normalize_url
+
+#: Bumped whenever the id format changes, so a database keyed on the old scheme
+#: is cleared rather than silently accumulating two generations of ids that can
+#: never match. Version 2 added the company scope prefix.
+JOB_ID_SCHEME_VERSION = 2
 
 # Trailing Workday requisition id, e.g. "..._R246063-2" -> "R246063-2".
 _WORKDAY_REQ_RE = re.compile(r"_([Rr]\d+(?:-\d+)?)(?:/|$)")
@@ -80,23 +86,44 @@ _PROVIDER_STRATEGIES = {
 }
 
 
-def extract_stable_job_id(job_url: str | None, ats_provider: str | None) -> str:
-    """Return a durable identity for a job, best available.
+def extract_stable_job_id(
+    job_url: str | None, ats_provider: str | None, company: str | None = None
+) -> str:
+    """Return a durable, company-scoped identity for a job.
 
     Order: provider-specific URL pattern -> generic query-param id -> trailing
     numeric/UUID path segment -> the normalized URL itself. The final fallback
     means every job always gets *some* stable id, even from a custom Playwright
     site where no structured pattern exists - it just degrades to the same
     "same URL = same job" behaviour the pipeline used before this feature.
+
+    Every id is prefixed with a normalized company key. Without that, the
+    extracted ids collide across employers: ``ats_provider`` is the literal
+    string ``"unknown"`` for every browser-routed company, so
+    ``https://a.com/careers?jobId=55512`` and
+    ``https://b.com/apply?jobid=55512`` both produced ``unknown:55512`` - and
+    since ``job_id`` is the ``jobs`` table primary key, the two employers'
+    postings became one row. The later upsert overwrote the earlier company
+    name, after which that job silently vanished from the original company's
+    set and was treated as removed.
+
+    The company key is normalized (suffixes and punctuation dropped) so
+    workbook drift - "Acme Inc" one run, "Acme, Inc." the next - does not
+    orphan every job the company had. Renaming a company in the workbook to
+    something genuinely different does re-key its jobs, which reports them as
+    new once.
     """
     if not job_url:
         return ""
+
+    scope = normalize_company(company) if company else ""
+    prefix = f"{scope}:" if scope else ""
 
     strategy = _PROVIDER_STRATEGIES.get((ats_provider or "").lower())
     if strategy:
         found = strategy(job_url)
         if found:
-            return f"{ats_provider}:{found}"
+            return f"{prefix}{ats_provider}:{found}"
 
     # Opportunistic: some providers (Phenom in particular) surface an
     # applyUrl that actually points at a different underlying ATS - e.g.
@@ -106,14 +133,14 @@ def extract_stable_job_id(job_url: str | None, ats_provider: str | None) -> str:
     # provider.
     workday_id = _workday_id(job_url)
     if workday_id:
-        return f"{WORKDAY}:{workday_id}"
+        return f"{prefix}{WORKDAY}:{workday_id}"
 
     query_id = _query_id(job_url)
     if query_id:
-        return f"{ats_provider}:{query_id}"
+        return f"{prefix}{ats_provider}:{query_id}"
 
     segment_id = _last_segment_id(job_url)
     if segment_id:
-        return f"{ats_provider}:{segment_id}"
+        return f"{prefix}{ats_provider}:{segment_id}"
 
-    return normalize_url(job_url, drop_query=True) or job_url
+    return f"{prefix}{normalize_url(job_url, drop_query=True) or job_url}"

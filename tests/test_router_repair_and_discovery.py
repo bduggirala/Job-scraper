@@ -10,6 +10,7 @@
 """
 
 import ats.router as router
+from ats.base import CollectionResult
 
 
 def test_plan_route_records_raw_url_and_repair_flag(monkeypatch):
@@ -67,7 +68,10 @@ def test_page_resolved_api_success_is_reported_as_verified_discovery(monkeypatch
         raw_url="https://www.prim.com/careers",
         was_repaired=True,
     )
-    monkeypatch.setattr(router, "collect_via_api", lambda p: [{"title": "Data Engineer"}])
+    monkeypatch.setattr(
+        router, "collect_via_api",
+        lambda p: CollectionResult(jobs=[{"title": "Data Engineer"}]),
+    )
 
     result = router.fetch_company_jobs("Primoris Services", plan=plan)
 
@@ -87,7 +91,10 @@ def test_direct_lexical_api_success_is_not_reported_as_discovery(monkeypatch):
         source=router.SOURCE_ATS_URL,
         resolved_via_page=False,
     )
-    monkeypatch.setattr(router, "collect_via_api", lambda p: [{"title": "Data Engineer"}])
+    monkeypatch.setattr(
+        router, "collect_via_api",
+        lambda p: CollectionResult(jobs=[{"title": "Data Engineer"}]),
+    )
 
     result = router.fetch_company_jobs("Capital One", plan=plan)
 

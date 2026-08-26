@@ -157,6 +157,7 @@ python main.py
 | `--no-playwright` | Disable browser fallback |
 | `--no-resolve` | Skip page resolution and URL repair |
 | `--no-write-back` | Don't write discovered ATS URLs into the workbook |
+| `--no-email` | Don't send the email digest, even on a full run |
 | `--save-raw` | Also write every collected job, pre-filter |
 | `--quiet` | Log to file only |
 | `--config PATH` / `--excel PATH` | Override config or input workbook |
@@ -200,6 +201,13 @@ Any collector that cannot serve a tenant raises `CollectorUnavailable`, and the
 router falls back to the next tier (JSON-LD, then Playwright) rather than
 failing the company.
 
+The JSON-LD tier applies the same `hop_good_enough_rows` floor the browser
+traversal uses: a landing page embedding two or three "featured" roles for SEO
+is kept only as a fallback while the ladder continues, never accepted as the
+company's job list. It also runs for a *known* provider whose collector just
+failed — previously it was gated on an unrecognised provider and skipped
+exactly the case where a cheap tier helps most.
+
 ---
 
 ## Output
@@ -209,8 +217,21 @@ failing the company.
 ```
 company, title, location, date_posted, job_url, apply_url, employment_type,
 remote, description, ats_provider, scraping_method, date_filter_status,
-location_match_type, first_seen, is_new
+location_match_type, remote_scope, source_query, first_seen, is_new
 ```
+
+`remote_scope` is `remote_us`, `remote_restricted`, `remote_non_us`, `hybrid`
+or `onsite`. Only `remote_us` counts as a remote match: a role tied to one
+non-Texas state ("Remote — must reside in New York") used to satisfy both the
+remote token and the US check, since any state name counted as US eligibility.
+
+`source_query` records which search term surfaced a job on a site whose jobs
+only exist behind a search. Blank for everything reached directly.
+
+Text columns are written with a leading `'` when the value starts with `=`,
+`+`, `-` or `@`. These come verbatim from third-party pages and the output is
+meant to be opened in a spreadsheet, where such a value is executed as a
+formula.
 
 `date_filter_status` is `within_window`, `older_than_window`, or
 `date_unavailable`. Jobs with no reliable posting date are **kept and flagged**,
@@ -222,17 +243,116 @@ date, and inventing one would corrupt the freshness filter.
 
 ---
 
+## Notifications
+
+A full run emails a digest of new and changed matching jobs with
+`output/company_jobs.xlsx` attached. Configure the recipient in
+`config/settings.yaml` under `notifications.email`; **credentials come from the
+environment only**, since that file is in git:
+
+```bash
+export SCRAPER_SMTP_HOST=smtp.gmail.com
+export SCRAPER_SMTP_PORT=587
+export SCRAPER_SMTP_USER=you@gmail.com
+export SCRAPER_SMTP_PASSWORD=your-app-password   # Gmail: an App Password, not your login
+```
+
+Without those three variables the run logs what it *would* have sent and
+carries on — a mail problem never fails a scrape, because the spreadsheet on
+disk is the real deliverable.
+
+Three guards decide whether anything goes out:
+
+| Guard | Why |
+|-------|-----|
+| Something new or changed | A channel that mails "0 new jobs" every run is one you stop opening |
+| Every company completed | A truncated run never saw the pages it missed, so its "new" set is not a real answer |
+| Not announced before | The `notifications` table records each job once per kind, so a digest never repeats itself |
+
+Partial runs (`--test-company`, `--limit`) never send: they know nothing about
+the companies they skipped.
+
 ## Job tracking (SQLite)
 
 `data/jobs.db` tracks every job seen, keyed on a **stable job id** derived from
 the posting URL rather than the URL itself — retitling a job changes its URL
 slug but not its underlying requisition id, so the same job stays the same row.
 
-After each successful company scrape, jobs no longer listed by that company are
-deleted. The comparison is scoped per-company via an index (measured at 0.38ms
-against a 21,000-row table), never a full-table scan. Companies whose scrape
-*failed* are skipped entirely — a scraping hiccup must never be read as "all
-jobs closed".
+Ids are **scoped by company**: `{company}:{provider}:{id}`. The extracted id is
+only unique *within* an employer, and `job_id` is the table's primary key — the
+provider prefix alone is the literal string `unknown` for every browser-routed
+company, so `https://a.com/careers?jobId=55512` and
+`https://b.com/apply?jobid=55512` used to produce the same id and merge two
+employers' postings into one row. The company key is normalized (suffixes and
+punctuation dropped) so workbook drift — "Acme Inc" one run, "Acme, Inc." the
+next — does not orphan every job that company had.
+
+`job_identity.JOB_ID_SCHEME_VERSION` records the format. When it changes, the
+`jobs` table is cleared on open rather than left holding ids nothing will ever
+match again: such rows are never refreshed and never removed (removal only
+considers ids the current run produced) while still inflating the "already
+known" set. Every job is reported as new once after such a reset, and the log
+says so.
+
+Jobs no longer listed by a company are aged out, not deleted on sight. Three
+conditions must all hold before a company is synced at all:
+
+| Condition | Why |
+|-----------|-----|
+| `result.success` | A company we could not reach tells us nothing |
+| `result.jobs` | An empty harvest is not evidence every posting closed |
+| **`result.complete`** | A scrape that stopped partway through pagination never saw the later pages — those jobs are missing from *our* data, not from the employer's site |
+
+The comparison is scoped per-company via an index (measured at 0.38ms against a
+21,000-row table), never a full-table scan.
+
+Even then removal is not immediate: a job absent from one qualifying scrape has
+its `misses` counter incremented, and only after `REMOVAL_GRACE_MISSES` (2)
+**consecutive** misses is it deleted. Seeing the job again resets the counter.
+One missed scrape is usually a flicker — a slow page, a reordered result set, a
+briefly unpublished requisition — and deleting on it destroys `first_seen`,
+which makes the job look brand new when it returns.
+
+### Collection completeness
+
+`ATSCollector.collect()` returns a **`CollectionResult`**, not a bare list:
+
+```python
+CollectionResult(jobs, complete, pages_fetched, reported_total, stop_reason)
+```
+
+`complete` is True only when the collector is confident it saw every row the
+provider would serve. A failed page, a tripped job budget, or a walk that ended
+short of the reported total all set it False and name a `stop_reason`
+(`exhausted`, `reported_total_reached`, `page_failed`, `budget_exhausted`,
+`no_new_rows`).
+
+This exists because the two cases used to be indistinguishable. A page failing
+partway through pagination produced a partial harvest the router reported as a
+success, after which the removal sync deleted every job on the pages we never
+reached — reading one transient HTTP error as "those postings closed", and
+resetting `first_seen` so they were re-reported as new when they came back.
+
+Incomplete companies are listed in the run summary with their shortfall.
+
+All 14 paginating collectors return a `CollectionResult`, and all of them get
+there through the one walk in `ats/pagination.py` rather than a hand-written
+loop each. The four that do not — Greenhouse, Lever, Ashby, Jobvite — return
+their entire board in a single response, so there is no pagination for them to
+get wrong; they stay on the `CollectionResult.coerce` shim.
+
+`paginate()` adds two things none of the hand-written loops had:
+
+- **per-page retry.** A transient failure on page 12 used to end the walk and
+  mark the company incomplete, suppressing removal sync until the next clean
+  run. Most such failures succeed on a second attempt, so the walk completes.
+- **repeated-page detection.** A tenant that ignores its own paging parameter
+  serves page 1 forever; a content hash stops on the first repeat instead of
+  parsing and de-duplicating every one.
+
+A first-page failure always propagates so the collector can raise
+`CollectorUnavailable` and let the router fall back; later pages are retried
+and then tolerated as an incomplete walk.
 
 ---
 
@@ -242,6 +362,34 @@ Everything tunable lives in `config/settings.yaml`: the freshness window
 (`hours_old`), DFW city list, target-role and exclusion regexes, HTTP
 timeout/retry/backoff, Playwright behaviour (including stealth and the search
 fallback term), and concurrency (`http_workers: 10`, `playwright_workers: 3`).
+
+### Pagination ceilings
+
+`requests.max_jobs_per_company` (default 10,000) bounds how much a converted
+collector will fetch for one company. It is expressed in **jobs, not pages**,
+deliberately: a shared *page* budget means a different job ceiling for every
+provider, because page sizes differ. The old `max_pages_per_company: 25` meant
+250 jobs on Phenom (10/page) and 5,000 on Oracle (200/page) — which silently
+truncated 23 companies in a measured run, including eleven Workday tenants that
+all returned exactly 500 (20 × 25) and seven Phenom tenants that returned
+exactly 250.
+
+Tripping the ceiling is not an error, but it marks the scrape incomplete, which
+suppresses removal sync for that company and lists it in the run summary with
+its shortfall. `max_pages_per_company` remains for collectors not yet converted
+(iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
+
+What survives a truncated walk should be what the freshness window can still
+match, so collectors that can be truncated ask for newest-first where the
+provider supports it (UKG `postedDateDesc`, Oracle `POSTING_DATES_DESC`,
+Amazon `sort=recent`).
+
+**Workday CXS ignores a sort parameter** — verified directly: requesting
+`sortBy=POSTING_DATES_DESC` returns a byte-identical first page to sending
+nothing, so the collector does not send one rather than carry a dead parameter
+that reads as a guarantee. Its default order is already posting-date
+descending, measured across Capital One's 1,854 postings: mean age climbs
+monotonically from 1.6 days in the first 200 rows to 29.0 days in the last 200.
 
 Target roles match on any title segment naming "data" as its own word (titles
 are split on `,`, `/`, `-`, `|`) — `Software Engineer, Data Engineering`
@@ -286,7 +434,18 @@ the other silently costs coverage.
 
 ## Reliability
 
-- 30s HTTP timeout, 3 retries, exponential backoff (tenacity), `Retry-After` honoured on 429
+- 30s HTTP timeout, 3 retries, exponential backoff **with jitter** (tenacity),
+  `Retry-After` honoured on 429. Jitter matters because ten workers share one
+  retry schedule — without it they back off in lockstep and retry together,
+  turning a transient 503 into a sustained one
+- **Per-host rate limiting** (`requests.per_host_rate_per_second`, default 3/s),
+  shared across all workers and keyed on hostname so a slow vendor never
+  throttles unrelated companies. Raising the pagination ceiling multiplied what
+  one company can request — a large Workday tenant went from 25 requests to as
+  many as 500 — and pacing is what keeps that polite
+- **Bounded response reads** (`http_client.MAX_RESPONSE_BYTES`, 8 MB): bodies
+  are streamed and truncated rather than read whole, since an unbounded `.text`
+  across 10 workers is a memory-exhaustion risk
 - Navigation retries with rotated user-agent/viewport
 - `playwright-stealth` patches the fingerprints headless Chromium leaks, which
   some career sites gate on
@@ -328,7 +487,8 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | `ats/detector.py` | Lexical ATS detection from a URL, plus HTML fingerprints and embedded-URL extraction. **Add a new provider's host/fingerprint here** |
 | `ats/resolver.py` | One HTTP GET on a branded page → identify the ATS behind it (redirect/fingerprint/embedded URL); 403→browser-UA retry |
 | `ats/url_repair.py` | Swaps a dead `careers.*` subdomain for a live careers page before routing |
-| `ats/base.py` | `ATSCollector` base class + `CollectorUnavailable`; `record()`/`finalize()` helpers every collector uses |
+| `ats/base.py` | `ATSCollector` base class, `CollectionResult` (the completeness contract) + `CollectorUnavailable`; `record()`/`finalize()`/`result()` helpers every collector uses |
+| `ats/pagination.py` | The shared pagination walk: per-page retry, repeated-page detection, total reconciliation, budget. **Every paginating collector uses this** |
 | `ats/html_utils.py` | Shared HTML/JSON-LD parsing helpers for collectors |
 | `ats/discovery.py` | On-demand ATS-URL discovery engine (used by `tools/find_ats_urls.py`, **not** the live pipeline) |
 
@@ -361,7 +521,9 @@ returns real jobs through it.
 | `filters.py` | Role match (per title segment), DFW/remote match, freshness window |
 | `enrich.py` | Fill coarse locations (e.g. Workday detail fetch) |
 | `deduplicate.py` | Collapse duplicate postings within a run |
-| `job_identity.py` | Stable per-job id derived from the posting URL |
+| `fit.py` | Explainable fit scoring against a configurable skill list |
+| `notify.py` | Email digest of new/changed jobs; SMTP credentials from env only |
+| `job_identity.py` | Stable, company-scoped per-job id derived from the posting URL; `JOB_ID_SCHEME_VERSION` |
 | `database.py` | SQLite tracking — upsert, per-company removal sync, new/first-seen |
 | `export_ats_urls.py` | Write verified discovered ATS URLs, verified dead-URL repairs, and run status back into the workbook |
 
@@ -389,6 +551,14 @@ python tools/canary.py
 ```
 
 Unit tests: `python -m pytest tests/ -v`
+
+Test-only dependencies live in `requirements-dev.txt` (which includes
+`requirements.txt`), so a deployment does not install a test runner it will
+never use:
+
+```bash
+pip install -r requirements-dev.txt
+```
 
 ## Finding missing ATS URLs
 

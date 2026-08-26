@@ -8,9 +8,11 @@ compound into retries^2 attempts.
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -19,7 +21,7 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
+    wait_exponential_jitter,
 )
 
 from logger import get_logger
@@ -49,6 +51,72 @@ class HTTPError(Exception):
 
 
 _thread_local = threading.local()
+
+
+class HostRateLimiter:
+    """Paces outbound requests per hostname.
+
+    One shared instance across every worker thread, because politeness is a
+    property of the *host* being called, not of the thread calling it. Ten HTTP
+    workers all scraping different companies on ``myworkdayjobs.com`` are ten
+    concurrent callers of one vendor.
+
+    Keyed on host so a slow vendor never throttles unrelated companies: each
+    host gets its own next-allowed timestamp.
+
+    A rate of 0 disables pacing entirely.
+    """
+
+    def __init__(self, rate_per_second: float):
+        self.min_interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._next_free: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, host: str) -> None:
+        """Block until this host may be called again."""
+        if not self.min_interval or not host:
+            return
+
+        with self._lock:
+            now = time.monotonic()
+            earliest = self._next_free.get(host, 0.0)
+            wait = max(0.0, earliest - now)
+            # Reserve this slot before releasing the lock, so concurrent
+            # callers queue behind each other instead of all sleeping the
+            # same interval and then firing together.
+            self._next_free[host] = max(now, earliest) + self.min_interval
+
+        if wait:
+            time.sleep(wait)
+
+
+_limiter: HostRateLimiter | None = None
+_limiter_lock = threading.Lock()
+
+
+def get_rate_limiter() -> HostRateLimiter:
+    """The process-wide per-host limiter, built from settings on first use."""
+    global _limiter
+    if _limiter is None:
+        with _limiter_lock:
+            if _limiter is None:
+                cfg = load_settings()
+                _limiter = HostRateLimiter(
+                    float(cfg.get("requests.per_host_rate_per_second", 3.0))
+                )
+    return _limiter
+
+
+def retry_wait_seconds(attempt: int, backoff_factor: float = 2.0) -> float:
+    """Exponential backoff with full jitter, capped at 60s.
+
+    Jitter matters here specifically because ten workers share one retry
+    schedule: without it they back off in lockstep and retry simultaneously,
+    which is the thundering herd that turns a transient 503 into a sustained
+    one.
+    """
+    ceiling = min(60.0, backoff_factor * (2 ** max(0, attempt - 1)))
+    return random.uniform(0.0, max(0.001, ceiling))
 
 
 def _build_session(user_agent: str) -> requests.Session:
@@ -119,12 +187,19 @@ def request(
 
     @retry(
         stop=stop_after_attempt(max(1, int(retries))),
-        wait=wait_exponential(multiplier=float(backoff_factor), min=1, max=60),
+        # Jittered: ten workers share this schedule, and backing off in
+        # lockstep turns a transient 503 into a sustained one.
+        wait=wait_exponential_jitter(initial=1, max=60, exp_base=2,
+                                     jitter=float(backoff_factor)),
         retry=retry_if_exception_type((RetryableHTTPError, requests.RequestException)),
         before_sleep=_log_retry,
         reraise=True,
     )
     def _do_request() -> requests.Response:
+        # Politeness is per-host, and applies to every attempt including
+        # retries - a retry storm is exactly when pacing matters most.
+        get_rate_limiter().acquire(urlsplit(url).netloc.split("@")[-1].split(":")[0])
+
         session = get_session()
         response = session.request(method, url, timeout=timeout, **kwargs)
 
@@ -163,6 +238,37 @@ def post_json(url: str, payload: Any, **kwargs: Any) -> Any:
     return response.json()
 
 
-def get_text(url: str, **kwargs: Any) -> str:
-    """GET a URL and return the decoded body text."""
-    return request(url, method="GET", **kwargs).text
+#: Default ceiling on a response body read into memory. Career pages are
+#: routinely 1-2 MB and occasionally larger; 8 MB is generous for real content
+#: while still bounding a hostile or misconfigured endpoint across 10 workers.
+MAX_RESPONSE_BYTES = 8_000_000
+
+
+def get_text(url: str, *, max_bytes: int | None = None, **kwargs: Any) -> str:
+    """GET a URL and return the decoded body text, bounded in size.
+
+    Reads incrementally and stops at ``max_bytes``. An unbounded ``.text`` on
+    ten concurrent workers is a memory-exhaustion risk, and no career page
+    worth parsing needs more than a few megabytes - the parsers only ever look
+    at markup near the top of the document anyway.
+    """
+    limit = MAX_RESPONSE_BYTES if max_bytes is None else max_bytes
+    kwargs.setdefault("stream", True)
+    response = request(url, method="GET", **kwargs)
+
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= limit:
+                log.debug("Truncating %s at %s bytes", url, limit)
+                break
+        body = b"".join(chunks)[:limit]
+    finally:
+        response.close()
+
+    return body.decode(response.encoding or "utf-8", errors="replace")

@@ -400,6 +400,18 @@ _NON_JOB_PATH_FRAGMENTS = (
 )
 
 
+#: Path fragments the "any URL" fallback deliberately tolerates. None of these
+#: point at a job list, but each is served from the customer's *own* tenant
+#: host, so the URL still carries the coordinates a collector needs:
+#:
+#: * careers.frostbank.com names its Workday tenant only via /external/login;
+#: * jobs.nokia.com names its Oracle tenant only via a /siteFavicon/ PNG.
+#:
+#: Both are confirmed live, and both return real jobs when the API is driven
+#: from the host they reveal.
+_HOST_BEARING_FRAGMENTS = ("/login", "/signin", "/sign-in", "/logout", "/favicon")
+
+
 def _is_plausible_job_url(url: str) -> bool:
     """Reject asset, legal and login URLs that merely share the ATS domain."""
     lowered = url.lower()
@@ -410,6 +422,112 @@ def _is_plausible_job_url(url: str) -> bool:
     if any(fragment in lowered for fragment in _NON_JOB_PATH_FRAGMENTS):
         return False
     return True
+
+
+#: Hostname labels that mark a *shared* vendor host - a CDN or asset origin
+#: serving every tenant - rather than one customer's own instance. This, not
+#: the file extension, is what separates a usable reference from a useless one:
+#: Nokia's Oracle tenant is discovered from a favicon PNG on its own host
+#: (fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com), while HCLTech's stored ATS URL
+#: was a PNG on rmkcdn.successfactors.com - a CDN shared across customers,
+#: carrying no tenant coordinates at all.
+_SHARED_HOST_MARKERS = ("cdn", "static", "assets", "asset", "media", "img",
+                        "images", "content", "resources", "public")
+
+
+def _is_shared_vendor_host(url: str) -> bool:
+    """True when the host looks like a vendor CDN rather than a tenant instance."""
+    try:
+        host = urlsplit(url).netloc.lower().split("@")[-1].split(":")[0]
+    except ValueError:
+        return False
+    labels = host.split(".")
+    if not labels:
+        return False
+    # Only the leading label is judged: "cdn.successfactors.com" and
+    # "rmkcdn.successfactors.com" are shared, "career55.sapsf.eu" is not.
+    return any(marker in labels[0] for marker in _SHARED_HOST_MARKERS)
+
+
+def _carries_tenant_coordinates(url: str) -> bool:
+    """Looser test for the fallback: not a job board, but still usable.
+
+    A login link, profile page or favicon does not point at a job list, but its
+    *host* carries the tenant/site a collector needs - which is the entire
+    reason this fallback exists (careers.frostbank.com names its Workday tenant
+    only via /external/login; jobs.nokia.com names its Oracle tenant only via a
+    favicon, and driving the API from it returns 575 jobs).
+
+    So the rule is about the host, not the file type. Rejected are:
+
+    * shared vendor CDN hosts, which carry no tenant identity;
+    * script/style assets, which are served from a shared host even when the
+      hostname does not say so (HCLTech's only path-bearing SuccessFactors
+      reference is jquery.js on hcm55.sapsf.eu, while its real tenant search
+      lives on the sibling career55.sapsf.eu - driving the script host 404s);
+    * legal, privacy and support pages, which are the vendor's own site rather
+      than the customer's (iCIMS's privacy notice became Builders
+      FirstSource's stored ATS URL).
+    """
+    lowered = url.lower()
+    path = lowered.split("?", 1)[0]
+
+    if _is_shared_vendor_host(url):
+        return False
+    if path.endswith((".js", ".css", ".map")):
+        return False
+    for fragment in _NON_JOB_PATH_FRAGMENTS:
+        if fragment in _HOST_BEARING_FRAGMENTS:
+            continue  # the case this fallback exists to serve
+        if fragment in lowered:
+            return False
+    return True
+
+
+# Hostnames that must never be fetched. Embedded URLs are harvested from
+# third-party pages, driven through a collector, then written into the workbook
+# and re-fetched on every later run - so an attacker-influenced host is
+# persistent, not transient.
+_PRIVATE_HOST_RE = re.compile(
+    r"^("
+    r"localhost|"
+    r"127\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"0\.0\.0\.0|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|"
+    r"169\.254\.\d{1,3}\.\d{1,3}|"      # link-local, incl. cloud metadata
+    r"\[?::1\]?|"
+    r"\[?[fF][cCdD][0-9a-fA-F]{2}:.*\]?"  # IPv6 unique-local
+    r")$",
+    re.I,
+)
+
+
+def is_safe_fetch_target(url: str) -> bool:
+    """True when ``url`` is an ordinary public http(s) URL worth fetching.
+
+    Refuses non-http schemes and private/loopback/link-local hosts. This is a
+    hygiene guard on URLs the pipeline did not author, not a complete SSRF
+    defence - it does not resolve DNS, so a public name pointing at a private
+    address still passes.
+    """
+    if not url:
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+
+    if parts.scheme.lower() not in {"http", "https"}:
+        return False
+
+    host = (parts.netloc or "").split("@")[-1]
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if not host:
+        return False
+
+    return not _PRIVATE_HOST_RE.match(host.strip("[]").lower())
 
 
 def _clean_extracted_url(raw: str) -> str:
@@ -472,7 +590,7 @@ def extract_embedded_ats_url(html_text: str, provider: str) -> str | None:
 
     for match in re.finditer(pattern, html_text, re.I):
         candidate = _clean_extracted_url(match.group(0))
-        if candidate and _is_plausible_job_url(candidate):
+        if candidate and _is_plausible_job_url(candidate) and is_safe_fetch_target(candidate):
             return candidate
     return None
 
@@ -511,7 +629,7 @@ def extract_any_embedded_ats_url(html_text: str, provider: str) -> str | None:
 
     for match in re.finditer(pattern, html_text, re.I):
         candidate = _clean_extracted_url(match.group(0))
-        if candidate and not candidate.lower().split("?", 1)[0].endswith((".js", ".css", ".map")):
+        if candidate and _carries_tenant_coordinates(candidate) and is_safe_fetch_target(candidate):
             return candidate
     return None
 
@@ -538,6 +656,7 @@ def extract_all_embedded_ats_urls(html_text: str, provider: str) -> list[str]:
     seen: list[str] = []
     for match in re.finditer(pattern, html_text, re.I):
         candidate = _clean_extracted_url(match.group(0))
-        if candidate and _is_plausible_job_url(candidate) and candidate not in seen:
+        if (candidate and _is_plausible_job_url(candidate)
+                and is_safe_fetch_target(candidate) and candidate not in seen):
             seen.append(candidate)
     return seen

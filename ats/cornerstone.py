@@ -45,7 +45,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import (
+    STOP_BUDGET,
+    STOP_EXHAUSTED,
+    STOP_PAGE_FAILED,
+    STOP_TOTAL_REACHED,
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+)
 from normalize import join_location
 
 # Canonical provider name. Mirrors the constants in ats.detector; kept here so
@@ -188,15 +196,22 @@ class CornerstoneCollector(ATSCollector):
     def _collect_site(
         self, endpoint: str, headers: dict[str, str], host: str, corp: str,
         site_id: int, *, strict: bool,
-    ) -> list[dict | None]:
+    ) -> tuple[list[dict | None], bool, str, int | None]:
         """Paginate one career site's search endpoint.
 
         ``strict`` (used when the URL named an explicit site) raises
         :class:`CollectorUnavailable` on a first-page failure; discovery mode
-        treats a dead/empty site as simply "no jobs here" and returns ``[]``.
+        treats a dead/empty site as simply "no jobs here".
+
+        Returns:
+            ``(records, complete, stop_reason, reported_total)`` - a page
+            failing partway through leaves ``complete`` False so the caller
+            can refuse to treat the harvest as this site's full job list.
         """
         records: list[dict | None] = []
         total: int | None = None
+        complete = True
+        stop_reason = STOP_EXHAUSTED
 
         for page in range(1, MAX_PAGES + 1):
             payload = {
@@ -220,14 +235,19 @@ class CornerstoneCollector(ATSCollector):
                         f"Cornerstone search endpoint unavailable: {exc}"
                     ) from exc
                 if page > 1:
-                    self.log.warning("%s: Cornerstone site %s page %s failed (%s)",
-                                     self.company, site_id, page, exc)
+                    self.log.warning(
+                        "%s: Cornerstone site %s page %s failed (%s); marking incomplete",
+                        self.company, site_id, page, exc,
+                    )
+                    complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             body = data.get("data") if isinstance(data, dict) else None
             if not isinstance(body, dict):
                 if page == 1 and strict:
                     raise CollectorUnavailable("Cornerstone returned no data envelope")
+                if page > 1:
+                    complete, stop_reason = False, STOP_PAGE_FAILED
                 break
 
             if total is None:
@@ -252,12 +272,17 @@ class CornerstoneCollector(ATSCollector):
                 )
 
             if total is not None and page * PAGE_SIZE >= int(total):
+                stop_reason = STOP_TOTAL_REACHED
                 break
+        else:
+            # Ran the full page range without reaching the reported total.
+            if total is not None and len(records) < int(total):
+                complete, stop_reason = False, STOP_BUDGET
 
-        return records
+        return records, complete, stop_reason, total
 
     # -- interface --------------------------------------------------------
-    def collect(self) -> list[dict]:
+    def collect(self) -> CollectionResult:
         host = self._host()
         corp = self._corp(host)
         explicit_site = self._site_id_from_url()
@@ -271,21 +296,40 @@ class CornerstoneCollector(ATSCollector):
         }
 
         records: list[dict | None] = []
+        complete = True
+        stop_reason = STOP_EXHAUSTED
+        total: int | None = None
+
         if explicit_site is not None:
             # The URL named a site: trust it and fail loudly if it is broken.
-            records = self._collect_site(
+            records, complete, stop_reason, total = self._collect_site(
                 endpoint, headers, host, corp, explicit_site, strict=True,
             )
         else:
             # No site in the URL: probe the numbered sites and keep every one
             # that returns requisitions (a tenant may split roles across sites).
+            # A single site stopping short makes the whole company incomplete -
+            # we cannot tell which of its jobs we never saw.
             for site_id in range(1, MAX_SITES + 1):
-                records.extend(
-                    self._collect_site(
-                        endpoint, headers, host, corp, site_id, strict=False,
-                    )
+                rows, site_complete, site_reason, site_total = self._collect_site(
+                    endpoint, headers, host, corp, site_id, strict=False,
                 )
+                records.extend(rows)
+                if not site_complete:
+                    complete, stop_reason = False, site_reason
+                if site_total is not None:
+                    total = (total or 0) + int(site_total)
 
         if not records:
             raise CollectorUnavailable("Cornerstone search returned zero requisitions")
-        return self.finalize(records)
+
+        jobs = self.finalize(records)
+        if not complete:
+            self.log.warning(
+                "%s: Cornerstone scrape INCOMPLETE (%s) - collected %s of %s",
+                self.company, stop_reason, len(jobs), total,
+            )
+        return CollectionResult(
+            jobs=jobs, complete=complete, reported_total=total,
+            stop_reason=stop_reason,
+        )

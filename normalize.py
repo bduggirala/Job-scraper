@@ -43,6 +43,22 @@ TRACKING_PARAMS = {
 _WHITESPACE_RE = re.compile(r"\s+")
 _TAG_RE = re.compile(r"<[^>]+>")
 
+#: A posting older than this is treated as a parsing artefact, not a real date.
+#: Generous on purpose - the point is to catch nonsense like a fuzzy parse
+#: landing in 1998, not to second-guess a genuinely long-running requisition.
+MAX_AGE_DAYS = 1095  # ~3 years
+
+#: What has to be present before a string is handed to dateutil's fuzzy parser:
+#: a month name, or a run of digits separated by / or - (2026-08-20, 8/20/26).
+#: Without this guard "Building 7" and "Level 3" both parse as dates.
+_LOOKS_LIKE_DATE_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b"
+    r"|\d{1,4}[/-]\d{1,2}[/-]\d{2,4}"
+    r"|\d{4}-\d{2}-\d{2}"
+    r"|\d{1,2}:\d{2}",
+    re.I,
+)
+
 _REMOTE_HINTS = (
     "remote", "work from home", "work-from-home", "wfh", "telecommute",
     "virtual", "anywhere", "home based", "home-based", "distributed",
@@ -177,6 +193,13 @@ def parse_date(value: Any, *, reference: datetime | None = None) -> datetime | N
     if not cleaned:
         return None
 
+    # dateutil's fuzzy mode will pull a "date" out of almost any string
+    # containing a number - "Building 7", "Suite 200", "Level 3" and
+    # "5 openings" all parse. Browser-scraped text reaches here routinely, so
+    # require something that actually looks like a date first.
+    if not _LOOKS_LIKE_DATE_RE.search(cleaned):
+        return None
+
     try:
         parsed = date_parser.parse(cleaned, fuzzy=True, default=now.replace(
             hour=0, minute=0, second=0, microsecond=0))
@@ -186,8 +209,13 @@ def parse_date(value: Any, *, reference: datetime | None = None) -> datetime | N
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
 
-    # Guard against fuzzy parsing pulling a nonsense far-future date.
+    # Bounded both ways. A far-future date is nonsense, and so is a posting
+    # from years ago - both are parsing artefacts rather than real postings,
+    # and an artefact old date is the dangerous one: it classifies a fresh job
+    # as stale and drops it silently.
     if parsed > now + timedelta(days=2):
+        return None
+    if parsed < now - timedelta(days=MAX_AGE_DAYS):
         return None
     return parsed
 

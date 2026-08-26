@@ -27,7 +27,8 @@ from __future__ import annotations
 from typing import Any
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from normalize import join_location
 
 try:  # pragma: no cover - falls back until AMAZON lands in the detector
@@ -103,55 +104,29 @@ class AmazonJobsCollector(ATSCollector):
             )
         return rows
 
-    def collect(self) -> list[dict]:
-        """Paginate ``search.json`` and return every posting as a record.
+    def _page(self, request: PageRequest):
+        data = self._fetch_page(request.offset)
+        return self._parse_jobs(data.get("jobs") or []), data.get("hits")
+
+    def collect(self) -> CollectionResult:
+        """Paginate ``search.json`` and return every posting it will serve.
 
         Raises:
             CollectorUnavailable: the first request fails or reports zero hits,
                 signalling the router to fall back to Playwright.
         """
         try:
-            first = self._fetch_page(0)
+            walk = paginate(
+                self._page,
+                page_size=RESULT_LIMIT, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/amazon",
+            )
+        except CollectorUnavailable:
+            raise
         except Exception as exc:
-            raise CollectorUnavailable(
-                f"Amazon search.json unavailable: {exc}"
-            ) from exc
+            raise CollectorUnavailable(f"Amazon search.json unavailable: {exc}") from exc
 
-        hits = int(first.get("hits") or 0)
-        if hits <= 0 and not first.get("jobs"):
-            raise CollectorUnavailable("Amazon search.json returned zero jobs")
-
-        records: list[dict | None] = []
-        seen: set[str] = set()
-
-        def absorb(jobs: list[dict[str, Any]]) -> None:
-            for row in self._parse_jobs(jobs or []):
-                if not row:
-                    continue
-                url = row["job_url"]
-                if url in seen:
-                    continue
-                seen.add(url)
-                records.append(row)
-
-        absorb(first.get("jobs") or [])
-
-        offset = RESULT_LIMIT
-        for _ in range(1, MAX_PAGES):
-            if offset >= hits:
-                break
-            try:
-                page = self._fetch_page(offset)
-            except Exception:
-                # A later page failing is tolerated: keep what we already have
-                # rather than discarding a large, valid partial harvest.
-                break
-            page_jobs = page.get("jobs") or []
-            if not page_jobs:
-                break
-            absorb(page_jobs)
-            offset += RESULT_LIMIT
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Amazon search.json yielded no parseable jobs")
-        return self.finalize(records)
+        return self.result(walk, walk.items)

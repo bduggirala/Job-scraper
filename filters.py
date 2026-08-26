@@ -48,6 +48,22 @@ _REMOTE_TOKENS = (
     "us-remote", "remote - us", "nationwide", "distributed",
 )
 
+# --- workplace / remote scope ---------------------------------------------
+# "Remote" is not one thing, and collapsing it to a boolean let the wrong jobs
+# through: "Remote - must reside in New York" satisfied both a remote token and
+# the US check (any state name counted as US eligibility), so it reached the
+# output as a DFW/remote match while being neither.
+REMOTE_US = "remote_us"                 # remote, anywhere in the U.S.
+REMOTE_RESTRICTED = "remote_restricted"  # remote, but tied to a non-Texas state
+REMOTE_NON_US = "remote_non_us"          # remote, outside the U.S.
+WORKPLACE_HYBRID = "hybrid"              # part on-site
+WORKPLACE_ONSITE = "onsite"              # ordinary office location
+
+_HYBRID_TOKENS = (
+    "hybrid", "days onsite", "days on-site", "days in office", "days in-office",
+    "flex office", "flexible office",
+)
+
 # Remote roles outside the U.S. must not qualify.
 _NON_US_TOKENS = (
     "india", "canada", "mexico", "united kingdom", "uk", "ireland", "germany",
@@ -57,6 +73,64 @@ _NON_US_TOKENS = (
     "hyderabad", "pune", "chennai", "mumbai", "noida", "gurgaon", "toronto",
     "vancouver", "london", "dublin", "berlin", "paris", "madrid", "warsaw",
 )
+
+
+def _named_states(text: str) -> set[str]:
+    """U.S. states named in ``text``, by full name or "City, ST" abbreviation.
+
+    Abbreviations require a preceding comma, matching the convention
+    :meth:`LocationMatcher._conflicting_state` already uses. Without that
+    anchor two-letter state codes collide with ordinary words - "in" is
+    Indiana, so "Remote (Anywhere in the US)" read as a state-restricted role.
+    """
+    found: set[str] = set()
+    for abbrev, name in _STATE_TOKENS.items():
+        if re.search(rf"\b{re.escape(name)}\b", text, re.I):
+            found.add(abbrev)
+        elif re.search(rf",\s*{abbrev}\b", text, re.I):
+            found.add(abbrev)
+    return found
+
+
+def classify_remote_scope(record: dict[str, Any]) -> str:
+    """Classify a record's workplace arrangement.
+
+    Returns one of :data:`REMOTE_US`, :data:`REMOTE_RESTRICTED`,
+    :data:`REMOTE_NON_US`, :data:`WORKPLACE_HYBRID` or
+    :data:`WORKPLACE_ONSITE`.
+
+    Hybrid is checked before remote because "Hybrid - Dallas" contains no
+    remote token but "Remote/Hybrid" contains both, and part-onsite is the
+    stronger constraint. A remote role naming exactly one non-Texas state is
+    *restricted*, not U.S.-wide - that distinction is the whole point, since a
+    state name used to count as positive evidence of U.S. eligibility.
+    """
+    location = (record.get("location") or "").lower()
+    title = (record.get("title") or "").lower()
+    haystack = f"{location} {title}"
+
+    if any(token in haystack for token in _HYBRID_TOKENS):
+        return WORKPLACE_HYBRID
+
+    explicit = record.get("remote")
+    has_token = any(token in haystack for token in _REMOTE_TOKENS)
+    if explicit is not True and not has_token:
+        return WORKPLACE_ONSITE
+
+    if any(re.search(rf"\b{re.escape(t)}\b", haystack) for t in _NON_US_TOKENS):
+        return REMOTE_NON_US
+
+    states = _named_states(haystack)
+    if states and "tx" not in states:
+        # Remote but pinned to somewhere else. Several states named together
+        # ("Remote - NY, NJ, CT") is still a restriction, just a broader one.
+        return REMOTE_RESTRICTED
+
+    # A blank or generic location carries no evidence either way and is
+    # trusted; a detailed one needs positive U.S. evidence.
+    if location and not LocationMatcher._has_us_signal(haystack):
+        return REMOTE_NON_US
+    return REMOTE_US
 
 
 class RoleMatcher:
@@ -140,28 +214,16 @@ class LocationMatcher:
         return any(token in text for token in _REMOTE_TOKENS)
 
     def is_remote_us(self, record: dict[str, Any]) -> bool:
-        """True when the record is a U.S.-eligible remote role."""
+        """True only for remote roles open anywhere in the U.S.
+
+        Delegates to :func:`classify_remote_scope`, so a role restricted to one
+        non-Texas state, a hybrid role, and a non-U.S. remote role are all
+        correctly excluded rather than collapsed into "has a remote token and
+        mentions somewhere American".
+        """
         if not self.include_remote:
             return False
-
-        location = (record.get("location") or "").lower()
-        title = (record.get("title") or "").lower()
-        haystack = f"{location} {title}"
-
-        explicit_remote = record.get("remote")
-        has_token = any(token in haystack for token in _REMOTE_TOKENS)
-
-        if explicit_remote is not True and not has_token:
-            return False
-        if self._has_non_us_signal(haystack):
-            return False
-        # A blank/generic location carries no evidence either way and is
-        # trusted as-is (this is a US-focused job search tool). A specific,
-        # detailed location listing needs positive US evidence, not just the
-        # absence of a blocklisted non-US one.
-        if location and not self._has_us_signal(haystack):
-            return False
-        return True
+        return classify_remote_scope(record) == REMOTE_US
 
     def _conflicting_state(self, text: str, matched_city: str) -> bool:
         """True when the string names a U.S. state other than Texas."""
@@ -283,6 +345,9 @@ def apply_filters(
         enriched = dict(record)
         enriched["date_filter_status"] = status
         enriched["location_match_type"] = reason
+        # Carried into the output so "remote" is legible rather than a bare
+        # flag: remote_us / remote_restricted / remote_non_us / hybrid / onsite.
+        enriched["remote_scope"] = classify_remote_scope(record)
 
         if status == WITHIN_WINDOW:
             counts["within_window"] += 1

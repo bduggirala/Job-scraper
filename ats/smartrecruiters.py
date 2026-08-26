@@ -11,8 +11,9 @@ from __future__ import annotations
 from typing import Any
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
 from ats.detector import SMARTRECRUITERS
+from ats.pagination import PageRequest, paginate
 from normalize import join_location
 
 API_TEMPLATE = "https://api.smartrecruiters.com/v1/companies/{company}/postings"
@@ -40,56 +41,47 @@ class SmartRecruitersCollector(ATSCollector):
         remote = location.get("remote")
         return text, bool(remote) if isinstance(remote, bool) else None
 
-    def collect(self) -> list[dict]:
+    def _fetch_page(self, url: str, request: PageRequest):
+        data = http_client.get_json(
+            url, params={"limit": request.page_size, "offset": request.offset}
+        )
+        if not isinstance(data, dict):
+            raise CollectorUnavailable("SmartRecruiters returned a non-object response")
+        return data.get("content") or [], data.get("totalFound")
+
+    def collect(self) -> CollectionResult:
         company_id = self._company_id()
         url = API_TEMPLATE.format(company=company_id)
 
-        records: list[dict | None] = []
-        offset = 0
-        total: int | None = None
+        try:
+            walk = paginate(
+                lambda request: self._fetch_page(url, request),
+                page_size=PAGE_SIZE, max_jobs=self.max_jobs,
+                label=f"{self.company}/smartrecruiters",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"SmartRecruiters API unavailable: {exc}") from exc
 
-        for page in range(self.max_pages):
-            try:
-                data = http_client.get_json(
-                    url, params={"limit": PAGE_SIZE, "offset": offset}
+        records = []
+        for posting in walk.items:
+            if not isinstance(posting, dict):
+                continue
+            location_text, remote = self._location(posting)
+            job_id = posting.get("id")
+            records.append(
+                self.record(
+                    title=posting.get("name"),
+                    location=location_text,
+                    date_posted=posting.get("releasedDate") or posting.get("createdOn"),
+                    job_url=PUBLIC_JOB_URL.format(company=company_id, job_id=job_id)
+                    if job_id else posting.get("ref"),
+                    employment_type=(posting.get("typeOfEmployment") or {}).get("label")
+                    if isinstance(posting.get("typeOfEmployment"), dict) else None,
+                    remote=remote,
                 )
-            except Exception as exc:
-                if page == 0:
-                    raise CollectorUnavailable(f"SmartRecruiters API unavailable: {exc}") from exc
-                self.log.warning("%s: SmartRecruiters page %s failed (%s)", self.company, page, exc)
-                break
-
-            if not isinstance(data, dict):
-                raise CollectorUnavailable("SmartRecruiters returned a non-object response")
-
-            postings = data.get("content") or []
-            if total is None:
-                total = data.get("totalFound")
-            if not postings:
-                break
-
-            for posting in postings:
-                if not isinstance(posting, dict):
-                    continue
-                location_text, remote = self._location(posting)
-                job_id = posting.get("id")
-                records.append(
-                    self.record(
-                        title=posting.get("name"),
-                        location=location_text,
-                        date_posted=posting.get("releasedDate") or posting.get("createdOn"),
-                        job_url=PUBLIC_JOB_URL.format(company=company_id, job_id=job_id)
-                        if job_id else posting.get("ref"),
-                        employment_type=(posting.get("typeOfEmployment") or {}).get("label")
-                        if isinstance(posting.get("typeOfEmployment"), dict) else None,
-                        remote=remote,
-                    )
-                )
-
-            offset += PAGE_SIZE
-            if total is not None and offset >= int(total):
-                break
-
+            )
         if not records:
             raise CollectorUnavailable("SmartRecruiters API returned zero postings")
-        return self.finalize(records)
+        return self.result(walk, records)

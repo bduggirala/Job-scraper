@@ -70,12 +70,39 @@ target_role_patterns:
 # posting.
 exclude_role_patterns:
   - '\bdata\s+scientist'
+  - '\bdata\s+science\b'
   - '\bmachine\s+learning\s+engineer'
   - '\bml\s+engineer'
   - '\b(intern|internship|co-?op)\b'
-  - '\b(lead|manager|principal)\b'
   - '\bdata\s*center'
   - '\bdata\s+entry\b'
+
+  # Non-engineering "data" roles. '\banalyst\b' is written as its own word so
+  # it rejects "Data Analyst" / "Sr. Analyst, Data Analysis" while leaving
+  # "Data Analytics Engineer" and "Analytics Engineer" alone - those are
+  # target roles, and "analytics" is a different word from "analyst".
+  # Confirmed against a live Capital One run: of 35 titles matching '\bdata\b',
+  # all but one were analyst/scientist/manager roles rather than engineering.
+  - '\banalyst\b'
+  - '\banalysis\b'
+  - '\bbusiness\s+intelligence\b'
+  - '\bdata\s+steward'
+  - '\bdata\s+governance\b'
+  - '\bdata\s+architect\b'
+  # Non-engineering roles that merely sit near data, seen in the same run:
+  # "Data Annotator", "Principal Associate, Accounting - CPC Card Data Team",
+  # "Sr Associate, Product Management - Finance Data". None risk a real
+  # engineering title.
+  - '\bannotator\b'
+  - '\baccounting\b'
+  - '\bproduct\s+management\b'
+
+  # Management, by shape rather than by seniority word. The previous
+  # '\b(lead|manager|principal)\b' also rejected "Lead Data Engineer" and
+  # "Principal Data Engineer", which are individual-contributor titles at most
+  # employers and among the most relevant senior postings there are.
+  - '\b(manager|director|head\s+of|vice\s+president|vp)\b'
+  - '\bmanaging\s+consultant\b'
 
 # --- Playwright fallback ---------------------------------------------------
 playwright:
@@ -143,8 +170,29 @@ playwright:
   # before the role filter ever runs.
   search_fallback:
     enabled: true
-    search_term: "Data"
     max_wait_ms: 6000
+
+    # On a search-driven site the site's own search is the only view of its
+    # jobs we ever get, so one term is a coverage ceiling, not a filter: a role
+    # whose title contains no "data" - Snowflake Engineer, Databricks Engineer,
+    # ETL Developer, Analytics Engineer - is simply invisible to a "Data"
+    # query, and those are all on the target list.
+    #
+    # Broad terms first: results merge and de-duplicate across queries, and
+    # each row records which query found it (`source_query`). Searching stays
+    # broad on purpose - target_role_patterns does the narrowing afterwards,
+    # and can only ever filter what was actually fetched.
+    search_terms:
+      - "Data"
+      - "Engineer"
+      - "Analytics"
+      - "ETL"
+
+    # Bound per company: each query costs a submit plus max_wait_ms.
+    max_queries: 4
+
+    # Retained so an older config keeps working; search_terms wins when set.
+    search_term: "Data"
 
 # --- HTTP behaviour --------------------------------------------------------
 requests:
@@ -158,7 +206,30 @@ requests:
   # reproduced 6/6). A generic UA doesn't match the bot signatures WAF
   # blocklists.
   user_agent: "Mozilla/5.0"
-  max_pages_per_company: 25   # pagination guard for API collectors
+
+  # Legacy page-count guard, still used by collectors not yet converted to
+  # CollectionResult (iCIMS, SuccessFactors, Avature, Taleo, Paylocity).
+  max_pages_per_company: 25
+
+  # Job-count ceiling for converted collectors. Expressed in JOBS, not pages,
+  # because a shared *page* budget means a different job ceiling per provider:
+  # 25 pages was 250 jobs on Phenom (10/page) and 5,000 on Oracle (200/page).
+  # That mismatch silently truncated 23 companies - measured against a real
+  # run, eleven Workday tenants returned exactly 500 (20 x 25) and seven
+  # Phenom tenants exactly 250 (10 x 25).
+  #
+  # Tripping this ceiling is not an error, but it does mark the scrape
+  # incomplete, which suppresses removal sync for that company and lists it in
+  # the run summary. Raise it if the summary keeps reporting a real shortfall.
+  max_jobs_per_company: 10000
+
+  # Politeness ceiling per hostname, shared across all HTTP workers. Raising
+  # max_jobs_per_company multiplied what one company can request (a large
+  # Workday tenant went from 25 requests to as many as 500), and ten workers
+  # scraping different companies on the same vendor host are ten concurrent
+  # callers of that host. Keyed on host, so a slow vendor never throttles
+  # unrelated companies. Set to 0 to disable.
+  per_host_rate_per_second: 3.0
 
 # --- Concurrency -----------------------------------------------------------
 concurrency:
@@ -177,7 +248,12 @@ concurrency:
   # Per-company limits, measured from when a company actually starts (not
   # when it was queued). This is the bound that matters: without it, one
   # wedged page costs the entire phase budget.
-  api_company_timeout_seconds: 300      # 5 min
+  # Raised from 300s alongside the jobs-based pagination ceiling and per-host
+  # pacing. A 10,000-job Workday tenant is 500 sequential requests; at 3 req/s
+  # plus latency that is ~320s, which would have been recorded as a Timeout
+  # failure under the old limit - losing the company entirely, which is worse
+  # than the truncation the higher ceiling was meant to fix.
+  api_company_timeout_seconds: 900      # 15 min
   # Multi-layer traversal can render up to max_hop_visits pages before it
   # concludes, and nav retries stack on top. At 240s companies that finish
   # comfortably in isolation (7-Eleven, Omnicell) were being cut off
@@ -199,8 +275,36 @@ output:
   directory: output
   csv: company_jobs.csv
   json: company_jobs.json
+  xlsx: company_jobs.xlsx          # emailed as the attachment
   failures: scraper_failures.csv
   raw_csv: company_jobs_raw.csv    # only written with --save-raw
+
+# --- Notifications ---------------------------------------------------------
+# A digest of new and changed matching jobs, with the spreadsheet attached.
+#
+# Sent only on a FULL run, only when there is something new, and only when
+# every company completed - a truncated run has not seen the pages it missed,
+# so its "new" set is not a real answer. Each job is announced once per kind
+# (new / changed), tracked in the `notifications` table.
+#
+# CREDENTIALS ARE READ FROM THE ENVIRONMENT ONLY. This file is in git; an SMTP
+# password must never be able to land in it. Set before running:
+#
+#   SCRAPER_SMTP_HOST      e.g. smtp.gmail.com
+#   SCRAPER_SMTP_PORT      587 (STARTTLS) or 465 (SSL); defaults to 587
+#   SCRAPER_SMTP_USER      the sending account
+#   SCRAPER_SMTP_PASSWORD  an app password, not the account password
+#
+# For Gmail this requires 2FA plus an App Password
+# (https://myaccount.google.com/apppasswords) - a normal password will be
+# rejected. Without these three variables the run logs what it *would* have
+# sent and carries on; a mail problem never fails a scrape.
+notifications:
+  email:
+    enabled: true
+    to: duggirala.de@gmail.com
+    # from: defaults to SCRAPER_SMTP_USER when unset
+    attach_spreadsheet: true
 
 logging:
   file: logs/scraper.log

@@ -12,8 +12,9 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
 from ats.detector import EIGHTFOLD
+from ats.pagination import PageRequest, paginate
 from normalize import join_location
 
 PAGE_SIZE = 50
@@ -58,58 +59,43 @@ class EightfoldCollector(ATSCollector):
             return join_location(*[str(loc) for loc in locations[:3]])
         return None
 
-    def collect(self) -> list[dict]:
+    def _fetch_page(self, endpoint: str, domain: str, request: PageRequest):
+        data = http_client.get_json(endpoint, params={
+            "domain": domain, "start": request.offset,
+            "num": request.page_size, "sort_by": "timestamp",
+        })
+        if not isinstance(data, dict):
+            raise CollectorUnavailable("Eightfold returned a non-object response")
+        return data.get("positions") or [], data.get("count")
+
+    def collect(self) -> CollectionResult:
         host = self._host()
         endpoint = f"https://{host}/api/apply/v2/jobs"
         domain = self._domain()
 
-        records: list[dict | None] = []
-        start = 0
-        total: int | None = None
+        try:
+            walk = paginate(
+                lambda request: self._fetch_page(endpoint, domain, request),
+                page_size=PAGE_SIZE, max_jobs=self.max_jobs,
+                label=f"{self.company}/eightfold",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Eightfold API unavailable: {exc}") from exc
 
-        for page in range(self.max_pages):
-            params = {
-                "domain": domain,
-                "start": start,
-                "num": PAGE_SIZE,
-                "sort_by": "timestamp",
-            }
-            try:
-                data = http_client.get_json(endpoint, params=params)
-            except Exception as exc:
-                if page == 0:
-                    raise CollectorUnavailable(f"Eightfold API unavailable: {exc}") from exc
-                self.log.warning("%s: Eightfold page %s failed (%s)", self.company, page, exc)
-                break
-
-            if not isinstance(data, dict):
-                raise CollectorUnavailable("Eightfold returned a non-object response")
-
-            positions = data.get("positions") or []
-            if total is None:
-                total = data.get("count")
-            if not positions:
-                break
-
-            for position in positions:
-                if not isinstance(position, dict):
-                    continue
-                records.append(
-                    self.record(
-                        title=position.get("name") or position.get("title"),
-                        location=self._location(position),
-                        date_posted=position.get("t_create") or position.get("t_update"),
-                        job_url=position.get("canonicalPositionUrl")
-                        or position.get("positionUrl"),
-                        employment_type=position.get("type"),
-                        description=position.get("job_description"),
-                    )
-                )
-
-            start += PAGE_SIZE
-            if total is not None and start >= int(total):
-                break
-
+        records = [
+            self.record(
+                title=position.get("name") or position.get("title"),
+                location=self._location(position),
+                date_posted=position.get("t_create") or position.get("t_update"),
+                job_url=position.get("canonicalPositionUrl") or position.get("positionUrl"),
+                employment_type=position.get("type"),
+                description=position.get("job_description"),
+            )
+            for position in walk.items
+            if isinstance(position, dict)
+        ]
         if not records:
             raise CollectorUnavailable("Eightfold API returned zero positions")
-        return self.finalize(records)
+        return self.result(walk, records)

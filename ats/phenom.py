@@ -24,18 +24,36 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from ats.detector import PHENOM
 from normalize import join_location
 
+# Phenom serves 10 rows per request, so the old shared 25-*page* budget capped
+# every tenant at 250 jobs - measured live against seven of them (RTX, Cisco,
+# HPE, Humana, BCG, Collins Aerospace, Cencora all returned exactly 250). The
+# ceiling is now expressed in jobs via ATSCollector.max_jobs, which means the
+# same thing regardless of a provider's page size.
 PAGE_SIZE = 10
-MAX_JOBS = 1500
 
 _DDO_RE = re.compile(r"phApp\.ddo\s*=\s*(\{.*?\})\s*;", re.S)
 
 
+#: Phenom's own ceiling, below the global default. Every page is a full HTML
+#: render returning only 10 rows, so the shared 10,000-job budget would mean
+#: 1,000 sequential page loads for one company - past the per-company timeout
+#: even before per-host pacing. 2,000 is 8x the old 250-job cap while keeping
+#: the request count to ~200. A tenant larger than this reports incomplete,
+#: which is honest and visible rather than silent.
+MAX_JOBS = 2000
+
+
 class PhenomCollector(ATSCollector):
     provider = PHENOM
+
+    @property
+    def max_jobs(self) -> int:
+        return min(super().max_jobs, MAX_JOBS)
 
     def _base_url(self) -> str:
         """Career-site root including its locale segment (e.g. /us/en)."""
@@ -113,69 +131,47 @@ class PhenomCollector(ATSCollector):
             return f"{base}/job/{seq}"
         return str(apply_url) if apply_url else None
 
-    def collect(self) -> list[dict]:
+    def _page(self, search_url: str, base: str, request: PageRequest):
+        html_text = http_client.get_text(
+            search_url,
+            params={"from": request.offset, "s": "1"},
+            headers={"Accept": "text/html", "Referer": base},
+        )
+        ddo = self._parse_ddo(html_text)
+        if ddo is None:
+            raise CollectorUnavailable("Phenom page did not contain phApp.ddo")
+        jobs, page_total = self._extract_jobs(ddo)
+        rows = [
+            self.record(
+                title=job.get("title"),
+                location=self._location(job),
+                date_posted=job.get("postedDate") or job.get("dateCreated"),
+                job_url=self._job_url(base, job),
+                apply_url=job.get("applyUrl"),
+                employment_type=job.get("type"),
+                description=job.get("descriptionTeaser"),
+            )
+            for job in jobs
+            if isinstance(job, dict)
+        ]
+        return [r for r in rows if r], page_total
+
+    def collect(self) -> CollectionResult:
         base = self._base_url()
         search_url = f"{base}/search-results"
 
-        records: list[dict | None] = []
-        seen: set[str] = set()
-        total: int | None = None
+        try:
+            walk = paginate(
+                lambda request: self._page(search_url, base, request),
+                page_size=PAGE_SIZE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/phenom",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Phenom search-results unavailable: {exc}") from exc
 
-        for page in range(self.max_pages):
-            offset = page * PAGE_SIZE
-            try:
-                html_text = http_client.get_text(
-                    search_url,
-                    params={"from": offset, "s": "1"},
-                    headers={"Accept": "text/html", "Referer": base},
-                )
-            except Exception as exc:
-                if page == 0:
-                    raise CollectorUnavailable(f"Phenom search-results unavailable: {exc}") from exc
-                self.log.warning("%s: Phenom page %s failed (%s)", self.company, page, exc)
-                break
-
-            ddo = self._parse_ddo(html_text)
-            if ddo is None:
-                if page == 0:
-                    raise CollectorUnavailable("Phenom page did not contain phApp.ddo")
-                break
-
-            jobs, page_total = self._extract_jobs(ddo)
-            if total is None and page_total is not None:
-                total = int(page_total)
-            if not jobs:
-                break
-
-            page_records = [
-                self.record(
-                    title=job.get("title"),
-                    location=self._location(job),
-                    date_posted=job.get("postedDate") or job.get("dateCreated"),
-                    job_url=self._job_url(base, job),
-                    apply_url=job.get("applyUrl"),
-                    employment_type=job.get("type"),
-                    description=job.get("descriptionTeaser"),
-                )
-                for job in jobs
-                if isinstance(job, dict)
-            ]
-
-            fresh = [r for r in page_records if r and r["job_url"] not in seen]
-            if not fresh:
-                break
-            for record in fresh:
-                seen.add(record["job_url"])
-            records.extend(fresh)
-
-            if total is not None and len(records) >= min(total, MAX_JOBS):
-                break
-            if len(records) >= MAX_JOBS:
-                break
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Phenom search-results returned zero jobs")
-
-        self.log.debug("%s: Phenom reported total=%s, collected=%s",
-                       self.company, total, len(records))
-        return self.finalize(records)
+        return self.result(walk, walk.items)

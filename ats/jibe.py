@@ -24,7 +24,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from ats.detector import JIBE
 from normalize import join_location
 
@@ -76,46 +77,31 @@ class JibeCollector(ATSCollector):
             description=data.get("description"),
         )
 
-    def collect(self) -> list[dict]:
+    def _page(self, endpoint: str, host: str, request: PageRequest):
+        data = self._fetch_page(endpoint, request.page_number)
+        rows = [
+            self._row(host, job.get("data") or {})
+            for job in (data.get("jobs") or [])
+            if isinstance(job, dict)
+        ]
+        return [r for r in rows if r], data.get("totalCount") or data.get("count")
+
+    def collect(self) -> CollectionResult:
         host = self._host()
         endpoint = f"https://{host}/api/jobs"
 
-        records: list[dict | None] = []
-        seen: set[str] = set()
-        total: int | None = None
+        try:
+            walk = paginate(
+                lambda request: self._page(endpoint, host, request),
+                page_size=RECORDS_PER_PAGE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/jibe",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(f"Jibe API unavailable: {exc}") from exc
 
-        for page in range(1, MAX_PAGES + 1):
-            try:
-                data = self._fetch_page(endpoint, page)
-            except CollectorUnavailable:
-                raise
-            except Exception as exc:
-                if page == 1:
-                    raise CollectorUnavailable(f"Jibe API unavailable: {exc}") from exc
-                self.log.warning("%s: Jibe page %s failed (%s)", self.company, page, exc)
-                break
-
-            jobs = data.get("jobs") or []
-            if total is None:
-                total = data.get("totalCount") or data.get("count")
-
-            fresh = []
-            for job in jobs:
-                if not isinstance(job, dict):
-                    continue
-                row = self._row(host, job.get("data") or {})
-                if row and row["job_url"] not in seen:
-                    fresh.append(row)
-
-            if not fresh:
-                break
-            for row in fresh:
-                seen.add(row["job_url"])
-            records.extend(fresh)
-
-            if total is not None and len(seen) >= int(total):
-                break
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Jibe API returned zero jobs")
-        return self.finalize(records)
+        return self.result(walk, walk.items)

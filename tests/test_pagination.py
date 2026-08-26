@@ -84,7 +84,7 @@ def test_accumulates_across_an_appending_load_more_button(browser_ctx):
     initial = _extract_job_rows(page)
     assert len(initial) == 1
 
-    rows = _paginate_and_extract(page, initial, max_clicks=3, timeout_ms=5000)
+    rows, _exhausted = _paginate_and_extract(page, initial, max_clicks=3, timeout_ms=5000)
 
     # One click appends 1 new job each time -> 1 initial + 3 clicks = 4 total.
     assert len(rows) == 4
@@ -104,7 +104,7 @@ def test_accumulates_across_a_content_replacing_next_link(browser_ctx):
     initial = _extract_job_rows(page)
     assert len(initial) == 2  # page one only, before any pagination
 
-    rows = _paginate_and_extract(page, initial, max_clicks=1, timeout_ms=5000)
+    rows, _exhausted = _paginate_and_extract(page, initial, max_clicks=1, timeout_ms=5000)
 
     # Old behavior would return only page two's 2 jobs (content replaced).
     # Fixed behavior accumulates both pages: 4 total.
@@ -125,5 +125,5 @@ def test_stops_when_nothing_new_appears(browser_ctx):
         "https://example.test/",
     )
     initial = _extract_job_rows(page)
-    rows = _paginate_and_extract(page, initial, max_clicks=5, timeout_ms=5000)
+    rows, _exhausted = _paginate_and_extract(page, initial, max_clicks=5, timeout_ms=5000)
     assert len(rows) == 1

@@ -17,7 +17,12 @@ from typing import Any
 from ats.amazon import AmazonJobsCollector
 from ats.ashby import AshbyCollector
 from ats.avature import AvatureCollector
-from ats.base import ATSCollector, CollectorUnavailable, SCRAPING_METHOD_BROWSER
+from ats.base import (
+    ATSCollector,
+    CollectionResult,
+    CollectorUnavailable,
+    SCRAPING_METHOD_BROWSER,
+)
 from ats.cornerstone import CornerstoneCollector
 from ats.detector import UNKNOWN, detect_ats
 from ats.eightfold import EightfoldCollector
@@ -122,6 +127,16 @@ class CompanyResult:
     error_type: str | None = None
     error_message: str | None = None
     fell_back: bool = False
+    #: True only when the collector is confident it saw every job the provider
+    #: would serve. ``pipeline.run()`` gates removal sync on this, never on
+    #: ``success`` - a partial harvest is a real success that must not be read
+    #: as "the jobs we didn't reach have closed". Defaults True so paths that
+    #: never paginate (JSON-LD, browser) keep today's behaviour.
+    complete: bool = True
+    #: Why collection stopped, when it stopped short. See ``ats.base``.
+    stop_reason: str | None = None
+    #: What the provider claimed it had, when it said.
+    reported_total: int | None = None
     discovered_ats_url: str | None = None
     discovered_provider: str | None = None
     #: True only when the discovered URL was actually driven through its
@@ -129,6 +144,17 @@ class CompanyResult:
     #: verified discoveries, so a URL that merely *looks* like an ATS never
     #: lands in the workbook.
     discovery_verified: bool = False
+
+
+def _good_enough_rows() -> int:
+    """Row count that counts as a genuine job list rather than featured roles.
+
+    Shared with the browser traversal (``playwright.hop_good_enough_rows``) on
+    purpose: "is this a real list?" is the same question wherever it is asked,
+    and the JSON-LD tier previously answered it with "any row at all".
+    """
+    from settings import load_settings
+    return int(load_settings().get("playwright.hop_good_enough_rows", 10))
 
 
 def _blank(value: Any) -> bool:
@@ -212,8 +238,12 @@ def plan_route(
     )
 
 
-def collect_via_api(plan: RoutePlan) -> list[dict]:
+def collect_via_api(plan: RoutePlan) -> CollectionResult:
     """Run the direct collector for a planned company.
+
+    Always returns a :class:`~ats.base.CollectionResult`, even for collectors
+    that still return a bare list - :meth:`CollectionResult.coerce` wraps those
+    as complete, preserving their current behaviour until they are converted.
 
     Raises:
         CollectorUnavailable: the API could not serve this tenant.
@@ -225,7 +255,7 @@ def collect_via_api(plan: RoutePlan) -> list[dict]:
     detection = dict(plan.detection or {})
     detection.setdefault("url", plan.url)
     collector = collector_class(plan.company, detection)
-    return collector.collect()
+    return CollectionResult.coerce(collector.collect())
 
 
 def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
@@ -244,7 +274,7 @@ def collect_via_jsonld(plan: RoutePlan) -> list[dict]:
     return JSONLDCollector(plan.company, detection).collect()
 
 
-def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None]:
+def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None, bool]:
     """Run the Playwright fallback for a planned company.
 
     Imported lazily so that a run which never needs a browser (or a machine
@@ -272,8 +302,9 @@ def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | 
 
     result = scrape_with_playwright(plan.company, browser_url)
 
-    records = [
-        build_record(
+    records = []
+    for job in result.jobs:
+        record = build_record(
             company=plan.company,
             title=job.get("title"),
             location=job.get("location"),
@@ -284,12 +315,16 @@ def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | 
             ats_provider=plan.provider if plan.provider != UNKNOWN else "unknown",
             scraping_method=METHOD_BROWSER,
         )
-        for job in result.jobs
-    ]
+        if record:
+            # Provenance: which search term surfaced this row, when the site
+            # only reveals jobs behind a search.
+            record["source_query"] = job.get("source_query")
+            records.append(record)
     return (
-        [record for record in records if record],
+        records,
         result.discovered_ats_url,
         result.discovered_provider,
+        result.blocked,
     )
 
 
@@ -324,8 +359,11 @@ def fetch_company_jobs(
     if plan.method == METHOD_API:
         log.info("%s -> %s", company, plan.provider.title())
         try:
-            jobs = collect_via_api(plan)
-            log.info("%s -> %s jobs retrieved", company, len(jobs))
+            collected = collect_via_api(plan)
+            jobs = collected.jobs
+            log.info("%s -> %s jobs retrieved%s", company, len(jobs),
+                     "" if collected.complete
+                     else f" (INCOMPLETE: {collected.stop_reason})")
             # A page-resolved provider (plan.url came from resolve_from_page,
             # not straight from the workbook) is just as verified as a
             # browser-discovered one once it has actually returned jobs -
@@ -335,8 +373,14 @@ def fetch_company_jobs(
                     company=company, jobs=jobs, plan=plan, success=True,
                     discovered_ats_url=plan.url, discovered_provider=plan.provider,
                     discovery_verified=True,
+                    complete=collected.complete, stop_reason=collected.stop_reason,
+                    reported_total=collected.reported_total,
                 )
-            return CompanyResult(company=company, jobs=jobs, plan=plan, success=True)
+            return CompanyResult(
+                company=company, jobs=jobs, plan=plan, success=True,
+                complete=collected.complete, stop_reason=collected.stop_reason,
+                reported_total=collected.reported_total,
+            )
         except CollectorUnavailable as exc:
             if not playwright_enabled:
                 return CompanyResult(
@@ -354,11 +398,12 @@ def fetch_company_jobs(
                 error_type=type(exc).__name__, error_message=str(exc),
             )
 
-    # JSON-LD tier: for pages with no recognised provider, try harvesting
-    # schema.org JobPosting structured data over HTTP before paying for a
-    # browser. If the page carries none, CollectorUnavailable drops us through
-    # to the Playwright fallback unchanged.
-    if plan.provider == UNKNOWN and plan.url:
+    # JSON-LD tier: harvest schema.org JobPosting structured data over a single
+    # HTTP GET before paying for a browser. Runs for an unrecognised provider
+    # *and* for a known provider whose collector just failed - that is the case
+    # where a cheap tier is most valuable, and it used to be skipped.
+    jsonld_jobs: list[dict] = []
+    if plan.url:
         try:
             jsonld_jobs = collect_via_jsonld(plan)
         except CollectorUnavailable:
@@ -366,21 +411,45 @@ def fetch_company_jobs(
         except Exception as exc:  # a parser hiccup must not sink the company
             log.debug("%s -> JSON-LD tier errored (%s)", company, exc)
             jsonld_jobs = []
+
+    # A landing page routinely embeds two or three "featured" roles for SEO.
+    # Accepting those as the company's job list reports 3 jobs for an employer
+    # with thousands, so apply the same floor the browser traversal uses: a
+    # small harvest is kept as a fallback while the search continues.
+    good_enough = _good_enough_rows()
+    if len(jsonld_jobs) >= good_enough:
+        log.info("%s -> %s jobs via JSON-LD", company, len(jsonld_jobs))
+        return CompanyResult(
+            company=company, jobs=jsonld_jobs, plan=plan, success=True,
+            fell_back=fell_back,
+        )
+    if jsonld_jobs:
+        log.debug("%s -> JSON-LD found only %s row(s); keeping as a fallback "
+                  "and continuing to Playwright", company, len(jsonld_jobs))
+
+    log.info("%s -> Playwright fallback", company)
+    try:
+        jobs, discovered_url, discovered_provider, blocked = collect_via_browser(plan)
+    except Exception as exc:
+        # A thin JSON-LD harvest is still better than nothing when the browser
+        # cannot run at all.
         if jsonld_jobs:
-            log.info("%s -> %s jobs via JSON-LD fallback", company, len(jsonld_jobs))
+            log.info("%s -> browser failed (%s); keeping %s JSON-LD row(s)",
+                     company, exc, len(jsonld_jobs))
             return CompanyResult(
                 company=company, jobs=jsonld_jobs, plan=plan, success=True,
                 fell_back=fell_back,
             )
-
-    log.info("%s -> Playwright fallback", company)
-    try:
-        jobs, discovered_url, discovered_provider = collect_via_browser(plan)
-    except Exception as exc:
         return CompanyResult(
             company=company, jobs=[], plan=plan, success=False, fell_back=fell_back,
             error_type=type(exc).__name__, error_message=str(exc),
         )
+
+    # Neither tier found a real list: keep whichever saw more.
+    if len(jsonld_jobs) > len(jobs) and not discovered_provider:
+        log.info("%s -> keeping %s JSON-LD row(s) over %s browser row(s)",
+                 company, len(jsonld_jobs), len(jobs))
+        jobs = jsonld_jobs
 
     # Self-healing: the browser found the real ATS behind a branded careers
     # page (e.g. GameStop -> UKG). Collecting through that provider's API now
@@ -395,25 +464,47 @@ def fetch_company_jobs(
             note="discovered via browser during this run",
         )
         try:
-            healed_jobs = collect_via_api(healed)
+            healed_collected = collect_via_api(healed)
             log.info("%s -> %s jobs retrieved via discovered %s API",
-                     company, len(healed_jobs), discovered_provider)
+                     company, len(healed_collected.jobs), discovered_provider)
             return CompanyResult(
-                company=company, jobs=healed_jobs, plan=healed, success=True,
+                company=company, jobs=healed_collected.jobs, plan=healed, success=True,
                 fell_back=fell_back,
                 discovered_ats_url=discovered_url,
                 discovered_provider=discovered_provider,
                 discovery_verified=True,
+                complete=healed_collected.complete,
+                stop_reason=healed_collected.stop_reason,
+                reported_total=healed_collected.reported_total,
             )
         except Exception as exc:
             log.warning("%s -> discovered %s API failed (%s); keeping browser rows",
                         company, discovered_provider, exc)
 
     log.info("%s -> %s jobs retrieved", company, len(jobs))
+
+    # A refusal is reported as itself rather than folded into "no jobs found",
+    # so the failure report distinguishes "the site turned us away" from
+    # "we reached the site and it had nothing" - which need opposite responses.
+    if blocked and not jobs:
+        return CompanyResult(
+            company=company, jobs=[], plan=plan, success=False, fell_back=fell_back,
+            error_type="AccessDenied",
+            error_message="Site answered with a bot challenge or explicit denial",
+        )
+
+    # Reaching a site that has no matching openings is a real answer, not a
+    # failure. Treating it as one inflated the failure count, filled the
+    # failure report with rows needing no action, and wrote a misleading
+    # "Data Retrieved = FALSE" into the workbook.
+    #
+    # This is safe for removal because sync_completed_companies also requires
+    # result.jobs - a zero-job result is still never read as "all jobs closed".
+    if not jobs:
+        log.info("%s -> rendered cleanly with no matching jobs", company)
+
     return CompanyResult(
         company=company, jobs=jobs, plan=plan,
-        success=bool(jobs), fell_back=fell_back,
-        error_type=None if jobs else "NoJobsFound",
-        error_message=None if jobs else "Browser fallback returned zero jobs",
+        success=True, fell_back=fell_back,
         discovered_ats_url=discovered_url, discovered_provider=discovered_provider,
     )

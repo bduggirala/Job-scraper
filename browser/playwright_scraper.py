@@ -228,7 +228,10 @@ _EXTRACT_JS = """
     return null;
   };
 
-  const dateRe = /(date|posted|time|age)/i;
+  // Narrow on purpose: 'age' also matched page/manager/message/package,
+  // and 'time' matched part-time/full-time badges - so whatever text
+  // those elements held was handed to the date parser as a posting date.
+  const dateRe = /(date|posted|publish)/i;
 
   const nearbyDate = (el) => {
     let node = el.parentElement;
@@ -301,6 +304,12 @@ class PlaywrightResult:
     jobs: list[dict[str, Any]] = field(default_factory=list)
     discovered_ats_url: str | None = None
     discovered_provider: str | None = None
+    #: Search terms actually submitted, in order. Empty when no search ran.
+    queries_run: list[str] = field(default_factory=list)
+    #: True when the page answered with a bot challenge, login wall or explicit
+    #: denial. Such a company is recorded and left alone rather than retried
+    #: with a different fingerprint - see :func:`_looks_blocked`.
+    blocked: bool = False
 
 
 def _start_playwright(use_stealth: bool):
@@ -475,7 +484,7 @@ def _is_job_row(title: str | None, href: str | None) -> bool:
 
 def _paginate_and_extract(
     page, initial_rows: list[dict[str, Any]], max_clicks: int, timeout_ms: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """Click through "Load more"/next controls, accumulating every page's
     rows rather than keeping only whatever is on screen after the last click.
 
@@ -495,16 +504,30 @@ def _paginate_and_extract(
     the "don't click at all when the page starts out empty" guard at each
     call site stays intact (blind clicking on a jobless page can navigate
     away and destroy UI the caller needs next - observed on Goldman Sachs).
+
+    Returns:
+        ``(rows, exhausted)``. ``exhausted`` is False when the click budget
+        ran out with pages still to go - the browser equivalent of a truncated
+        API walk, and previously indistinguishable from a site that simply had
+        no more results.
     """
     seen: dict[str, dict[str, Any]] = {}
 
-    def _merge(rows: list[dict[str, Any]]) -> None:
+    def _merge(rows: list[dict[str, Any]]) -> int:
+        added = 0
         for row in rows:
             key = row.get("job_url")
             if key and key not in seen:
                 seen[key] = row
+                added += 1
+        return added
 
     _merge(initial_rows)
+
+    # Two consecutive clicks that add nothing mean the control is inert - a
+    # button that stays visible but no longer loads anything. One barren click
+    # is tolerated because some sites render asynchronously.
+    barren = 0
 
     for _ in range(max_clicks):
         clicked = False
@@ -529,14 +552,21 @@ def _paginate_and_extract(
                 page.wait_for_timeout(1200)
                 after = page.evaluate("document.body.scrollHeight")
                 if after <= before:
-                    break
+                    return list(seen.values()), True
                 clicked = True
             except Exception:
-                break
+                return list(seen.values()), True
 
-        _merge(_extract_job_rows(page))
+        if _merge(_extract_job_rows(page)):
+            barren = 0
+        else:
+            barren += 1
+            if barren >= 2:
+                return list(seen.values()), True
 
-    return list(seen.values())
+    # The budget ran out while the control was still producing rows, so there
+    # is very likely more to collect.
+    return list(seen.values()), False
 
 
 def _extract_jsonld_rows(page) -> list[dict[str, Any]]:
@@ -738,7 +768,7 @@ def _navigate_to_job_list(
         # is actually present.
         rows = _extract_job_rows(page)
         if rows:
-            rows = _paginate_and_extract(page, rows, max_pages, timeout_ms)
+            rows, _exhausted = _paginate_and_extract(page, rows, max_pages, timeout_ms)
         else:
             rows = _extract_jsonld_rows(page)
         if len(rows) >= good_enough:
@@ -767,6 +797,50 @@ def _navigate_to_job_list(
     if best.jobs:
         log.info("%s: traversal settled on %s job(s)", company, len(best.jobs))
     return best
+
+
+# Markers of a page that is refusing automated access rather than failing.
+# Kept deliberately specific: matching loosely would misread an ordinary
+# careers page that happens to mention "security" or "verification".
+_BLOCK_MARKERS = (
+    "verify you are human",
+    "are you a human",
+    "i am not a robot",
+    "checking your browser",
+    "enable javascript and cookies to continue",
+    "attention required! | cloudflare",
+    "access denied",
+    "request unsuccessful",
+    "unusual traffic",
+    "captcha",
+    "px-captcha",
+    "distil_r_blocked",
+)
+
+
+def _looks_blocked(page) -> bool:
+    """True when the page is a bot challenge, denial or CAPTCHA.
+
+    This exists so a blocked site is **recorded and left alone** rather than
+    retried with a rotated fingerprint. A challenge page renders cleanly with
+    zero jobs, so without this it took the "clean render, no jobs" retry path -
+    three full traversals, up to eight minutes, before being written down as a
+    generic zero-jobs failure that told nobody what actually happened.
+
+    Detection only. Nothing here attempts to solve or bypass a challenge: when
+    a site says it does not want automated access, the honest outcomes are to
+    record it and move on.
+    """
+    try:
+        title = (page.title() or "").lower()
+        # Only the visible text - matching raw HTML would hit analytics and
+        # consent scripts that mention "captcha" on perfectly normal pages.
+        body = page.inner_text("body")[:4000].lower()
+    except Exception:
+        return False
+
+    haystack = f"{title} {body}"
+    return any(marker in haystack for marker in _BLOCK_MARKERS)
 
 
 def _dismiss_cookie_banner(page) -> None:
@@ -903,14 +977,50 @@ def _discover_host_based_ats(page) -> PlaywrightResult | None:
     return PlaywrightResult(discovered_ats_url=page.url, discovered_provider=provider)
 
 
-def _search_fallback(company: str, page, timeout_ms: int) -> PlaywrightResult:
-    """Type a configured search term and retry extraction, sniffing network traffic.
+def _configured_search_terms() -> list[str]:
+    """The query list, tolerating the older single-term config key.
 
-    Only called when the initial page load yields zero job rows.
+    One term was never enough: a role whose title contains no "data" - Snowflake
+    Engineer, Databricks Engineer, ETL Developer, Analytics Engineer - is
+    invisible to a "Data" search, and on a search-driven site the site's own
+    search is the only view of its jobs we ever get.
     """
     cfg = load_settings()
-    search_term = cfg.get("playwright.search_fallback.search_term", "Data Engineer")
+    terms = cfg.get("playwright.search_fallback.search_terms")
+    if isinstance(terms, list) and terms:
+        return [str(t) for t in terms if str(t).strip()]
+    single = cfg.get("playwright.search_fallback.search_term", "Data")
+    return [str(single)]
+
+
+def _search_fallback(
+    company: str,
+    page,
+    timeout_ms: int,
+    *,
+    search_terms: list[str] | None = None,
+    max_queries: int | None = None,
+) -> PlaywrightResult:
+    """Submit each configured search term, merging what every query returns.
+
+    Called when a page has not already yielded a real job list. Each query is
+    typed into the detected keyword input (``fill`` replaces the previous
+    value, so the box is reused rather than re-found), submitted, and the
+    results re-extracted. Rows merge by ``job_url`` across queries and carry
+    ``source_query`` so the output records which term found each job.
+
+    While this runs it also watches network traffic for a real ATS endpoint the
+    static-HTML resolver never saw - many custom career pages only call their
+    ATS once you interact with them.
+    """
+    cfg = load_settings()
+    terms = search_terms if search_terms is not None else _configured_search_terms()
+    limit = max_queries if max_queries is not None else int(
+        cfg.get("playwright.search_fallback.max_queries", 4)
+    )
+    terms = terms[:max(1, limit)]
     max_wait_ms = int(cfg.get("playwright.search_fallback.max_wait_ms", 6000))
+    good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
 
     found = _find_search_input(page)
     if found is None:
@@ -922,22 +1032,66 @@ def _search_fallback(company: str, page, timeout_ms: int) -> PlaywrightResult:
     seen_urls: list[str] = []
 
     def _record_response(response) -> None:
-        seen_urls.append(response.url)
+        # Bounded: a busy page can emit thousands of responses, and only the
+        # ATS-shaped ones matter.
+        if len(seen_urls) < 400:
+            seen_urls.append(response.url)
+
+    merged: dict[str, dict[str, Any]] = {}
+    queries_run: list[str] = []
 
     page.on("response", _record_response)
     try:
         _dismiss_cookie_banner(page)
-        submitted = _submit_search(page, frame, locator, search_term)
-        if not submitted:
-            return PlaywrightResult()
 
+        for term in terms:
+            if not _submit_search(page, frame, locator, term):
+                # The input went away (a search can navigate elsewhere); try to
+                # find it again on the new page before giving up.
+                found = _find_search_input(page)
+                if found is None:
+                    break
+                frame, locator = found
+                if not _submit_search(page, frame, locator, term):
+                    break
+
+            queries_run.append(term)
+
+            try:
+                page.wait_for_load_state(
+                    "networkidle", timeout=min(max_wait_ms, timeout_ms)
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(max_wait_ms)
+
+            if _looks_blocked(page):
+                log.warning("%s: search blocked by the site; stopping", company)
+                page.remove_listener("response", _record_response)
+                return PlaywrightResult(
+                    jobs=list(merged.values()), queries_run=queries_run, blocked=True,
+                )
+
+            rows, _exhausted = _paginate_and_extract(
+                page, _extract_job_rows(page),
+                int(cfg.get("playwright.max_pages", 10)), timeout_ms,
+            )
+            for row in rows:
+                url = row.get("job_url")
+                if url and url not in merged:
+                    row["source_query"] = term
+                    merged[url] = row
+
+            # Enough is enough: a query list is insurance against a narrow
+            # first term, not a reason to keep searching a site that answered.
+            if len(merged) >= good_enough and len(queries_run) >= 1 and term != terms[-1]:
+                if len(merged) >= good_enough * 3:
+                    break
+    finally:
         try:
-            page.wait_for_load_state("networkidle", timeout=min(max_wait_ms, timeout_ms))
+            page.remove_listener("response", _record_response)
         except Exception:
             pass
-        page.wait_for_timeout(max_wait_ms)
-    finally:
-        page.remove_listener("response", _record_response)
 
     discovered_url, discovered_provider = _sniff_ats_from_urls(seen_urls)
 
@@ -983,19 +1137,18 @@ def _search_fallback(company: str, page, timeout_ms: int) -> PlaywrightResult:
                     company, provider,
                 )
 
-    jobs = _paginate_and_extract(
-        page, _extract_job_rows(page), int(cfg.get("playwright.max_pages", 5)), timeout_ms
-    )
+    jobs = list(merged.values())
 
     if jobs or discovered_provider:
         log.info(
-            "%s: search fallback ('%s') found %s jobs%s",
-            company, search_term, len(jobs),
+            "%s: search fallback (%s) found %s jobs%s",
+            company, ", ".join(repr(q) for q in queries_run), len(jobs),
             f", discovered ATS={discovered_provider}" if discovered_provider else "",
         )
 
     return PlaywrightResult(
-        jobs=jobs, discovered_ats_url=discovered_url, discovered_provider=discovered_provider,
+        jobs=jobs, discovered_ats_url=discovered_url,
+        discovered_provider=discovered_provider, queries_run=queries_run,
     )
 
 
@@ -1054,6 +1207,13 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
 
         _dismiss_cookie_banner(page)
 
+        # Stop immediately on a challenge or denial: nothing below can succeed
+        # against one, and the retry loop must not treat it as a flaky render.
+        if _looks_blocked(page):
+            log.warning("%s: %s answered with a challenge or denial",
+                        company, urlsplit(page.url).netloc)
+            return PlaywrightResult(blocked=True)
+
         # A branded-domain ATS (Radancy TalentBrew) is recognised only from the
         # rendered HTML. Detecting it here lets the router self-heal to the real
         # collector instead of scraping an XHR-driven list the DOM cannot show.
@@ -1076,7 +1236,10 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         jobs = _extract_job_rows(page)
         if jobs:
             initial_count = len(jobs)
-            jobs = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
+            jobs, exhausted = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
+            if not exhausted:
+                log.warning("%s: pagination stopped at the %s-page cap with more "
+                            "results still available", company, max_pages)
             if len(jobs) != initial_count:
                 log.debug("%s: pagination changed the result count %s -> %s",
                           company, initial_count, len(jobs))
@@ -1188,6 +1351,15 @@ def scrape_with_playwright(company: str, url: str) -> PlaywrightResult:
             continue
 
         if result.jobs or result.discovered_provider:
+            return result
+
+        # An explicit refusal is a final answer, not a bad draw. Retrying it
+        # with a rotated user-agent and viewport would be varying our identity
+        # to get past a control the site stated plainly - and it does not work
+        # anyway, so it only costs the per-company budget.
+        if result.blocked:
+            log.warning("%s: site refused automated access; recording and moving on",
+                        company)
             return result
 
         last_empty = result

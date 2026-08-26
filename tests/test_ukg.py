@@ -76,7 +76,7 @@ def test_still_uses_shared_host_when_none_detected(monkeypatch):
 
 def test_parses_real_shaped_response(monkeypatch):
     monkeypatch.setattr(ukg_module.http_client, "post_json", lambda url, payload, **kw: PAGE_1)
-    rows = _collector("recruiting2.ultipro.com").collect()
+    rows = _collector("recruiting2.ultipro.com").collect().jobs
     assert len(rows) == 1
     assert rows[0]["title"] == "Payment Integrity Analyst II"
     assert rows[0]["location"] == "TX - Fort Worth"

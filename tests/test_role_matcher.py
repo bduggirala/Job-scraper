@@ -18,14 +18,13 @@ def matcher():
 @pytest.mark.parametrize("title", [
     "Data Engineer",
     "Senior Data Engineer",
-    "Data Analyst",
-    "Data Architect",
-    "Business Data Analyst",
+    "Data Engineer II",
     "Data Platform Engineer",
     "Snowflake Engineer",
     "Databricks Developer",
     "ETL Developer",
     "Analytics Engineer",
+    "Data Analytics Engineer",
 ])
 def test_matches_individual_contributor_data_roles(matcher, title):
     assert matcher.matches(title) is True
@@ -33,12 +32,47 @@ def test_matches_individual_contributor_data_roles(matcher, title):
 
 @pytest.mark.parametrize("title", [
     "Lead Data Engineer",
-    "Data Engineering Manager",
+    "Senior Lead Data Engineer",
     "Principal Data Engineer",
-    "Data Engineer, Team Lead",
-    "Manager, Data Platform",
+    "Distinguished Data Engineer",
 ])
-def test_excludes_seniority_and_management_titles(matcher, title):
+def test_matches_senior_individual_contributor_titles(matcher, title):
+    """lead/principal are IC titles at most employers, not management.
+
+    Excluding them cost real postings: a live Capital One run returned 44
+    "Lead Data Engineer" / "Senior Lead Data Engineer" roles that the old
+    '\b(lead|manager|principal)\b' pattern discarded outright - the most
+    relevant senior openings in the whole tenant.
+    """
+    assert matcher.matches(title) is True
+
+
+@pytest.mark.parametrize("title", [
+    "Data Engineering Manager",
+    "Manager, Data Platform",
+    "Director, Data Engineering",
+    "Head of Data Engineering",
+    "VP, Data Platform",
+])
+def test_excludes_management_titles(matcher, title):
+    """Management is excluded by shape - manager/director/head of/VP - rather
+    than by seniority words, which caught individual contributors too."""
+    assert matcher.matches(title) is False
+
+
+@pytest.mark.parametrize("title", [
+    "Data Analyst",
+    "Business Data Analyst",
+    "Sr. Analyst, Data Analysis",
+    "Data Architect",
+    "Business Intelligence Developer",
+    "Data Governance Specialist",
+    "Data Annotator",
+])
+def test_excludes_non_engineering_data_roles(matcher, title):
+    """The false-positive classes '\bdata\b' pulls in that are not
+    engineering. '\banalyst\b' is deliberately its own word so that
+    "Data Analytics Engineer" and "Analytics Engineer" still match."""
     assert matcher.matches(title) is False
 
 

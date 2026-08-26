@@ -24,7 +24,8 @@ import re
 from urllib.parse import urlsplit
 
 import http_client
-from ats.base import ATSCollector, CollectorUnavailable
+from ats.base import ATSCollector, CollectionResult, CollectorUnavailable
+from ats.pagination import PageRequest, paginate
 from ats.detector import RADANCY
 from ats.html_utils import make_soup
 from normalize import clean_text
@@ -33,7 +34,6 @@ from normalize import clean_text
 # in ~11 requests at 500/page rather than ~52 at 100. Bounded by MAX_PAGES so a
 # tenant that ignores pagination cannot spin forever.
 RECORDS_PER_PAGE = 500
-MAX_PAGES = 60
 
 # Strips the visible field label Radancy renders inside the location span
 # (``<b>Location</b> Mattydale, NY`` -> ``Mattydale, NY``).
@@ -119,33 +119,28 @@ class RadancyCollector(ATSCollector):
             return None
         return _LABEL_RE.sub("", text) or None
 
-    def collect(self) -> list[dict]:
+    def _page(self, results_url: str, request: PageRequest):
+        fragment = self._fetch_page(results_url, request.page_number)
+        return self._parse_cards(fragment, results_url), None
+
+    def collect(self) -> CollectionResult:
         host = self._base_host()
         results_url = f"https://{host}/search-jobs/results"
 
-        records: list[dict | None] = []
-        seen: set[str] = set()
+        try:
+            walk = paginate(
+                lambda request: self._page(results_url, request),
+                page_size=RECORDS_PER_PAGE, max_jobs=self.max_jobs,
+                key=lambda row: row["job_url"],
+                label=f"{self.company}/radancy",
+            )
+        except CollectorUnavailable:
+            raise
+        except Exception as exc:
+            raise CollectorUnavailable(
+                f"Radancy results endpoint unavailable: {exc}"
+            ) from exc
 
-        for page in range(1, MAX_PAGES + 1):
-            try:
-                fragment = self._fetch_page(results_url, page)
-            except Exception as exc:
-                if page == 1:
-                    raise CollectorUnavailable(
-                        f"Radancy results endpoint unavailable: {exc}"
-                    ) from exc
-                break
-
-            fresh = [
-                row for row in self._parse_cards(fragment, results_url)
-                if row and row["job_url"] not in seen
-            ]
-            if not fresh:
-                break
-            for row in fresh:
-                seen.add(row["job_url"])
-            records.extend(fresh)
-
-        if not records:
+        if not walk.items:
             raise CollectorUnavailable("Radancy results endpoint returned zero jobs")
-        return self.finalize(records)
+        return self.result(walk, walk.items)
