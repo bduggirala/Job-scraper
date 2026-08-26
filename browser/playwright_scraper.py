@@ -310,6 +310,32 @@ class PlaywrightResult:
     #: denial. Such a company is recorded and left alone rather than retried
     #: with a different fingerprint - see :func:`_looks_blocked`.
     blocked: bool = False
+    #: False when pagination stopped at ``playwright.max_pages`` while the page
+    #: still offered more results. The direct-API path has carried this since
+    #: :class:`ats.base.CollectionResult` existed; the browser path computed the
+    #: same signal in :func:`_paginate_and_extract` and then discarded it, so
+    #: every capped browser scrape claimed it had seen the whole list - and
+    #: ``sync_completed_companies`` aged out everything past the cap.
+    complete: bool = True
+    #: Why collection stopped, when it stopped short. See ``ats.base``.
+    stop_reason: str | None = None
+
+
+def _capped_result(jobs: list[dict[str, Any]], capped: bool) -> PlaywrightResult:
+    """Wrap rows, recording whether the page cap cut the list short.
+
+    ``STOP_BUDGET`` is deliberate rather than a browser-specific reason: this
+    is the same kind of gap the direct-API job budget leaves - a bound we chose,
+    tripped while the source still had more - and ``notify.should_send`` already
+    treats that as a describable hole rather than a reason to go silent.
+    """
+    from ats.base import STOP_BUDGET
+
+    return PlaywrightResult(
+        jobs=jobs,
+        complete=not capped,
+        stop_reason=STOP_BUDGET if capped else None,
+    )
 
 
 def _start_playwright(use_stealth: bool):
@@ -767,16 +793,18 @@ def _navigate_to_job_list(
         # Same ordering rule as the landing page: paginate only once a list
         # is actually present.
         rows = _extract_job_rows(page)
+        capped = False
         if rows:
-            rows, _exhausted = _paginate_and_extract(page, rows, max_pages, timeout_ms)
+            rows, exhausted = _paginate_and_extract(page, rows, max_pages, timeout_ms)
+            capped = not exhausted
         else:
             rows = _extract_jsonld_rows(page)
         if len(rows) >= good_enough:
             log.info("%s: found %s jobs at depth %s -> %s",
                      company, len(rows), depth, target[:90])
-            return PlaywrightResult(jobs=rows)
+            return _capped_result(rows, capped)
         if len(rows) > len(best.jobs):
-            best = PlaywrightResult(jobs=rows)
+            best = _capped_result(rows, capped)
 
         # This page may be search-driven: the list renders only after a
         # keyword is submitted. Cheap relative to another navigation.
@@ -1039,6 +1067,7 @@ def _search_fallback(
 
     merged: dict[str, dict[str, Any]] = {}
     queries_run: list[str] = []
+    capped = False
 
     page.on("response", _record_response)
     try:
@@ -1072,10 +1101,13 @@ def _search_fallback(
                     jobs=list(merged.values()), queries_run=queries_run, blocked=True,
                 )
 
-            rows, _exhausted = _paginate_and_extract(
+            rows, exhausted = _paginate_and_extract(
                 page, _extract_job_rows(page),
                 int(cfg.get("playwright.max_pages", 10)), timeout_ms,
             )
+            # Any query whose results were cut short leaves the merged set
+            # short too, however many other queries ran to completion.
+            capped = capped or not exhausted
             for row in rows:
                 url = row.get("job_url")
                 if url and url not in merged:
@@ -1146,9 +1178,12 @@ def _search_fallback(
             f", discovered ATS={discovered_provider}" if discovered_provider else "",
         )
 
+    from ats.base import STOP_BUDGET
+
     return PlaywrightResult(
         jobs=jobs, discovered_ats_url=discovered_url,
         discovered_provider=discovered_provider, queries_run=queries_run,
+        complete=not capped, stop_reason=STOP_BUDGET if capped else None,
     )
 
 
@@ -1234,10 +1269,12 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         # fallback needs next - observed on Goldman Sachs, where four such
         # clicks left the page with no search input at all.
         jobs = _extract_job_rows(page)
+        capped = False
         if jobs:
             initial_count = len(jobs)
             jobs, exhausted = _paginate_and_extract(page, jobs, max_pages, timeout_ms)
-            if not exhausted:
+            capped = not exhausted
+            if capped:
                 log.warning("%s: pagination stopped at the %s-page cap with more "
                             "results still available", company, max_pages)
             if len(jobs) != initial_count:
@@ -1251,9 +1288,9 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         log.debug("%s: Playwright extracted %s job rows", company, len(jobs))
 
         if len(jobs) >= good_enough:
-            return PlaywrightResult(jobs=jobs)
+            return _capped_result(jobs, capped)
         if len(jobs) > len(best.jobs):
-            best = PlaywrightResult(jobs=jobs)
+            best = _capped_result(jobs, capped)
 
         # Try the search box here first (cheap, no navigation), then hop to a
         # dedicated job-list page.

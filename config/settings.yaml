@@ -19,21 +19,74 @@ columns:
 hours_old: 168
 
 # --- Location filtering ----------------------------------------------------
+# DFW-metro cities. A city missing from this list is silently dropped, so it
+# covers the metro rather than just the named few: the twelve entries this
+# started with excluded Arlington, Carrollton, Lewisville, Denton, McKinney,
+# Allen, Garland, Southlake, Flower Mound and Grand Prairie - all ordinary
+# commutable DFW employers' locations.
+#
+# Adding a city is safe because enforce_texas_for_city_match rejects a match
+# whose string also names a different U.S. state (Arlington VA, Roanoke VA,
+# Bedford MA, Mansfield OH...), which is what keeps the more generic names here
+# from pulling in the rest of the country.
 locations:
+  # Core
   - Dallas
-  - Irving
-  - Plano
-  - Richardson
-  - Frisco
-  - Addison
-  - Coppell
-  - Farmers Branch
-  - Westlake
   - Fort Worth
   - DFW
   - Dallas-Fort Worth
-  - Grapevine
+  - Dallas/Fort Worth
+  # Dallas County / mid-cities
+  - Irving
   - Las Colinas
+  - Addison
+  - Coppell
+  - Farmers Branch
+  - Garland
+  - Mesquite
+  - Richardson
+  - Carrollton
+  - Rowlett
+  - Cedar Hill
+  - DeSoto
+  - Duncanville
+  - Grand Prairie
+  - Lancaster
+  - Balch Springs
+  # Collin / Denton County
+  - Plano
+  - Frisco
+  - McKinney
+  - Allen
+  - Wylie
+  - Prosper
+  - Celina
+  - Little Elm
+  - The Colony
+  - Lewisville
+  - Flower Mound
+  - Denton
+  - Coppell
+  - Highland Village
+  # Tarrant County / mid-cities
+  - Arlington
+  - Grapevine
+  - Southlake
+  - Westlake
+  - Roanoke
+  - Keller
+  - Euless
+  - Bedford
+  - Hurst
+  - Colleyville
+  - North Richland Hills
+  - Mansfield
+  - Haltom City
+  - Watauga
+  # Rockwall / Kaufman
+  - Rockwall
+  - Rowlett
+  - Forney
 
 include_remote: true
 
@@ -96,6 +149,10 @@ exclude_role_patterns:
   - '\bannotator\b'
   - '\baccounting\b'
   - '\bproduct\s+management\b'
+  # "Data Products" is a product-org label, not an engineering discipline -
+  # "Software Engineer, Data Products" splits into a "Data Products" segment
+  # that '\bdata\b' accepts, which made a general software role a match.
+  - '\bdata\s+products?\b'
 
   # Management, by shape rather than by seniority word. The previous
   # '\b(lead|manager|principal)\b' also rejected "Lead Data Engineer" and
@@ -305,6 +362,12 @@ notifications:
     to: duggirala.de@gmail.com
     # from: defaults to SCRAPER_SMTP_USER when unset
     attach_spreadsheet: true
+
+    # Render the digest to output/digest_preview/ instead of sending it. Needs
+    # no SMTP credentials, opens no connection, and deliberately does NOT mark
+    # the jobs as announced - so the first real send still includes them.
+    # SCRAPER_SMTP_DRY_RUN=1 forces this on without editing this file.
+    dry_run: false
 
 logging:
   file: logs/scraper.log

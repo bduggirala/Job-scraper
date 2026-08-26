@@ -104,7 +104,21 @@ def deduplicate(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     ordered: list[str] = []
 
     for record in all_records:
-        url_key = normalize_url(record.get("job_url"), drop_query=True) or ""
+        # The query is KEPT here. On several enterprise platforms it is the
+        # only thing that distinguishes one posting from another - UKG serves
+        # ``OpportunityDetail?opportunityId=<uuid>``, Taleo
+        # ``jobdetail.ftl?job=<id>``, Infor ``shorturl.do?key=<id>`` - so every
+        # job a company lists shares one path. Dropping the query collapsed all
+        # of them into a single row: measured against a real full run,
+        # GameStop's 5,148 distinct postings became 1, BAE Systems' 1,858
+        # became 1, and 8,423 real postings were destroyed across 18 companies.
+        #
+        # Tracking parameters, the thing dropping the query was reaching for,
+        # are already removed by normalize_url itself (see TRACKING_PARAMS), so
+        # two links differing only by campaign still collapse - and a job whose
+        # URL genuinely varies by some other parameter is caught by the
+        # job_id pass below.
+        url_key = normalize_url(record.get("job_url")) or ""
         if not url_key:
             # No URL to key on: fall back to the composite key alone.
             url_key = "|".join(duplicate_key(record))

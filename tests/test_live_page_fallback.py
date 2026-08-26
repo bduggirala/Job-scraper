@@ -34,7 +34,7 @@ def test_the_browser_falls_back_to_the_live_page_when_the_ats_url_is_dead(monkey
 
     def _browser(plan):
         rendered.append(plan.url)
-        return [], None, None, False
+        return router.BrowserHarvest()
 
     monkeypatch.setattr(router, "collect_via_api", _api)
     monkeypatch.setattr(router, "collect_via_jsonld", lambda plan: [])
@@ -80,7 +80,7 @@ def test_no_live_page_means_the_original_url_is_used(monkeypatch):
     monkeypatch.setattr(router, "collect_via_jsonld", lambda plan: [])
     monkeypatch.setattr(
         router, "collect_via_browser",
-        lambda plan: (rendered.append(plan.url), ([], None, None, False))[1],
+        lambda plan: (rendered.append(plan.url), router.BrowserHarvest())[1],
     )
 
     plan = _plan("https://walmart.wd5.myworkdayjobs.com/WalmartExternal/", live=None)
@@ -113,7 +113,7 @@ def test_a_live_page_identical_to_the_ats_url_is_not_retried(monkeypatch):
     monkeypatch.setattr(router, "collect_via_jsonld", lambda plan: [])
     monkeypatch.setattr(
         router, "collect_via_browser",
-        lambda plan: (rendered.append(plan.url), ([], None, None, False))[1],
+        lambda plan: (rendered.append(plan.url), router.BrowserHarvest())[1],
     )
 
     same = "https://careers.christushealth.org/job-search"

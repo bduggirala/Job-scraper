@@ -137,12 +137,19 @@ def test_the_walk_sends_no_dead_sort_parameter(monkeypatch):
         )
 
 
-def test_a_tenant_that_runs_out_early_is_complete_despite_a_higher_total(monkeypatch):
-    """An empty page means the provider is done, whatever its total claimed.
+def test_a_tenant_stopping_far_short_of_its_total_is_not_complete(monkeypatch):
+    """Replaces a rule that trusted an empty page over the tenant's own total.
 
-    Some tenants report a stale ``total`` well above the rows they actually
-    serve. Running out is exhaustion, not truncation - marking it incomplete
-    would permanently block removal sync for that company.
+    That rule rested on "some tenants report a stale total well above the rows
+    they actually serve". Checked directly against three live tenants, none of
+    them do: requesting offset ``total - 5`` returned exactly 5 rows on
+    Capital One (total 1,842), Travelers (346) and Texas Capital Bank (81), so
+    the last served row is at index ``total - 1`` and the count is accurate.
+
+    With no evidence for benign over-reporting, a tenant serving 30 of a
+    reported 900 is far more likely to have stalled - and believing it would
+    delete 870 live postings from the tracker. Small drifts are still
+    tolerated; see ``test_a_total_drifting_slightly_still_completes``.
     """
     class _OverReporting(_FakeCXS):
         def __call__(self, endpoint, payload, **kwargs):
@@ -155,5 +162,23 @@ def test_a_tenant_that_runs_out_early_is_complete_despite_a_higher_total(monkeyp
 
     result = _collector().collect()
 
+    assert result.complete is False
+    assert len(result.jobs) == 30, "the rows we did collect are still returned"
+    assert result.reported_total == 900
+
+
+def test_a_total_drifting_slightly_still_completes(monkeypatch):
+    """Postings close mid-walk; a few missing rows is not a stalled tenant."""
+    class _Drifting(_FakeCXS):
+        def __call__(self, endpoint, payload, **kwargs):
+            self.payloads.append(payload)
+            offset = payload["offset"]
+            rows = [_posting(i) for i in range(offset, min(offset + PAGE_SIZE, 99))]
+            return {"total": 100, "jobPostings": rows}
+
+    _install(monkeypatch, _Drifting(total=99))
+
+    result = _collector().collect()
+
     assert result.complete is True
-    assert len(result.jobs) == 30
+    assert len(result.jobs) == 99

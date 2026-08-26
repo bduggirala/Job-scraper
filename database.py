@@ -72,6 +72,11 @@ TRACKED_FIELDS = ("title", "location", "job_url")
 #: meta key holding the job-id scheme the stored rows were written under.
 _SCHEME_KEY = "job_id_scheme_version"
 
+#: Alert kinds. ``KIND_CHANGED`` is fingerprinted per change - see
+#: :func:`notification_kind`.
+KIND_NEW = "new"
+KIND_CHANGED = "changed"
+
 #: Consecutive complete scrapes that must miss a job before it is removed.
 #: One miss is usually a flicker - a slow page, a reordered result set, a
 #: requisition briefly unpublished - and deleting on it destroys first_seen,
@@ -83,6 +88,23 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def notification_kind(record: dict[str, Any], kind: str) -> str:
+    """The ``notifications.kind`` value one alert should be stored under.
+
+    "new" happens once per job, so the bare kind is the right key. "changed"
+    does not: a posting can move city in March and be retitled in June, and
+    storing both under the literal string "changed" meant the second one was
+    filtered out as already announced - permanently, for the life of the job.
+
+    Fingerprinting the kind with the record's tracked-field hash makes the key
+    "this job, in this state", so each distinct change is announced exactly
+    once and a re-run reporting the same change stays silent.
+    """
+    if kind != KIND_CHANGED:
+        return kind
+    return f"{kind}:{JobDatabase.record_hash(record)[:12]}"
+
+
 def _migrate_legacy_db(path: Path) -> None:
     """Move a pre-job_id database aside so it never collides with the new schema.
 
@@ -92,13 +114,19 @@ def _migrate_legacy_db(path: Path) -> None:
     """
     if not path.exists():
         return
+    conn = None
     try:
         conn = sqlite3.connect(str(path))
         cursor = conn.execute("PRAGMA table_info(jobs)")
         columns = {row[1] for row in cursor.fetchall()}
-        conn.close()
     except sqlite3.Error:
         return
+    finally:
+        # The close used to sit inside the try, so a PRAGMA failure leaked the
+        # handle - and on Windows an open handle blocks the path.replace()
+        # below, turning a recoverable migration into a permanent one.
+        if conn is not None:
+            conn.close()
 
     if columns and "job_id" not in columns:
         backup = path.with_name(f"{path.name}.pre-migration.bak")
@@ -397,20 +425,26 @@ class JobDatabase:
         if not rows:
             return []
 
-        sent: set[str] = set()
-        with self._cursor() as cursor:
-            ids = [r["job_id"] for r in rows]
-            for start in range(0, len(ids), 500):
-                chunk = ids[start:start + 500]
-                placeholders = ",".join("?" * len(chunk))
-                cursor.execute(
-                    f"SELECT job_id FROM notifications "
-                    f"WHERE kind = ? AND job_id IN ({placeholders})",
-                    [kind, *chunk],
-                )
-                sent.update(row["job_id"] for row in cursor.fetchall())
+        # Keyed on (job_id, kind) where "changed" carries a per-change
+        # fingerprint, so two different changes to one job are two keys.
+        keys = {(r["job_id"], notification_kind(r, kind)) for r in rows}
 
-        return [r for r in rows if r["job_id"] not in sent]
+        sent: set[tuple[str, str]] = set()
+        with self._cursor() as cursor:
+            pairs = sorted(keys)
+            for start in range(0, len(pairs), 250):
+                chunk = pairs[start:start + 250]
+                placeholders = ",".join("(?, ?)" for _ in chunk)
+                flat = [value for pair in chunk for value in pair]
+                cursor.execute(
+                    f"SELECT job_id, kind FROM notifications "
+                    f"WHERE (job_id, kind) IN ({placeholders})",
+                    flat,
+                )
+                sent.update((row["job_id"], row["kind"]) for row in cursor.fetchall())
+
+        return [r for r in rows
+                if (r["job_id"], notification_kind(r, kind)) not in sent]
 
     def record_notified(self, records: Iterable[dict[str, Any]], *, kind: str) -> int:
         """Mark records as announced. Call only after a send actually succeeds."""
@@ -422,7 +456,7 @@ class JobDatabase:
             cursor.executemany(
                 "INSERT INTO notifications (job_id, kind, sent_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(job_id, kind) DO NOTHING",
-                [(r["job_id"], kind, now) for r in rows],
+                [(r["job_id"], notification_kind(r, kind), now) for r in rows],
             )
         return len(rows)
 

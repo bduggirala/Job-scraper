@@ -306,7 +306,24 @@ def collect_via_framework_data(plan: RoutePlan) -> list[dict]:
     return FrameworkDataCollector(plan.company, detection).collect().jobs
 
 
-def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | None, bool]:
+@dataclass
+class BrowserHarvest:
+    """What the Playwright fallback returned, including how much of it there was.
+
+    Replaces a 4-tuple. The completeness fields are the reason: they have to
+    reach :class:`CompanyResult`, and a fifth and sixth positional element
+    would have made every call site harder to read than the thing it returns.
+    """
+
+    records: list[dict] = field(default_factory=list)
+    discovered_ats_url: str | None = None
+    discovered_provider: str | None = None
+    blocked: bool = False
+    complete: bool = True
+    stop_reason: str | None = None
+
+
+def collect_via_browser(plan: RoutePlan) -> BrowserHarvest:
     """Run the Playwright fallback for a planned company.
 
     Imported lazily so that a run which never needs a browser (or a machine
@@ -352,11 +369,15 @@ def collect_via_browser(plan: RoutePlan) -> tuple[list[dict], str | None, str | 
             # only reveals jobs behind a search.
             record["source_query"] = job.get("source_query")
             records.append(record)
-    return (
-        records,
-        result.discovered_ats_url,
-        result.discovered_provider,
-        result.blocked,
+    return BrowserHarvest(
+        records=records,
+        discovered_ats_url=result.discovered_ats_url,
+        discovered_provider=result.discovered_provider,
+        blocked=result.blocked,
+        # getattr, not attribute access: a test double standing in for
+        # PlaywrightResult predates these fields and must keep working.
+        complete=getattr(result, "complete", True),
+        stop_reason=getattr(result, "stop_reason", None),
     )
 
 
@@ -491,7 +512,11 @@ def fetch_company_jobs(
 
     log.info("%s -> Playwright fallback", company)
     try:
-        jobs, discovered_url, discovered_provider, blocked = collect_via_browser(plan)
+        harvest = collect_via_browser(plan)
+        jobs = harvest.records
+        discovered_url = harvest.discovered_ats_url
+        discovered_provider = harvest.discovered_provider
+        blocked = harvest.blocked
     except Exception as exc:
         # A thin JSON-LD harvest is still better than nothing when the browser
         # cannot run at all.
@@ -507,11 +532,14 @@ def fetch_company_jobs(
             error_type=type(exc).__name__, error_message=str(exc),
         )
 
-    # Neither tier found a real list: keep whichever saw more.
+    # Neither tier found a real list: keep whichever saw more. A cheap-tier
+    # harvest is a single GET, so preferring it also discards the browser's
+    # truncation - the rows being returned are no longer the capped ones.
     if len(jsonld_jobs) > len(jobs) and not discovered_provider:
         log.info("%s -> keeping %s JSON-LD row(s) over %s browser row(s)",
                  company, len(jsonld_jobs), len(jobs))
         jobs = jsonld_jobs
+        harvest.complete, harvest.stop_reason = True, None
 
     # Self-healing: the browser found the real ATS behind a branded careers
     # page (e.g. GameStop -> UKG). Collecting through that provider's API now
@@ -569,4 +597,8 @@ def fetch_company_jobs(
         company=company, jobs=jobs, plan=plan,
         success=True, fell_back=fell_back,
         discovered_ats_url=discovered_url, discovered_provider=discovered_provider,
+        # A browser scrape that stopped at playwright.max_pages has not seen the
+        # later pages, exactly as a truncated API walk has not - and removal
+        # sync must skip it for the same reason.
+        complete=harvest.complete, stop_reason=harvest.stop_reason,
     )

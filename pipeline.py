@@ -55,7 +55,35 @@ OUTPUT_FIELDS = list(RECORD_FIELDS) + [
     "fit_explanation",
     "first_seen",
     "is_new",
+    # new / changed / unchanged. Change detection reached the database and the
+    # email digest but never the spreadsheet, so the file most people actually
+    # open could not say which rows had moved since the last run.
+    "change_status",
 ]
+
+CHANGE_NEW = "new"
+CHANGE_CHANGED = "changed"
+CHANGE_UNCHANGED = "unchanged"
+
+
+def assign_change_status(jobs: list[dict[str, Any]], changed_ids: set[str]) -> None:
+    """Label each row new / changed / unchanged, in place.
+
+    "New" wins over "changed": a job seen for the first time has no previous
+    state to have moved from, so reporting it as a change would be meaningless
+    and would hide the more useful fact.
+
+    Removed jobs are deliberately not a status here - this export lists what an
+    employer is advertising now, and a row for a closed requisition is a link to
+    a dead page. Removals are counted in the run summary instead.
+    """
+    for job in jobs:
+        if job.get("is_new"):
+            job["change_status"] = CHANGE_NEW
+        elif job.get("job_id") in changed_ids:
+            job["change_status"] = CHANGE_CHANGED
+        else:
+            job["change_status"] = CHANGE_UNCHANGED
 
 FAILURE_FIELDS = [
     "company", "url", "ats_provider", "error_type", "error_message", "timestamp",
@@ -551,6 +579,24 @@ def write_outputs(
     return written
 
 
+def unannounced_matching_jobs(
+    database: JobDatabase, final_jobs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Matching jobs that have never been announced as new.
+
+    Deliberately *not* ``[j for j in final_jobs if j["is_new"]]``. ``is_new``
+    is computed against the ids already in the database, and by the time a
+    digest is attempted the jobs have been upserted - so a send that failed
+    left those jobs no longer new on the next run, never back in the candidate
+    set, and never announced. The notifications table faithfully recorded that
+    they had not been sent, and nothing ever asked it.
+
+    Asking the table directly makes the retry automatic: this run's new jobs
+    and an earlier run's unannounced ones are the same query.
+    """
+    return database.filter_unnotified(final_jobs, kind="new")
+
+
 def _prepare_notification(
     database: JobDatabase,
     summary: "RunSummary",
@@ -563,9 +609,8 @@ def _prepare_notification(
     the send happens after the outputs exist on disk - the attachment has to be
     written before it can be attached.
     """
-    new_jobs = [j for j in final_jobs if j.get("is_new")]
     return {
-        "new": database.filter_unnotified(new_jobs, kind="new"),
+        "new": unannounced_matching_jobs(database, final_jobs),
         "changed": database.filter_unnotified(changed_jobs, kind="changed"),
         # A run with any truncated company cannot be trusted to know what is
         # new - unless the only truncation was the job budget, which leaves a
@@ -614,6 +659,14 @@ def send_notifications(
 
     if not send_digest(config, digest, attachments):
         return False
+
+    # A dry run rendered the digest to disk without mailing anyone. Recording
+    # those jobs as announced would mean the first *real* send silently skipped
+    # everything a preview had already seen.
+    if config.dry_run:
+        log.info("Dry run: %s new and %s changed job(s) left unmarked so a real "
+                 "send still announces them", len(new_jobs), len(changed_jobs))
+        return True
 
     with JobDatabase(database_path) as database:
         database.record_notified(new_jobs, kind="new")
@@ -817,6 +870,7 @@ def run(
             if c["job_id"] in matching_ids
         ]
         summary.changed_jobs = len(changed_jobs)
+        assign_change_status(final_jobs, {c["job_id"] for c in changed_jobs})
         database.clear_change_marks()
 
         notify_payload = _prepare_notification(
@@ -834,7 +888,11 @@ def run(
     # a full run: a --limit or --test-company slice knows nothing about the
     # companies it skipped, so its "new" set is not a real answer.
     if notify and not output_prefix:
-        attachments = [p for k, p in paths.items() if k == "xlsx"]
+        # notifications.email.attach_spreadsheet was defined in settings.yaml
+        # and never read - the workbook was attached unconditionally, so
+        # turning it off had no effect.
+        attach = bool(cfg.get("notifications.email.attach_spreadsheet", True))
+        attachments = [p for k, p in paths.items() if k == "xlsx"] if attach else []
         send_notifications(notify_payload, summary, db_path, cfg, attachments)
 
     # Search-fallback ATS discovery, written back so the next run routes these

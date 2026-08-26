@@ -155,12 +155,40 @@ def test_the_request_carries_both_offset_and_page_number():
     assert seen == [(0, 0, 1), (10, 1, 2), (20, 2, 3)]
 
 
-def test_over_reported_totals_do_not_prevent_completion():
-    """A stale total above what the tenant serves is exhaustion, not truncation."""
+def test_a_slightly_over_reported_total_does_not_prevent_completion():
+    """Totals drift while a walk runs - postings close, counts are cached.
+
+    Treating a few missing rows as a failure would suppress that company's
+    removal sync on every run forever, so a small gap is tolerated (see
+    ``ats.base.TOTAL_RECONCILIATION_TOLERANCE``).
+    """
+    def fetch(req: PageRequest):
+        return _rows(req.offset, 20, total=98), 100
+
+    result = paginate(fetch, page_size=20, max_jobs=10_000)
+
+    assert result.complete is True
+    assert len(result.items) == 98
+
+
+def test_a_large_shortfall_against_a_reported_total_is_not_completion():
+    """Deliberate policy, replacing an earlier rule that called this complete.
+
+    30 rows served against a reported 900 is ambiguous: either the tenant is
+    over-reporting a total for a different scope, or it stalled and 870 live
+    postings exist that we never saw. Nothing in a single walk distinguishes
+    them, so the choice is which error to make - and they are not symmetric.
+
+    Believing the tenant costs 870 live postings deleted from the tracker on
+    the next sync, plus the false "new" burst when they reappear. Disbelieving
+    it costs a suppressed removal sync, which leaves stale rows behind and is
+    visible in the run summary's truncation table. The recoverable error wins.
+    """
     def fetch(req: PageRequest):
         return _rows(req.offset, 20, total=30), 900
 
     result = paginate(fetch, page_size=20, max_jobs=10_000)
 
-    assert result.complete is True
-    assert len(result.items) == 30
+    assert result.complete is False
+    assert len(result.items) == 30, "the rows we did get are still kept"
+    assert result.reported_total == 900

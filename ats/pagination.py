@@ -33,9 +33,12 @@ from ats.base import (
     STOP_BUDGET,
     STOP_EXHAUSTED,
     STOP_NO_NEW_ROWS,
+    STOP_PAGE_CEILING,
     STOP_PAGE_FAILED,
     STOP_REPEATED_PAGE,
+    STOP_SHORT_OF_TOTAL,
     STOP_TOTAL_REACHED,
+    TOTAL_RECONCILIATION_TOLERANCE,
 )
 from logger import get_logger
 
@@ -73,6 +76,43 @@ class PageWalk:
 
 #: ``fetch(request) -> (rows, reported_total_or_None)``
 FetchPage = Callable[[PageRequest], "tuple[Iterable[Any], int | None]"]
+
+
+def _reconcile(items: list[Any], total: int | None, pages: int, reason: str) -> PageWalk:
+    """Finish a walk, checking what we collected against what was promised.
+
+    A provider that reports a total and then stops serving rows before reaching
+    it has contradicted itself, and the difference is postings we never saw.
+    Reporting that as a complete scrape is what lets removal sync delete them:
+    it is the same class of error as a failed page, just quieter, because
+    nothing raised.
+
+    A small shortfall is tolerated - see
+    :data:`ats.base.TOTAL_RECONCILIATION_TOLERANCE`.
+
+    Only ``STOP_EXHAUSTED`` is rewritten. That reason is a *claim* - "the
+    provider served everything it had" - and a reported total contradicting it
+    makes the claim false. The other reasons describe an observed event
+    (a page repeated, a page contributed nothing new); those stay true and
+    remain far more useful for diagnosis, so completeness alone is flipped.
+    """
+    walk = PageWalk(items, True, pages, total, reason)
+    if total is None or total <= 0:
+        return walk
+
+    missing = total - len(items)
+    if missing <= max(1, int(total * TOTAL_RECONCILIATION_TOLERANCE)):
+        return walk
+
+    log.warning(
+        "pagination stopped (%s) with %s of %s row(s) the provider reported; "
+        "marking the scrape incomplete so removal sync is skipped",
+        reason, len(items), total,
+    )
+    walk.complete = False
+    if reason == STOP_EXHAUSTED:
+        walk.stop_reason = STOP_SHORT_OF_TOTAL
+    return walk
 
 
 def _page_fingerprint(rows: list[Any]) -> str:
@@ -147,13 +187,13 @@ def paginate(
 
         rows = list(rows or [])
         if not rows:
-            return PageWalk(items, True, pages, total, STOP_EXHAUSTED)
+            return _reconcile(items, total, pages, STOP_EXHAUSTED)
 
         fingerprint = _page_fingerprint(rows)
         if fingerprint in seen_pages:
             log.debug("%s: page %s repeated an earlier page; stopping",
                       label or "pagination", request.page_number)
-            return PageWalk(items, True, pages, total, STOP_REPEATED_PAGE)
+            return _reconcile(items, total, pages, STOP_REPEATED_PAGE)
         seen_pages.add(fingerprint)
 
         pages += 1
@@ -167,7 +207,7 @@ def paginate(
                 seen_keys.add(identity)
                 fresh.append(row)
             if not fresh:
-                return PageWalk(items, True, pages, total, STOP_NO_NEW_ROWS)
+                return _reconcile(items, total, pages, STOP_NO_NEW_ROWS)
 
         items.extend(fresh)
 
@@ -181,16 +221,26 @@ def paginate(
         # request: the empty page that follows ends the walk honestly, while
         # stopping here would report 2 of 200 rows as a complete scrape.
         if len(rows) < page_size and total is None:
-            return PageWalk(items, True, pages, total, STOP_EXHAUSTED)
+            return _reconcile(items, total, pages, STOP_EXHAUSTED)
 
         index += 1
 
-    reason = STOP_BUDGET if len(items) >= max_jobs else STOP_EXHAUSTED
-    complete = reason is STOP_EXHAUSTED
-    if not complete:
+    # Which bound actually ended the loop matters. Deriving the reason from the
+    # job budget alone reported a walk that ran out of *pages* as "exhausted",
+    # which reads as complete - and on a ten-rows-per-request provider the page
+    # ceiling is only 5,000 jobs however high max_jobs is set.
+    if len(items) >= max_jobs:
         log.warning("%s: stopped at the %s-job budget with %s reported",
                     label or "pagination", max_jobs, total)
-    return PageWalk(items[:max_jobs], complete, pages, total, reason)
+        return PageWalk(items[:max_jobs], False, pages, total, STOP_BUDGET)
+
+    if index >= MAX_PAGES:
+        log.warning("%s: stopped at the %s-page ceiling with %s row(s) "
+                    "collected and %s reported",
+                    label or "pagination", MAX_PAGES, len(items), total)
+        return PageWalk(items[:max_jobs], False, pages, total, STOP_PAGE_CEILING)
+
+    return _reconcile(items[:max_jobs], total, pages, STOP_EXHAUSTED)
 
 
 def _fetch_with_retry(
