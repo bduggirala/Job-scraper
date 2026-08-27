@@ -27,11 +27,14 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Iterable
 
+from normalize import parse_date
 from ats.base import (
     STOP_BUDGET,
     STOP_EXHAUSTED,
+    STOP_FRESHNESS_REACHED,
     STOP_NO_NEW_ROWS,
     STOP_PAGE_CEILING,
     STOP_PAGE_FAILED,
@@ -124,6 +127,39 @@ def _page_fingerprint(rows: list[Any]) -> str:
     return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()
 
 
+def _default_row_date(row: Any) -> Any:
+    """Read a date from an already-normalized record."""
+    return row.get("date_posted") if isinstance(row, dict) else None
+
+
+def _page_is_entirely_older(
+    rows: Iterable[Any], cutoff: datetime, row_date: Callable[[Any], Any],
+) -> bool:
+    """True when every dated row on this page is older than ``cutoff``.
+
+    ``row_date`` exists because the walk sees whatever shape the collector's
+    fetch returns, and that is not consistent: Paylocity hands back normalized
+    records with ``date_posted``, while Workday hands back raw ``jobPostings``
+    whose date lives in ``postedOn`` (or a ``bulletFields`` entry) and is only
+    normalized after the walk finishes. Reading ``date_posted`` unconditionally
+    found no dates at all on Workday, so the stop silently never fired.
+
+    Undated rows do not count either way: a page of them says nothing about
+    where the walk has reached, and treating "no date" as "old" would end a
+    walk the moment a provider stopped stamping dates. A page with no dated
+    rows at all therefore returns False and the walk continues.
+    """
+    seen_a_date = False
+    for row in rows:
+        posted = parse_date(row_date(row))
+        if posted is None:
+            continue
+        seen_a_date = True
+        if posted >= cutoff:
+            return False
+    return seen_a_date
+
+
 def paginate(
     fetch: FetchPage,
     *,
@@ -133,6 +169,8 @@ def paginate(
     page_retries: int = 2,
     retry_backoff_seconds: float = 1.0,
     label: str = "",
+    freshness_cutoff: "datetime | None" = None,
+    row_date: Callable[[Any], Any] | None = None,
 ) -> PageWalk:
     """Walk a provider's pages until it runs out, or a bound is reached.
 
@@ -150,6 +188,15 @@ def paginate(
             propagates so the collector can raise ``CollectorUnavailable`` and
             let the router fall back; later pages are retried and then
             tolerated as an incomplete walk.
+        freshness_cutoff: stop once the provider is serving nothing newer than
+            this. Only collectors that serve **newest-first** may pass it, and
+            it only engages when the reported total exceeds ``max_jobs`` - i.e.
+            when the walk was going to be truncated regardless. Given the
+            choice between an arbitrary prefix of a 19,263-job tenant and the
+            part of it inside the freshness window, this takes the latter.
+        row_date: how to read a posting date out of one of *this* provider's
+            raw rows. Required alongside ``freshness_cutoff`` unless the rows
+            are already normalized records carrying ``date_posted``.
 
     Returns:
         A :class:`PageWalk`. ``complete`` is False only when rows are known to
@@ -169,6 +216,9 @@ def paginate(
     #: is the row cursor, and it must follow what was *received* rather than
     #: what was requested - see the ``offset`` note below.
     rows_seen = 0
+    #: Consecutive pages carrying nothing inside the freshness window.
+    stale_pages = 0
+    read_date = row_date or _default_row_date
 
     while len(items) < max_jobs and index < MAX_PAGES:
         request = PageRequest(
@@ -233,6 +283,22 @@ def paginate(
                 return _reconcile(items, total, pages, STOP_NO_NEW_ROWS)
 
         items.extend(fresh)
+
+        # Past the freshness window on a newest-first provider that we could
+        # never have finished anyway. Two consecutive fully-stale pages rather
+        # than one, because real feeds carry a little ordering noise (a
+        # re-activated requisition keeps its original date) and one stale page
+        # is not proof the walk is done with fresh rows.
+        if freshness_cutoff is not None and total is not None and total > max_jobs:
+            if _page_is_entirely_older(rows, freshness_cutoff, read_date):
+                stale_pages += 1
+                if stale_pages >= 2:
+                    log.info("%s: paged past the freshness window after %s row(s) "
+                             "of %s reported; the rest is older by construction",
+                             label or "pagination", len(items), total)
+                    return PageWalk(items, False, pages, total, STOP_FRESHNESS_REACHED)
+            else:
+                stale_pages = 0
 
         if total is not None and len(items) >= total:
             return PageWalk(items, True, pages, total, STOP_TOTAL_REACHED)

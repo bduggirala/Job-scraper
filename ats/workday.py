@@ -149,6 +149,18 @@ class WorkdayCollector(ATSCollector):
                 page_size=PAGE_SIZE,
                 max_jobs=self.max_jobs,
                 label=f"{self.company}/workday",
+                # Workday CXS serves posting-date descending by default -
+                # measured across Capital One's 1,854 postings, mean age climbs
+                # monotonically from 1.6 days in the first 200 rows to 29.0 in
+                # the last 200, and again on the 19,263-posting CVS tenant
+                # (offset 0 "Posted Today", 6,000 "9 Days Ago", 12,000 "23 Days
+                # Ago"). That ordering is what makes an early stop safe: on a
+                # tenant too big to finish, the rows past the freshness window
+                # are the ones the filter would have dropped anyway.
+                freshness_cutoff=self.freshness_cutoff,
+                # The walk sees raw jobPostings; the date is normalized only
+                # after it finishes, so it needs this to read one.
+                row_date=self._extract_posted,
             )
         except CollectorUnavailable:
             raise

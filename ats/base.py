@@ -13,6 +13,7 @@ company as a hard failure.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from logger import get_logger
@@ -46,6 +47,14 @@ STOP_PAGE_CEILING = "page_ceiling"
 #: unless it can actually establish date ordering - see the note on
 #: :data:`DESCRIBABLE_STOP_REASONS`.
 STOP_BUDGET_UNORDERED = "budget_exhausted_unordered"
+#: The walk stopped on purpose, having paged past the freshness window on a
+#: provider that serves newest-first. Everything beyond is older than the
+#: window by construction, so nothing the filter would have kept was missed.
+#:
+#: Only engaged for a tenant too large to walk completely - it is the answer to
+#: "we cannot have all 19,263 postings, so which 6,000 do we want?", and the
+#: honest answer is the recent ones rather than an arbitrary prefix.
+STOP_FRESHNESS_REACHED = "freshness_window_reached"
 #: A single-GET tier (JSON-LD, static HTML, framework payload) harvested a page
 #: that advertises more results than it served - a stated results count above
 #: what we extracted, a pagination widget, or a "view all jobs" link. The tier
@@ -85,6 +94,9 @@ STOP_SHORT_OF_TOTAL = "short_of_reported_total"
 #: many companies are affected.
 DESCRIBABLE_STOP_REASONS = frozenset({
     STOP_BUDGET, STOP_PAGE_CEILING, STOP_MORE_AVAILABLE,
+    # The most describable of the lot: we chose where to stop, and we chose the
+    # freshness boundary itself.
+    STOP_FRESHNESS_REACHED,
 })
 
 #: How far below a reported total a walk may land and still count as complete.
@@ -176,6 +188,24 @@ class ATSCollector:
         it does make the result incomplete (:data:`STOP_BUDGET`).
         """
         return int(self.settings.get("requests.max_jobs_per_company", 10000))
+
+    @property
+    def freshness_cutoff(self) -> "datetime | None":
+        """The oldest posting worth paging to, or None to walk everything.
+
+        Only meaningful for a collector that serves **newest-first**; passing
+        it from one that does not would truncate a walk on the strength of an
+        ordering the provider never promised (see
+        :data:`STOP_BUDGET_UNORDERED` for what that costs).
+
+        A margin is added to the configured window so the stop lands clear of
+        the boundary: posting dates are day-granular on most providers, time
+        zones move them around, and a walk that stopped exactly at the cutoff
+        would shave rows the filter would have kept.
+        """
+        hours = float(self.settings.get("hours_old", 168))
+        margin = float(self.settings.get("requests.freshness_stop_margin_hours", 48))
+        return datetime.now(timezone.utc) - timedelta(hours=hours + margin)
 
     def record(self, **kwargs: Any) -> dict[str, Any] | None:
         """Build a normalized record stamped with this collector's provider."""

@@ -504,6 +504,7 @@ name a `stop_reason`:
 | `page_failed` | no | A page beyond the first failed — hole of unknown shape |
 | `budget_exhausted` | no | `max_jobs_per_company` tripped while rows remained, on a walk that runs newest-first |
 | `budget_exhausted_unordered` | no | The same ceiling against a provider that serves by **relevance**, so the gap is of no particular age |
+| `freshness_window_reached` | no | Deliberately stopped: a newest-first provider too large to finish had paged past the freshness window |
 | `page_ceiling` | no | `pagination.MAX_PAGES` (500) tripped first |
 | `short_of_reported_total` | no | The walk ended naturally, but the provider's own total says there was more |
 | `more_results_available` | no | A single-GET tier read page one of a list the page itself advertises as longer |
@@ -711,13 +712,32 @@ Amazon `sort=recent`).
 Phenom's search URL carries `s=1`, which was read as a date sort for a long
 time and is not one — see `budget_exhausted_unordered` above. A collector whose
 ordering cannot be established reports that reason instead, which keeps its
-companies out of the set the digest treats as fully understood. The practical
-consequence today is CVS Health and Signify Health: 8,000 of 18,904 postings,
-a gap that cannot be walked (≈1,890 sequential requests, ~1,020s at the rate
-those two actually achieve against one rate-limited host, against a 900s
-per-company budget) and cannot be narrowed (that endpoint ignores every
-keyword and sort parameter tried). They are reported honestly as truncated
-rather than quietly as complete.
+companies out of the set the digest treats as fully understood.
+
+**And where it does support it, stop at the window rather than at a prefix.**
+When a tenant is too large to finish, the only question is *which* subset to
+keep, and on a newest-first provider there is a much better answer than "the
+first N". `paginate(freshness_cutoff=...)` pages until the provider stops
+serving anything inside the freshness window and then stops
+(`freshness_window_reached`); everything past that point is older than the
+window by construction, so nothing the filter would have kept is missed.
+
+Two guards keep it honest. It only engages when `reported_total` already
+exceeds `max_jobs` — otherwise it would turn completed scrapes into partial
+ones and silently disable their removal sync. And it needs two consecutive
+fully-stale pages, because real feeds carry ordering noise (a re-activated
+requisition keeps its original date). `requests.freshness_stop_margin_hours`
+(48) is added to `hours_old` so the stop lands clear of the boundary rather
+than shaving rows the filter would have kept.
+
+CVS Health is what this was built for, and it moved provider as a result. Its
+Phenom board served 19,126 postings in relevance order, so its 8,000-row
+ceiling hid jobs of every age *including current ones*. Its own `applyUrl`
+values point at a Workday tenant (`cvshealth.wd1.myworkdayjobs.com/
+CVS_Health_Careers`) which serves posting-date descending — offset 0 "Posted
+Today", 6,000 "9 Days Ago", 12,000 "23 Days Ago". Measured end to end: **6,777
+jobs in 220s with the oldest 12 days old, against 8,000 in 432s scattered
+across 191 days.** Half the time, and no fresh posting left behind.
 
 **Workday CXS ignores a sort parameter** — verified directly: requesting
 `sortBy=POSTING_DATES_DESC` returns a byte-identical first page to sending
@@ -872,6 +892,36 @@ still carries the full per-company record (see [Output](#output)).
 
 ## Reliability
 
+**One wedged company must not cost the phase.** Playwright threads can block
+inside their own event loop with no timeout of their own. The per-company limit
+records such a company as failed — but a `ThreadPoolExecutor` has no way to
+reclaim the thread, so the slot stays occupied until the process exits.
+Measured: PwC, CBRE and Slalom each ran past the limit within ten minutes of
+each other, all three Playwright workers were then permanently held, throughput
+went to zero, and the fourteen companies queued behind them were written off on
+the phase budget. **Three bad sites cost seventeen.**
+
+The obvious fix — spare threads, so an abandoned company's slot can be reused —
+was implemented, measured and reverted. Playwright's sync API is thread-affine
+(`shutdown_thread_browser` documents why: closing a worker's browser from
+another thread deadlocked a full run and orphaned ~100 Chromium processes), so
+the wedged browser cannot be closed and the replacement starts a *second*
+Chromium beside it. Six concurrent instances against a measured ceiling of five
+turned a 43-minute run with 3 failures into a **3h13m run with 19**. The scarce
+resource is browsers, not threads, and no amount of thread juggling makes more
+of them.
+
+What works costs nothing: `pipeline.slowest_last()` orders each phase so the
+companies that timed out on the previous run go **last**, and healthy companies
+are ordered fastest-first ahead of them. Whatever a wedged company blocks, it
+blocks companies that were already the slowest or already timed out — and if
+the phase budget expires, it expires on them rather than on healthy employers
+that merely queued behind them. Omnicell and Slalom have timed out on every
+recorded run; under this they can no longer take anything with them. It is
+deliberately a *deprioritisation*, never a skip list, so a site that recovers
+is still scraped.
+
+
 - 30s HTTP timeout, 3 retries, exponential backoff **with jitter** (tenacity),
   `Retry-After` honoured on 429. Jitter matters because ten workers share one
   retry schedule — without it they back off in lockstep and retry together,
@@ -975,14 +1025,15 @@ returns real jobs through it.
 | `tools/canary.py` | ~2-min smoke test: one company per collection path (run before a full run) |
 | `tools/find_ats_urls.py` | Crawl + verify missing ATS URLs, write suggestions into the workbook |
 | `tools/probe_site.py` | Diagnostic: dump what a single page actually contains |
-| `tests/` | Offline pytest suite (network mocked), 887 tests |
+| `tests/` | Offline pytest suite (network mocked), 925 tests |
 | `tests/conftest.py` | Suite-wide isolation: clears the `.env` variables, and redirects `setup_logging` into `tmp_path` so no test can truncate `logs/scraper.log` |
 | `docs/superpowers/` | Design specs + implementation plans — see `docs/superpowers/README.md` for the index |
 
 ## Before trusting a full run
 
-A full run over all 180 companies takes **~34 minutes** (measured: 131,730 jobs
-collected, 120 direct-API and 60 browser companies, 3 Playwright workers).
+A full run over all 180 companies takes **~40 minutes** (measured: 145,634 jobs
+collected, 122 direct-API and 58 browser companies, 3 Playwright workers, 178
+of 180 succeeding).
 `tools/canary.py` checks one company per collection path in about two minutes
 and exits non-zero if any path returns zero jobs — it catches the case where a
 whole provider (or the browser path) breaks silently:
@@ -991,7 +1042,7 @@ whole provider (or the browser path) breaks silently:
 python tools/canary.py
 ```
 
-Unit tests: `python -m pytest tests/ -q` (887 tests, ~8.5 minutes).
+Unit tests: `python -m pytest tests/ -q` (925 tests, ~10 minutes).
 
 Lint: `python -m ruff check --select F,E9 --exclude venv .` — `F` catches
 unused imports and dead locals, `E9` catches syntax/IO errors. Kept to those

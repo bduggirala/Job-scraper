@@ -240,6 +240,73 @@ CHANGE_CHANGED = "changed"
 CHANGE_UNCHANGED = "unchanged"
 
 
+def previous_costs(report_path: Path) -> dict[str, tuple[bool, float]]:
+    """``{company: (timed_out, seconds)}`` from a previous run's report.
+
+    Used only to decide *order*, never to skip a company - a site that hung
+    once may be fine today, and this pipeline exists to not miss jobs.
+
+    Empty when there is no readable report; a first run simply keeps workbook
+    order.
+    """
+    report_path = Path(report_path)
+    if not report_path.exists():
+        return {}
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.debug("Could not read %s for run ordering: %s", report_path, exc)
+        return {}
+
+    costs: dict[str, tuple[bool, float]] = {}
+    for row in report.get("companies") or []:
+        name = str(row.get("company") or "").strip()
+        if not name:
+            continue
+        # Only a company that burned its *own* per-company limit is a problem
+        # company. The other Timeout in the report is "Exceeded the browser
+        # phase budget", which is what a healthy company gets when it was
+        # queued behind one - counting that would demote the victims and let
+        # the real offender keep its place.
+        timed_out = (
+            str(row.get("error_type") or "") == "Timeout"
+            and "per-company limit" in str(row.get("error_message") or "")
+        )
+        try:
+            seconds = float(row.get("duration_seconds") or 0.0)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        costs[name] = (timed_out, seconds)
+    return costs
+
+
+def slowest_last(plans: list[RoutePlan], costs: dict[str, tuple[bool, float]]) -> list[RoutePlan]:
+    """Order a phase so its known problem companies run at the end.
+
+    A company that wedges its worker holds it until the process exits -
+    Playwright's sync API is thread-affine, so no other thread can close its
+    browser, and giving the pool spare threads to "replace" the slot only
+    starts a second browser beside the first (tried, measured, reverted: six
+    concurrent instances against a ceiling of five turned a 43-minute run with
+    3 failures into 3h13m with 19).
+
+    Ordering is the lever that costs nothing. Whatever a wedged company blocks,
+    it now blocks companies that were *already* the slowest or already timed
+    out - and if the phase budget expires, it expires on them rather than on
+    healthy employers that simply queued behind them. Omnicell and Slalom have
+    timed out on every run recorded; under this they can no longer take
+    anything with them.
+
+    Deliberately not a skip list: a company is only ever deprioritised, so a
+    site that recovers is still scraped.
+    """
+    def sort_key(plan: RoutePlan) -> tuple[int, float]:
+        timed_out, seconds = costs.get(plan.company, (False, 0.0))
+        return (1 if timed_out else 0, seconds)
+
+    return sorted(plans, key=sort_key)
+
+
 def previous_job_counts(report_path: Path) -> dict[str, int]:
     """``{company: jobs collected}`` from a previous run's ``last_run.json``.
 
@@ -573,6 +640,7 @@ def _teardown_pool_browsers(pool: ThreadPoolExecutor, workers: int, timeout: flo
 
 
 def _run_pool(
+
     runner: Callable[[RoutePlan], CompanyResult],
     plans: list[RoutePlan],
     *,
@@ -604,6 +672,17 @@ def _run_pool(
     stuck worker cannot block the process either.
     """
     results: list[CompanyResult] = []
+
+    # Sized exactly to the concurrency limit, and deliberately so. Giving the
+    # pool spare threads so an abandoned company could be "replaced" was tried
+    # and reverted: a wedged thread keeps its Chromium instance - Playwright's
+    # sync API is thread-affine, so no other thread can close it - and the
+    # replacement then starts a *second* browser beside it. Six concurrent
+    # instances against a measured ceiling of five took a 43-minute run with 3
+    # failures to 3h13m with 19. The scarce resource is browsers, not threads.
+    #
+    # A wedged company is instead kept from doing damage by ordering (see
+    # `_slowest_first`), not by trying to reclaim its slot.
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix)
 
     started: dict[str, float] = {}
@@ -700,13 +779,21 @@ def execute_plans(
     playwright_enabled = bool(cfg.get("playwright.enabled", True))
 
     plan_list = list(plans)
-    api_plans = [p for p in plan_list if p.method == METHOD_API]
-    browser_plans = [p for p in plan_list if p.method == METHOD_BROWSER]
 
+    # Known problem companies run at the end of their phase, so whatever they
+    # wedge, they wedge behind themselves. See :func:`slowest_last`.
+    costs = previous_costs(cfg.resolve_path("output.directory", "output") / "last_run.json")
+    api_plans = slowest_last([p for p in plan_list if p.method == METHOD_API], costs)
+    browser_plans = slowest_last([p for p in plan_list if p.method == METHOD_BROWSER], costs)
+
+    deferred = [p.company for p in (api_plans + browser_plans)
+                if costs.get(p.company, (False, 0.0))[0]]
     log.info(
         "Executing %s companies: %s via direct API, %s via Playwright",
         len(plan_list), len(api_plans), len(browser_plans),
     )
+    if deferred:
+        log.info("Running last (timed out on the previous run): %s", ", ".join(deferred))
 
     results: list[CompanyResult] = []
 

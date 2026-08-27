@@ -304,6 +304,19 @@ requests:
   # the run summary. Raise it if the summary keeps reporting a real shortfall.
   max_jobs_per_company: 10000
 
+  # Added to hours_old to decide where a newest-first walk may stop early on a
+  # tenant too large to finish (stop reason `freshness_window_reached`). The
+  # margin exists because posting dates are day-granular on most providers and
+  # time zones move them around, so stopping exactly at the 168-hour boundary
+  # would shave rows the filter would have kept. 168 + 48 = 9 days.
+  #
+  # Only collectors that actually serve newest-first pass this - currently
+  # Workday, whose CXS default order is posting-date descending (measured:
+  # CVS's 19,259-posting tenant reads "Posted Today" at offset 0 and "23 Days
+  # Ago" at offset 12,000). Never set it for a relevance-ordered provider; see
+  # `budget_exhausted_unordered` in ats/base.py for what that costs.
+  freshness_stop_margin_hours: 48
+
   # Politeness ceiling per hostname, shared across all HTTP workers. Raising
   # max_jobs_per_company multiplied what one company can request (a large
   # Workday tenant went from 25 requests to as many as 500), and ten workers

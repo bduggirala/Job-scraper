@@ -57,6 +57,11 @@ _DDO_RE = re.compile(r"phApp\.ddo\s*=\s*(\{.*?\})\s*;", re.S)
 #: (8,000 rows took 432s each, sharing one rate-limited host), and overrunning
 #: the per-company budget loses the company outright rather than truncating it.
 #:
+#: CVS Health itself has since moved off this collector: its own applyUrls
+#: point at a Workday tenant that *is* posting-date descending, so it now stops
+#: at the freshness window instead (see STOP_FRESHNESS_REACHED). What follows
+#: still governs every other oversized Phenom tenant.
+#:
 #: **The gap is not the oldest postings.** That was claimed here for a long
 #: time, on the strength of the ``s=1`` parameter the search URL carries, and
 #: it is false: offset 0 returned a 12 June posting while offset 7,990 returned
