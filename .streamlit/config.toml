@@ -1,0 +1,25 @@
+# Streamlit settings for the local dashboard.
+#
+# Read from the working directory, which is the project root for both
+# `streamlit run dashboard/app.py` and dashboard\start_dashboard.bat.
+
+[client]
+# Hide Streamlit's "developer options" from the toolbar and the ... menu.
+#
+# The one that matters is **Deploy**, which publishes an app to Streamlit
+# Community Cloud. That is the wrong action for this dashboard in three
+# separate ways: the cloud has none of this machine's files (the workbook, the
+# SQLite database, output/, logs/), it could not run the scraper (no venv, no
+# Playwright browsers), and the page has no authentication *because* only
+# localhost can reach it - a public URL would let anyone with the link edit the
+# workbook and start runs.
+#
+# Streamlit 1.62 has no switch for the Deploy button alone; "viewer" is the
+# setting that removes it, and it takes Rerun and Clear cache with it. That
+# trade is fine here because the page provides its own Refresh button, which
+# does what Rerun did and says so plainly.
+toolbarMode = "viewer"
+
+[browser]
+# A personal tool on one machine has no reason to phone home.
+gatherUsageStats = false

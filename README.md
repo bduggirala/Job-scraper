@@ -115,6 +115,7 @@ it, not separate codebases.
 | `python tools/find_ats_urls.py` | **Discovery only.** Crawls to find & *verify* an ATS URL / job-search page per company, then stops — no job list, no filtering. | ❌ | suggestions → `Suggested…` columns (or the real columns with `--apply`) |
 | `python tools/canary.py` | **Smoke test.** One company per collection path (~2 min); exits non-zero if any path returns zero jobs. Run before trusting a full run. | tests only | no |
 | `python tools/probe_site.py <url>` | **Diagnostic.** Dumps what a single page actually contains (links, detected provider). For investigating one stubborn site. | no | no |
+| `streamlit run dashboard/app.py` | **Local browser dashboard.** Two tabs: start a run (it shells out to `python main.py --no-email`) and watch it, or add/edit a company. Reads the same `last_run.json` and `company_jobs.csv` every other front door writes. See [Dashboard](#dashboard). | via `main.py` | one appended/edited row, atomically |
 
 **Do I need the discovery tool?** No — `main.py` already discovers and back-fills
 ATS URLs on its own. `find_ats_urls.py` is an optional *pre-pass*: bulk-fill or
@@ -185,6 +186,302 @@ Partial runs (`--test-company`, `--test-provider`, `--limit`) write to
 clobber a full run's results. `--retry-failed` uses a `retry_` prefix for the
 same reason: it knows nothing about the companies that already succeeded, so
 its spreadsheet is a slice rather than a replacement.
+
+---
+
+## Dashboard
+
+A small local Streamlit page over the pipeline that already exists. It starts
+the same `python main.py` a terminal would, and reads the same
+`output/last_run.json`, `output/company_jobs.csv` and `logs/scraper.log` that
+run writes. **No scraper logic lives in the dashboard** — it is a front door,
+like `tools/canary.py` or `find_ats_urls.py`.
+
+### Install and start
+
+Streamlit is an *optional* dependency, kept out of `requirements.txt` for the
+same reason the test runner is: a deployment that only scrapes should not
+install a web server it never starts.
+
+```bash
+pip install -r requirements-dashboard.txt
+```
+
+```bash
+streamlit run dashboard/app.py
+```
+
+Then open **<http://localhost:8501>** (Streamlit also prints the URL, and opens
+a browser tab itself unless `--server.headless true` is passed). To use another
+port:
+
+```bash
+streamlit run dashboard/app.py --server.port 8502
+```
+
+### Bookmarking it, and the terminal question
+
+**Yes, bookmark `http://localhost:8501/`** — the URL is stable and never
+changes. But it is not a website: it is a page served by a program on this
+machine, so **the bookmark only works while that program is running.** Open it
+with nothing running and the browser says it cannot connect.
+
+What must stay running is the *server*, not a terminal window. `streamlit run`
+happens to tie the two together, so closing that terminal stops the server.
+Double-click this instead and the terminal goes away:
+
+```text
+dashboard\start_dashboard.bat
+```
+
+It launches the server with `pythonw.exe` (the windowless interpreter, so no
+console is created at all) and opens the browser at the bookmark. Close the
+browser, reopen it from the bookmark, come back tomorrow — it keeps serving
+until you stop it or the machine restarts.
+
+**A bookmark cannot start the server.** Browsers deliberately refuse to launch
+a local program from a bookmark or a link — that restriction is the whole
+reason drive-by downloads cannot run themselves, and it is not something to
+work around. A `file:///…/start_dashboard.bat` bookmark does not run the file;
+Chrome blocks it outright. So use a **shortcut instead of a bookmark**: it both
+starts the server and opens the page, which a bookmark can never do. Run this
+once to create one on your Desktop:
+
+```text
+dashboard\create_desktop_shortcut.bat
+```
+
+Then double-click **Company ATS Dashboard** on the Desktop; right-click it to
+"Pin to Start" or "Pin to taskbar" if you want it there. Keep the browser
+bookmark too — it is the quickest way back to the page *while the server is
+already running*.
+
+To stop it:
+
+```text
+dashboard\stop_dashboard.bat
+```
+
+That stops only the server on port 8501. **A scraper run already in flight is a
+separate process and is deliberately left alone** — closing the dashboard must
+never abandon a 40-minute run half-way. It carries on writing
+`logs/scraper.log`, `output/company_jobs.csv` and `output/last_run.json`, and
+the next time you open the dashboard it reports how that run ended, because the
+outcome is recorded on disk rather than held in the page.
+
+Two things the dashboard is *not*, and does not become by being bookmarked: it
+does not start with Windows (nothing is installed or registered), and it is not
+reachable from another machine — Streamlit binds localhost, and the page has no
+authentication precisely because nothing but this machine can reach it.
+
+### "Connection error — Is Streamlit still running?"
+
+This banner is the page telling you the truth: the browser tab is open but the
+**server behind it is not running**, so it has nothing to talk to. It is not an
+error in the dashboard or in the scraper.
+
+It appears whenever the server goes away with a tab still open — you ran
+`dashboard\stop_dashboard.bat`, you closed the terminal `streamlit run` was
+using, the machine slept or restarted, or you opened the bookmark before
+starting anything. The fix is always the same: start the server again, then
+reload the tab.
+
+```text
+dashboard\start_dashboard.bat
+```
+
+A scraper run is unaffected either way — it is a separate process that keeps
+writing `logs/scraper.log` and `output/` whether or not the page is up, which
+is why the dashboard can tell you how it ended long after the fact.
+
+### The toolbar: Deploy and Rerun are hidden
+
+`.streamlit/config.toml` sets `client.toolbarMode = "viewer"`, which removes
+Streamlit's built-in developer options from the toolbar and the ⋮ menu.
+
+**Deploy** is the one that matters. It publishes an app to Streamlit Community
+Cloud, which is the wrong action here in three separate ways: the cloud has
+none of this machine's files (the workbook, `data/jobs.db`, `output/`,
+`logs/`), it could not run the scraper (no venv, no Playwright browsers), and
+the page has no authentication *because* only localhost can reach it — a public
+URL would let anyone with the link edit the workbook and start runs.
+
+That setting also hides **Rerun** and **Clear cache**, because Streamlit 1.62
+has no switch for the Deploy button alone. Neither is a loss:
+
+- The page has its own **Refresh** button, on both tabs, which re-reads the
+  workbook, the run report, the export and the log and redraws. It is the same
+  capability under a name that says what it does — "Rerun" left people
+  reasonably unsure whether it would start a scrape. (It would not: a Streamlit
+  button reports a click only on the rerun that immediately follows it, and
+  `start_run` refuses anyway while the lock is held. Neither Refresh nor a
+  browser reload can start, stop or disturb a run.)
+- **Clear cache** was never needed: the cached file reads are keyed on each
+  file's modification time, so a changed file invalidates itself. Refresh
+  clears the cache too, so the button covers that case as well.
+
+The ⋮ menu keeps its viewer options — light/dark theme, print, screencast,
+about. The theme is per browser and affects nothing but the colours.
+
+### Tab 1 — Run Scraper
+
+Press **Run Scraper**. It launches, in a separate process:
+
+```bash
+python main.py --no-email
+```
+
+`--no-email` is not optional and not a checkbox — a dashboard run never sends a
+real digest. `EMAIL_ENABLED=false` is also forced into the child's environment,
+which wins because `settings.load_env_file` never overrides a variable that is
+already set (see [Notifications](#notifications)). Ticking **Dry run** adds
+`--dry-run`: routing decisions only, nothing scraped, no output file rewritten.
+
+While the run is in flight the page shows the run's own log, the company
+currently being routed for collection, and an `n of N` bar — all parsed out of
+`logs/scraper.log`, so nothing in the pipeline had to change to make progress
+visible. The panel refreshes every 3 seconds as a Streamlit fragment, so the
+rest of the page stays interactive.
+
+Afterwards it shows, from `output/last_run.json` and the current export:
+
+| Field | Source |
+|-------|--------|
+| Status: `idle` / `running` / `completed` / `partial` / `failed` | the run lock, then the **exit code**, then `status_counts` |
+| Last run started / ended, run duration | the launch record, falling back to the `run_id` (which *is* the start time) |
+| Last successful completion | `generated_at` in `last_run.json` — written only when the pipeline reaches the end |
+| Output freshness ("Updated 12 minutes ago") | mtime of `output/company_jobs.csv` |
+| Companies attempted / successful / partial / failed / blocked | `companies_attempted`, `status_counts` |
+| Total jobs collected, matching jobs, removed | `totals` |
+| New / changed / unchanged | `change_status` in the current export |
+| Within the freshness window | `date_filter_status == within_window` (the window is `hours_old`, 168 h) |
+| Run ID, final output path | `run_id`, `config/settings.yaml` |
+| Exit code and the console tail, on failure | the launch record and `logs/dashboard_run.log` |
+
+**A run is never called successful because a process started.** The verdict is
+the scraper's exit code first; only a clean exit is then refined into
+`completed` or `partial` by the run report's own five per-company statuses.
+
+Below that: the current export as a filterable table (company, title, location,
+posted date, clickable application URL, provider, extraction method, job
+status), the partial/failed/blocked companies with their stop reason or error,
+and download buttons for `output/company_jobs.csv`, `output/company_jobs.xlsx`
+and `output/scraper_failures.csv` — **the files the run itself wrote**, byte for
+byte. The dashboard generates no export format of its own.
+
+Only one run may be active at a time, across every browser tab *and* every
+dashboard process on this machine (see [Concurrency and
+recovery](#concurrency-and-recovery)).
+
+### Tab 2 — Manage Companies
+
+Shows `config/companies.xlsx` with every column it actually has — `Company`,
+`ATS URL`, `Live Jobs Page (if ATS URL unavailable)`, plus `Data Retrieved`,
+`Jobs Found` and the `Suggested…` columns other tools write.
+
+**Add a company** takes a name (required) and the two URL columns. Leaving
+`ATS URL` blank is the normal case — the pipeline discovers and back-fills it
+during a run. Before anything is written:
+
+- the name is normalised exactly as `pipeline.load_companies` normalises it;
+- URLs must be `http(s)` with a real host;
+- a duplicate name (case-insensitive) is **refused** — the name is the key the
+  run report, the job ids and the workbook write-back all match on;
+- a duplicate URL, compared after normalisation (case, `www.`, trailing slash
+  and fragment removed) and across *both* URL columns, is refused unless you
+  tick **Add anyway**;
+- a value starting `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`, the same
+  guard the pipeline applies to scraped text before writing a CSV.
+
+The write itself: take an exclusive lock file → edit the workbook in place with
+openpyxl (so sheets, column widths, the defined table, unrelated rows and every
+other column survive) → save to `companies.xlsx.dashboard-tmp.xlsx` → verify it
+reopens, has the same header row and the expected row count, **and that
+`pipeline.load_companies` can read it** → copy the original to
+`companies.bak-dashboard.xlsx` → `os.replace` the temp over the original. The
+replace is atomic, so a concurrent reader sees the old file or the new one,
+never a half-written one. Exactly one backup is kept, overwritten each time;
+it keeps its `.xlsx` extension so recovery is a rename, not a repair.
+
+**Edit a company** changes the two URL columns of an existing row, through the
+same path. Renaming is deliberately not offered: the company name is the key
+the run report, the SQLite job ids and the write-back all match on, so a rename
+here would orphan that row's history. There is likewise **no active/inactive
+toggle** — the workbook has no such column and the pipeline scrapes every row,
+so a toggle would be a control that quietly did nothing. Remove a company by
+deleting its row in Excel.
+
+New and edited rows take effect on the **next** run; the dashboard says so
+after each write.
+
+### Concurrency and recovery
+
+| Situation | What happens |
+|-----------|--------------|
+| Two tabs, or two dashboards, press Run | `output/dashboard_run.lock` is claimed with `O_CREAT｜O_EXCL` *before* anything is spawned, so exactly one wins; the other is told a run is already in progress |
+| A run is in progress | Adding and editing are refused — the run reads the workbook *and* writes discovered ATS URLs back into it |
+| Streamlit is restarted mid-run | The run keeps going. A supervisor process (`dashboard/runner.py`) holds the lock and records the exit code, so the outcome survives the UI |
+| The run crashes, or the machine goes down | The lock outlives its owner. The dashboard checks the PID, reports **stale lock**, and offers a **Clear stale run lock** button. It is never cleared silently, and never while the owner is alive |
+| The workbook is open in Excel | Detected via Excel's `~$companies.xlsx` owner file *and* a real write-open attempt. The write is refused before anything is touched |
+
+To recover a stale lock without the UI:
+
+```bash
+rm output/dashboard_run.lock
+```
+
+To recover a workbook Excel has left locked after a crash — check no Excel
+window has it open, then:
+
+```bash
+rm config/~\$companies.xlsx
+```
+
+To restore the workbook from the dashboard's single backup:
+
+```bash
+cp config/companies.bak-dashboard.xlsx config/companies.xlsx
+```
+
+### Logs and files the dashboard owns
+
+Four files, all single-current and none of them timestamped or accumulated —
+the same policy [Logging](#logging) describes:
+
+| File | Contents |
+|------|----------|
+| `logs/scraper.log` | Written by the run itself; the dashboard only tails it |
+| `logs/dashboard_run.log` | The current run's console output, truncated at each start. This is where a scraper that dies before it can log (bad config, import error) says why |
+| `output/dashboard_run.lock` | Present only while a run is in flight; holds the supervisor's PID and start time |
+| `output/dashboard_last_run.json` | The last launch's outcome: start, finish, exit code, console tail. Overwritten each run — a status file, **not** a history |
+
+There is no dashboard database, no historical run store and no second export
+format. `output/last_run.json` and `data/jobs.db` remain the only records of
+what a run did.
+
+The same files from a terminal, when the browser is not where you are:
+
+```bash
+tail -f logs/scraper.log
+```
+
+```bash
+cat logs/dashboard_run.log
+```
+
+```bash
+cat output/dashboard_last_run.json
+```
+
+```bash
+ls -l output/company_jobs.csv output/company_jobs.xlsx
+```
+
+The output's *freshness* is that file's modification time — which is what the
+dashboard turns into "Updated 12 minutes ago". The run behind it is named by
+`run_id` in `output/last_run.json` and stamped onto every exported row, and
+that id **is** the run's start time in UTC (`20260827T202307Z`); `generated_at`
+in the same file is when it finished.
 
 ---
 
@@ -885,6 +1182,12 @@ of their own: `tools/canary.py` writes `logs/canary.log`, `find_ats_urls.py`
 writes `logs/discovery.log`, `probe_site.py` writes `logs/probe.log`. Each is
 its own single current file under the same policy.
 
+The dashboard follows the same policy without going through `setup_logging` at
+all: `logs/dashboard_run.log` holds the **console output** of the current
+dashboard-launched run and is truncated at each start. It exists for the case
+`scraper.log` cannot cover — a run that dies before logging is configured (a
+bad config, an import error) still prints why. See [Dashboard](#dashboard).
+
 Run *statistics* are a separate concern and unaffected: `output/last_run.json`
 still carries the full per-company record (see [Output](#output)).
 
@@ -966,6 +1269,9 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | `settings.py` | Loads `config/settings.yaml`; path resolution and config access |
 | `logger.py` | Logging setup |
 | `http_client.py` | Shared `requests` session, retries/backoff, `get_json`/`get_text`/`post_json` |
+| `dashboard/app.py` | The two-tab Streamlit UI (Run Scraper / Manage Companies). No scraper logic — it renders what `services` returns |
+| `dashboard/services.py` | The dashboard's non-UI half: the cross-process run lock, launching `main.py`, reading `last_run.json` / the current export / the log, and the safe `companies.xlsx` writer. Imports no Streamlit |
+| `dashboard/runner.py` | Supervisor for one dashboard-launched run: spawns `main.py`, captures its console output, records the real **exit code** and releases the lock |
 
 ### Routing & detection (`ats/`)
 
@@ -1025,7 +1331,10 @@ returns real jobs through it.
 | `tools/canary.py` | ~2-min smoke test: one company per collection path (run before a full run) |
 | `tools/find_ats_urls.py` | Crawl + verify missing ATS URLs, write suggestions into the workbook |
 | `tools/probe_site.py` | Diagnostic: dump what a single page actually contains |
-| `tests/` | Offline pytest suite (network mocked), 925 tests |
+| `requirements-dashboard.txt` | Streamlit, for `streamlit run dashboard/app.py`. Separate from `requirements.txt` so a scraper deployment does not install a web server |
+| `.streamlit/config.toml` | Hides Streamlit's Deploy button (and with it Rerun / Clear cache); disables usage stats. See [Dashboard](#dashboard) |
+| `dashboard/start_dashboard.bat` / `stop_dashboard.bat` / `create_desktop_shortcut.bat` | Start the server with no console window, stop it, and put a one-click shortcut on the Desktop |
+| `tests/` | Offline pytest suite (network mocked), 1,025 tests |
 | `tests/conftest.py` | Suite-wide isolation: clears the `.env` variables, and redirects `setup_logging` into `tmp_path` so no test can truncate `logs/scraper.log` |
 | `docs/superpowers/` | Design specs + implementation plans — see `docs/superpowers/README.md` for the index |
 
@@ -1042,7 +1351,7 @@ whole provider (or the browser path) breaks silently:
 python tools/canary.py
 ```
 
-Unit tests: `python -m pytest tests/ -q` (925 tests, ~10 minutes).
+Unit tests: `python -m pytest tests/ -q` (1,025 tests, ~10 minutes).
 
 Lint: `python -m ruff check --select F,E9 --exclude venv .` — `F` catches
 unused imports and dead locals, `E9` catches syntax/IO errors. Kept to those
@@ -1097,6 +1406,7 @@ describes. When you change the code, update the matching section:
 | Detection / resolution / routing flow | [How it works](#how-it-works) diagram |
 | A CLI flag in `main.py` | [Usage](#usage) flag table |
 | An entry-point script or tool in `tools/` | [Entry points & tools](#entry-points--tools) |
+| Anything under `dashboard/` — a field shown, a guard, a file it owns | [Dashboard](#dashboard) + [Entry points & tools](#entry-points--tools) |
 | Any module's purpose, or add/remove a file | [Codebase map](#codebase-map) |
 | A setting in `config/settings.yaml` | [Configuration](#configuration) |
 | Output columns, `last_run.json`, or filtering behaviour | [Output](#output) |

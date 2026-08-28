@@ -1,0 +1,8 @@
+# Dashboard-only dependencies. Kept out of requirements.txt for the same reason
+# requirements-dev.txt is: a scraper deployment should not install a web server
+# it will never start. Install these only to run `streamlit run dashboard/app.py`.
+-r requirements.txt
+# Upper bound is deliberate, matching this project's other pins: Streamlit
+# renames widget parameters across majors (use_container_width -> width in
+# 1.49), so a surprise major would break the page rather than the import.
+streamlit>=1.40,<2.0
