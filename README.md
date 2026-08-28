@@ -115,7 +115,7 @@ it, not separate codebases.
 | `python tools/find_ats_urls.py` | **Discovery only.** Crawls to find & *verify* an ATS URL / job-search page per company, then stops — no job list, no filtering. | ❌ | suggestions → `Suggested…` columns (or the real columns with `--apply`) |
 | `python tools/canary.py` | **Smoke test.** One company per collection path (~2 min); exits non-zero if any path returns zero jobs. Run before trusting a full run. | tests only | no |
 | `python tools/probe_site.py <url>` | **Diagnostic.** Dumps what a single page actually contains (links, detected provider). For investigating one stubborn site. | no | no |
-| `streamlit run dashboard/app.py` | **Local browser dashboard.** Two tabs: start a run (it shells out to `python main.py --no-email`) and watch it, or add/edit a company. Reads the same `last_run.json` and `company_jobs.csv` every other front door writes. See [Dashboard](#dashboard). | via `main.py` | one appended/edited row, atomically |
+| `streamlit run dashboard/app.py` | **Local browser dashboard.** Two tabs: start a run (it shells out to `python main.py --no-email`, or `--retry-failed` for the troubled companies only) and watch it, or add/edit a company. Reads the same `last_run.json` and `company_jobs.csv` every other front door writes. See [Dashboard](#dashboard). | via `main.py` | one appended/edited row, atomically |
 
 **Do I need the discovery tool?** No — `main.py` already discovers and back-fills
 ATS URLs on its own. `find_ats_urls.py` is an optional *pre-pass*: bulk-fill or
@@ -171,7 +171,7 @@ python main.py
 | `--resolve` | With `--dry-run`, also probe branded pages (1 GET each) |
 | `--test-company NAME` | Only companies matching NAME, with diagnostics |
 | `--test-provider P` | Only companies routed to provider P |
-| `--retry-failed` | Re-run only the companies `output/last_run.json` recorded as `failed` or `partial`. Blocked companies are skipped — a site that issued a challenge is not fixed by asking again. |
+| `--retry-failed` | Re-run only the companies `output/last_run.json` recorded as `failed` or `partial`, merging the results back into the full export and report per company. Blocked companies are skipped — a site that issued a challenge is not fixed by asking again. |
 | `--limit N` | Process only the first N companies |
 | `--no-playwright` | Disable browser fallback |
 | `--no-resolve` | Skip page resolution and URL repair |
@@ -183,9 +183,15 @@ python main.py
 
 Partial runs (`--test-company`, `--test-provider`, `--limit`) write to
 `test_`-prefixed output files and never modify the workbook, so they cannot
-clobber a full run's results. `--retry-failed` uses a `retry_` prefix for the
-same reason: it knows nothing about the companies that already succeeded, so
-its spreadsheet is a slice rather than a replacement.
+clobber a full run's results.
+
+`--retry-failed` is the exception, because it is the one partial run that knows
+exactly which companies it stands for. Its rows are **merged into the full
+export and the full run report, per company** — same `company_jobs.csv`,
+`company_jobs.xlsx` and `last_run.json` every other reader already opens. See
+[Merging a retry back in](#merging-a-retry-back-in) for the rule that decides
+what a retried company replaces, adds, or leaves alone. (Narrowing a retry with
+`--test-company` makes it an ordinary test slice again, prefix and all.)
 
 ---
 
@@ -369,9 +375,47 @@ and download buttons for `output/company_jobs.csv`, `output/company_jobs.xlsx`
 and `output/scraper_failures.csv` — **the files the run itself wrote**, byte for
 byte. The dashboard generates no export format of its own.
 
+#### Re-running only the companies that need it
+
+Under the **Companies needing attention** table is a second button, which
+launches:
+
+```bash
+python main.py --no-email --retry-failed
+```
+
+It re-attempts only the `partial` and `failed` companies from
+`output/last_run.json` — a full re-run of 183 companies to fix 21 of them is
+most of an hour spent on companies that already worked. The button names the
+count it will attempt, and an expander lists the companies by name before
+anything is launched.
+
+Three things it deliberately does *not* do:
+
+- **`blocked` companies are not retried.** They appear in the table but not in
+  the button's count: the site issued a challenge, and asking again is not a
+  fix (see `pipeline.RETRYABLE_STATUSES`). Where the table shows 23 rows, the
+  button offers 21.
+- **It does not build its own list.** The names come from
+  `pipeline.retryable_from_report`, the same function `--retry-failed` itself
+  calls, over the same report the table above is drawn from — so the button
+  cannot promise a set the run would not attempt.
+- **Its results land in the same files this page already shows.** The rows are
+  merged into `output/company_jobs.*` and `output/last_run.json` per company —
+  see [Merging a retry back in](#merging-a-retry-back-in) — so a company the
+  retry fixed drops out of the attention table, its jobs appear in the table
+  above, and there is no second file to open. A caption above the button names
+  the last retry, since the merged report is otherwise indistinguishable from
+  a full run's.
+
+**Dry run does not apply to it.** `--dry-run` routes to the routing report,
+which reads the whole workbook, so the retry button ignores the checkbox and
+always runs for real.
+
 Only one run may be active at a time, across every browser tab *and* every
-dashboard process on this machine (see [Concurrency and
-recovery](#concurrency-and-recovery)).
+dashboard process on this machine — a retry is a run like any other, so it is
+disabled while one is in flight and refused if it races another (see
+[Concurrency and recovery](#concurrency-and-recovery)).
 
 ### Tab 2 — Manage Companies
 
@@ -622,6 +666,52 @@ Company status is one of five, deliberately not two:
 | `blocked` | Bot challenge or explicit denial | a different route in, never a workaround |
 | `no_jobs` | Read correctly; not hiring | nothing |
 
+### Merging a retry back in
+
+`--retry-failed` re-runs a handful of companies out of the whole workbook. It
+used to write `output/retry_company_jobs.*` and `output/retry_last_run.json`,
+which kept the full export honest but left two files to reconcile by hand —
+while the dashboard, the digest, the database and the workbook all read the
+unprefixed one. A company that was fixed by a retry stayed listed as broken,
+and its rediscovered jobs sat in a file nothing else opened.
+
+So a retry now writes **into** the full outputs, per company. The rule for what
+a retried company does to its own rows is the database's, not a second one
+invented for files — `pipeline.removal_sync_allowed()` is the single predicate,
+called by `sync_completed_companies()`, the run report and the merge alike:
+
+| The retry came back… | Its rows | Why |
+|----------------------|----------|-----|
+| succeeded, complete, no collapse | **replace** that company's | the only case where a row disappearing is real news rather than a scrape we failed to read |
+| succeeded but `partial`, or a collapse against last run | **added** to that company's, keyed on `job_id` | it never reached the later pages, so what is missing is missing from *our* data, not the employer's — the same reason the database upserts without syncing removals |
+| failed, or came back empty | nothing changes | a company we could not reach tells us nothing about the rows it gave us last time |
+| was never visited | nothing changes | — |
+
+The report is spliced the same way: the retried companies' rows are replaced,
+every other company's is carried through, and `status_counts`,
+`companies_attempted` and `totals.jobs_collected` are recomputed from the
+merged set. Three things deliberately do **not** move:
+
+- **`run_id` and `generated_at` stay the full run's.** They answer "which run
+  saw the whole workbook, and when did it finish", and a 21-company retry did
+  not. The retry identifies itself under a `last_retry` block instead, which
+  the dashboard shows above the re-run button — otherwise the page would
+  display a retry's numbers with nothing saying a retry produced them.
+- **Run-scoped deltas** — `new_jobs`, `changed_jobs`, `removed_jobs`,
+  `duplicates_removed` — stay as the full run wrote them. They are measured
+  against a different baseline in the two runs, so adding them would be
+  arithmetic on two different questions.
+- **Each exported row keeps the `run_id` that produced it.** A carried-over row
+  is not restamped, which is the whole reason the column exists.
+
+`output/scraper_failures.csv` is merged on company name for the same reason:
+`blocked` companies are never retried, and a failures file rebuilt from a
+retry's own results alone would quietly report them as fixed.
+
+Where there is no previous export to merge into (a first run, a cleared
+`output/`), the merge is exactly a normal write — an empty base merges to the
+rows the run produced.
+
 ---
 
 ## Notifications
@@ -719,7 +809,10 @@ person. A dry run deliberately does *not* mark jobs as announced, so the first
 real send still includes everything a preview has seen.
 
 Partial runs (`--test-company`, `--test-provider`, `--limit`, `--retry-failed`)
-never send: they know nothing about the companies they skipped.
+never send: they know nothing about the companies they skipped. A merged retry
+writes the unprefixed files, so "is the prefix empty" stopped being the same
+question — the gate is `pipeline.speaks_for_whole_workbook()`, which also
+governs the workbook write-back for the same reason.
 
 ## Job tracking (SQLite)
 
@@ -1265,12 +1358,12 @@ and the **post-scrape tail** (normalize → filter → dedupe → store → outp
 | File | Responsibility |
 |------|----------------|
 | `main.py` | CLI: arg parsing, `--dry-run`/`--test-*`/`--retry-failed` modes, wiring to `pipeline.run()` |
-| `pipeline.py` | Run orchestration — load workbook → route → execute (2 thread pools) → filter/dedupe/store → write outputs, `last_run.json` and workbook write-back. Also `company_status()` (the five outcomes), `write_run_report()`, `retryable_companies()` and `select_attachments()` |
+| `pipeline.py` | Run orchestration — load workbook → route → execute (2 thread pools) → filter/dedupe/store → write outputs, `last_run.json` and workbook write-back. Also `company_status()` (the five outcomes), `write_run_report()`, `retryable_companies()` / `retryable_from_report()`, the retry merge (`removal_sync_allowed()`, `merge_job_rows()`, `merge_run_reports()`, `write_merged_outputs()`, `speaks_for_whole_workbook()`) and `select_attachments()` |
 | `settings.py` | Loads `config/settings.yaml`; path resolution and config access |
 | `logger.py` | Logging setup |
 | `http_client.py` | Shared `requests` session, retries/backoff, `get_json`/`get_text`/`post_json` |
 | `dashboard/app.py` | The two-tab Streamlit UI (Run Scraper / Manage Companies). No scraper logic — it renders what `services` returns |
-| `dashboard/services.py` | The dashboard's non-UI half: the cross-process run lock, launching `main.py`, reading `last_run.json` / the current export / the log, and the safe `companies.xlsx` writer. Imports no Streamlit |
+| `dashboard/services.py` | The dashboard's non-UI half: the cross-process run lock, launching `main.py` (a full run or a `--retry-failed` one), reading `last_run.json` / the current export / the log, and the safe `companies.xlsx` writer. Imports no Streamlit |
 | `dashboard/runner.py` | Supervisor for one dashboard-launched run: spawns `main.py`, captures its console output, records the real **exit code** and releases the lock |
 
 ### Routing & detection (`ats/`)
@@ -1361,7 +1454,8 @@ style opinions that say nothing about whether jobs are being missed.
 
 After a run, `output/last_run.json` is the fastest way to see what happened:
 the `status_counts` block, and `removal_sync_allowed` per company. Re-run just
-the ones that did not finish with `python main.py --retry-failed`.
+the ones that did not finish with `python main.py --retry-failed` — the results
+merge back into that same file and the same export, per company.
 
 Test-only dependencies live in `requirements-dev.txt` (which includes
 `requirements.txt`), so a deployment does not install a test runner it will

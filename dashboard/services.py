@@ -38,7 +38,12 @@ from openpyxl import load_workbook
 
 # Reused rather than restated: the dashboard must escape exactly the values the
 # pipeline's own CSV guard escapes, and two copies of that tuple would drift.
-from pipeline import _FORMULA_PREFIXES, load_companies, resolve_companies_path
+from pipeline import (
+    _FORMULA_PREFIXES,
+    load_companies,
+    resolve_companies_path,
+    retryable_from_report,
+)
 from settings import PROJECT_ROOT, Settings, load_settings
 
 MAIN_PY = PROJECT_ROOT / "main.py"
@@ -74,7 +79,10 @@ STATUS_PARTIAL = "partial"
 STATUS_FAILED = "failed"
 STATUS_STALE = "stale"
 
-#: Per-company outcomes that belong in the "needs attention" table.
+#: Per-company outcomes that belong in the "needs attention" table. Not every
+#: one of them is retryable: ``blocked`` means the site issued a challenge, and
+#: ``--retry-failed`` deliberately leaves those alone (see
+#: ``pipeline.RETRYABLE_STATUSES``).
 PROBLEM_STATUSES = ("partial", "failed", "blocked")
 
 _RUN_ID_RE = re.compile(r"^(\d{8})T(\d{6})Z$")
@@ -865,6 +873,45 @@ def problem_companies(report: dict | None) -> pd.DataFrame:
             "Status", key=lambda column: column.map(order), kind="stable"
         ).reset_index(drop=True)
     return frame
+
+
+def retry_targets(report: dict | None) -> list[str]:
+    """The companies a ``--retry-failed`` run would actually re-attempt.
+
+    A subset of :func:`problem_companies`: the retry list is the pipeline's,
+    not the dashboard's, so a blocked company shown in the attention table is
+    correctly absent here. Returns an empty list rather than raising - the
+    caller is drawing a button, and "no report yet" and "nothing to retry" both
+    mean the same thing to a button: it is disabled.
+    """
+    return retryable_from_report(report)
+
+
+@dataclass
+class RetryRecord:
+    """What the last merged retry did, from the report it merged itself into."""
+
+    run_id: str = ""
+    finished_at: datetime | None = None
+    companies: list[str] = field(default_factory=list)
+
+
+def last_retry(report: dict | None) -> RetryRecord | None:
+    """The ``last_retry`` block a merged retry leaves in ``last_run.json``.
+
+    Without it the page would show a retry's numbers with nothing saying a
+    retry produced them - the cost of merging into one report rather than
+    writing a second one beside it.
+    """
+    block = (report or {}).get("last_retry") or {}
+    run_id = str(block.get("run_id") or "")
+    if not run_id:
+        return None
+    return RetryRecord(
+        run_id=run_id,
+        finished_at=parse_timestamp(block.get("finished_at")),
+        companies=[str(name) for name in (block.get("companies") or [])],
+    )
 
 
 # ---------------------------------------------------------------------------

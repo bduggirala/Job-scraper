@@ -290,7 +290,8 @@ def _run_facts(settings, status: services.RunStatus, jobs: pd.DataFrame) -> None
 
     # --- Identity ----------------------------------------------------------
     identity = st.columns(4)
-    _fact(identity[0], "Run ID", status.run_id or "-", "stamped onto every exported row")
+    _fact(identity[0], "Run ID", status.run_id or "-",
+          "the last full run; each exported row carries the run that produced it")
     _fact(identity[1], "Final output", outputs["csv"].name, str(outputs["csv"].parent))
     _fact(identity[2], "Workbook", services.workbook_path(settings).name,
           str(services.workbook_path(settings).parent))
@@ -471,18 +472,96 @@ def _jobs_table(settings, jobs: pd.DataFrame) -> None:
             column.button(f"{label} not written yet", disabled=True, width="stretch")
 
 
-def _problem_table(report: dict | None) -> None:
+def _problem_table(settings, status: services.RunStatus, report: dict | None) -> None:
     st.subheader("Companies needing attention")
     frame = services.problem_companies(report)
     if frame.empty:
         st.success("No partial, failed or blocked companies in the last run report.")
         return
     st.caption(
-        "`partial` means the rows are real but the coverage is not (re-run with "
-        "`python main.py --retry-failed`); `blocked` means the site issued a challenge "
+        "`partial` means the rows are real but the coverage is not (that is what the "
+        "re-run button below covers); `blocked` means the site issued a challenge "
         "and needs a different route in, never a retry."
     )
     st.dataframe(frame, width="stretch", hide_index=True)
+    _retry_control(settings, status, report, len(frame))
+
+
+def _retry_control(
+    settings, status: services.RunStatus, report: dict | None, problem_count: int
+) -> None:
+    """Re-run only the companies above that are worth a second attempt.
+
+    The list is the pipeline's own (``pipeline.retryable_from_report``), read
+    from the same ``last_run.json`` the table above is drawn from, so the
+    button can never disagree with what the run will actually do - it names
+    the count and shows the names before anything is launched.
+    """
+    targets = services.retry_targets(report)
+
+    # The report is merged in place, so without this the page would show a
+    # retry's results with nothing saying a retry had happened.
+    retry = services.last_retry(report)
+    if retry:
+        st.caption(
+            f"Last retry: {len(retry.companies)} company(ies) at "
+            f"{services.format_clock(retry.finished_at)} (run `{retry.run_id}`), "
+            "merged into the figures above."
+        )
+
+    left, right = st.columns([2, 3])
+
+    with left:
+        if not targets:
+            st.button(
+                "Re-run companies needing attention",
+                width="stretch",
+                disabled=True,
+                help="Every company above is `blocked`, which a retry cannot fix.",
+            )
+        elif st.button(
+            f"Re-run {len(targets)} companies needing attention",
+            width="stretch",
+            disabled=status.running,
+            help="Starts `python main.py --no-email --retry-failed`: only the partial "
+                 "and failed companies from the last run, in a separate process.",
+        ):
+            try:
+                payload = services.start_run(settings, extra_args=["--retry-failed"])
+            except services.DashboardError as exc:
+                _flash("error", str(exc))
+            else:
+                _flash(
+                    "success",
+                    f"Retry started (PID {payload.get('pid')}) for {len(targets)} "
+                    f"company(ies): python main.py {' '.join(payload.get('args', []))}",
+                )
+            st.rerun()
+
+    with right:
+        if targets:
+            skipped = problem_count - len(targets)
+            st.caption(
+                f"Re-runs the {len(targets)} `partial`/`failed` companies only."
+                + (
+                    f" The {skipped} `blocked` one(s) are skipped - a challenge page "
+                    "answers a retry the same way."
+                    if skipped
+                    else ""
+                )
+            )
+            st.caption(
+                "Its rows are merged into the same `company_jobs.*` and the same run "
+                "report this page already shows - per company, so nothing it did not "
+                "visit is touched. There is no second file to check."
+            )
+        if status.running:
+            st.caption("Disabled while a run is in flight - only one run may be active.")
+
+    if targets:
+        with st.expander(f"Which {len(targets)} companies", expanded=False):
+            for name in targets:
+                st.markdown(f"- {name}")
 
 
 def render_run_tab(settings) -> None:
@@ -518,7 +597,7 @@ def render_run_tab(settings) -> None:
     st.divider()
     _jobs_table(settings, jobs)
     st.divider()
-    _problem_table(report)
+    _problem_table(settings, status, report)
 
 
 # ---------------------------------------------------------------------------

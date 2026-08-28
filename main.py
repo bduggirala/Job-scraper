@@ -159,13 +159,17 @@ def cmd_scrape(args: argparse.Namespace, settings) -> int:
         for name in names:
             print(f"  {name}")
 
-    # A partial run must not overwrite a full run's outputs. A retry is one:
-    # it knows nothing about the companies that already succeeded, so its
-    # spreadsheet is a slice, not a replacement.
+    # A partial run must not overwrite a full run's outputs with its much
+    # smaller result set, so --test-* and --limit write under a prefix.
+    #
+    # A retry is the one partial run that can do better than a separate file.
+    # It knows exactly which companies it re-ran, so its rows are merged into
+    # the full export per company rather than replacing it wholesale - one
+    # spreadsheet and one report to read, which is where the dashboard, the
+    # digest and every other reader already look. See pipeline.merge_job_rows.
+    merge = bool(args.retry_failed) and not diagnostic
     partial = diagnostic or bool(args.limit) or bool(args.retry_failed)
-    prefix = "retry_" if args.retry_failed and not diagnostic else (
-        "test_" if partial else ""
-    )
+    prefix = "" if merge else ("test_" if partial else "")
 
     summary, jobs, results = run(
         settings,
@@ -177,6 +181,7 @@ def cmd_scrape(args: argparse.Namespace, settings) -> int:
         resolve_pages=not args.no_resolve,
         save_raw=args.save_raw,
         output_prefix=prefix,
+        merge_into_full=merge,
         write_back=not args.no_write_back,
         notify=not args.no_email,
     )
@@ -221,8 +226,10 @@ def cmd_scrape(args: argparse.Namespace, settings) -> int:
     if prefix:
         print(f"\nPartial run - outputs written to: {out_dir} (prefixed '{prefix}')")
         print("Full-run outputs were left untouched.")
-        if args.retry_failed:
-            print("Re-run the full workbook to refresh output/company_jobs.xlsx.")
+    elif merge:
+        print(f"\nRetry merged into the full outputs in: {out_dir}")
+        print(f"Only the {len(names or [])} re-run company(ies) changed; every other "
+              "company's rows were carried over.")
     else:
         print(f"\nOutputs written to: {out_dir}")
     return 0

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
+import pipeline
 from dashboard import services
 from settings import Settings
 
@@ -365,6 +366,60 @@ def test_only_troubled_companies_are_listed_with_their_reason(cfg):
 def test_no_report_means_no_table():
     assert services.problem_companies(None).empty
     assert services.problem_companies({"companies": []}).empty
+
+
+def test_the_retry_list_is_the_troubled_table_minus_the_blocked(cfg):
+    """The button must promise exactly what ``--retry-failed`` will attempt."""
+    report = write_report(cfg)
+
+    assert services.retry_targets(report) == ["Ericsson", "IBM"]
+    assert "Infosys" in list(services.problem_companies(report)["Company"])
+
+
+def test_a_report_worth_no_retry_leaves_nothing_to_launch(cfg):
+    """No report, an empty one, and blocked-only all disable the button alike."""
+    blocked_only = write_report(
+        cfg,
+        companies=[
+            {"company": "Infosys", "status": "blocked", "provider": "unknown",
+             "method": "playwright", "jobs": 0},
+        ],
+    )
+
+    assert services.retry_targets(None) == []
+    assert services.retry_targets({"companies": []}) == []
+    assert services.retry_targets(blocked_only) == []
+
+
+def test_a_merged_retry_identifies_itself_on_the_page(cfg):
+    """A retry merges into the same report, so the only thing distinguishing
+    those figures from a full run's is the block it leaves behind."""
+    report = write_report(cfg, last_retry={
+        "run_id": "20260828T090000Z",
+        "finished_at": "2026-08-28T09:00:00+00:00",
+        "companies": ["Ericsson", "IBM"],
+    })
+
+    record = services.last_retry(report)
+
+    assert record.run_id == "20260828T090000Z"
+    assert record.companies == ["Ericsson", "IBM"]
+    assert services.format_clock(record.finished_at) != "-"
+
+
+def test_a_report_no_retry_has_touched_says_nothing_about_one(cfg):
+    assert services.last_retry(write_report(cfg)) is None
+    assert services.last_retry(None) is None
+    assert services.last_retry({"last_retry": {}}) is None
+
+
+def test_the_retry_list_matches_what_the_scraper_itself_would_pick(cfg):
+    """Same rule, same data: the dashboard never keeps its own retry policy."""
+    write_report(cfg)
+
+    assert services.retry_targets(
+        services.load_last_run(cfg)
+    ) == pipeline.retryable_companies(services.last_run_report_path(cfg))
 
 
 # ---------------------------------------------------------------------------

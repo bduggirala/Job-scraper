@@ -98,6 +98,31 @@ def test_dry_run_passes_the_existing_flag(cfg, monkeypatch):
     assert json.loads(services.run_lock_path(cfg).read_text(encoding="utf-8"))["dry_run"] is True
 
 
+def test_the_retry_button_launches_only_the_troubled_companies(cfg, monkeypatch):
+    """The dashboard adds a flag; it never builds its own company list."""
+    monkeypatch.setattr(services, "pid_alive", lambda pid: True)
+    spawn = RecordingPopen()
+
+    services.start_run(cfg, extra_args=["--retry-failed"], popen=spawn)
+
+    command = spawn.calls[0][0]
+    assert "--retry-failed" in command
+    # Still a dashboard run: no digest, and no --dry-run, which main.py routes
+    # to the routing report rather than to the retry list.
+    assert "--no-email" in command
+    assert "--dry-run" not in command
+    lock = json.loads(services.run_lock_path(cfg).read_text(encoding="utf-8"))
+    assert lock["args"] == ["--no-email", "--retry-failed"]
+
+
+def test_a_retry_is_refused_while_a_full_run_is_alive(cfg, monkeypatch):
+    monkeypatch.setattr(services, "pid_alive", lambda pid: True)
+    services.start_run(cfg, popen=RecordingPopen())
+
+    with pytest.raises(services.RunAlreadyActive):
+        services.start_run(cfg, extra_args=["--retry-failed"], popen=RecordingPopen())
+
+
 def test_a_failed_spawn_releases_the_lock(cfg):
     def explode(command, **kwargs):
         raise OSError("no such executable")

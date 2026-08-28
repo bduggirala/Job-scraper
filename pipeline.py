@@ -19,7 +19,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import pandas as pd
 
@@ -96,6 +96,25 @@ def new_run_id(moment: datetime | None = None) -> str:
     return (moment or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
 
 
+def removal_sync_allowed(
+    result: CompanyResult, previous_counts: dict[str, int] | None = None
+) -> bool:
+    """Is this company's harvest authoritative enough to delete against?
+
+    The four conditions :func:`sync_completed_companies` applies, as one
+    predicate: success AND jobs AND complete AND not collapsed. It was stated
+    twice - once as control flow there, once inline in the run report - and a
+    third caller (the retry merge, which must drop a company's old rows only
+    when this is true) is one copy too many.
+    """
+    return bool(
+        result.success and result.jobs and result.complete
+        and not collapsed_against(
+            (previous_counts or {}).get(result.company), len(result.jobs)
+        )
+    )
+
+
 def write_run_report(
     summary: "RunSummary",
     results: list[CompanyResult],
@@ -103,8 +122,14 @@ def write_run_report(
     run_id: str,
     prefix: str = "",
     previous_counts: dict[str, int] | None = None,
+    merge_into_previous: bool = False,
 ) -> Path:
     """Write ``last_run.json``: what happened to every company, and why.
+
+    ``merge_into_previous`` splices this run's per-company rows into the report
+    already at that path instead of replacing it - what a retry needs, so the
+    file keeps describing the whole workbook while telling the truth about the
+    companies that were just re-run. See :func:`merge_run_reports`.
 
     ``scraper_failures.csv`` covers failures only, so the successes - which
     provider answered, how it was extracted, how long it took, whether it
@@ -145,14 +170,8 @@ def write_run_report(
                 if result.duration_seconds is not None else None
             ),
             # Mirrors sync_completed_companies exactly: success AND jobs AND
-            # complete AND not collapsed. Restating the rule here would let the
-            # two drift, so the collapse check calls the same predicate.
-            "removal_sync_allowed": bool(
-                result.success and result.jobs and result.complete
-                and not collapsed_against(
-                    (previous_counts or {}).get(result.company), len(result.jobs)
-                )
-            ),
+            # complete AND not collapsed - the one predicate, never restated.
+            "removal_sync_allowed": removal_sync_allowed(result, previous_counts),
             "collapsed_vs_previous": collapsed_against(
                 (previous_counts or {}).get(result.company), len(result.jobs)
             ),
@@ -181,14 +200,165 @@ def write_run_report(
     }
 
     path = out_dir / f"{prefix}last_run.json"
+    if merge_into_previous:
+        previous = _read_report(path)
+        if previous:
+            report = merge_run_reports(previous, report)
+        else:
+            log.info("No report at %s to merge into - writing this run's own", path)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, ensure_ascii=False, default=str)
     return path
 
 
+# ---------------------------------------------------------------------------
+# Merging a retry back into the full run's outputs
+#
+# A retry re-runs a handful of companies out of the whole workbook, so on its
+# own it can only ever write a slice. Writing that slice to its own
+# ``retry_*`` files kept the full export honest but left two files to read and
+# reconcile by hand - and the dashboard, the digest and the workbook all point
+# at the unprefixed one. Merging puts the retry's answer where everything
+# already looks, per company, without the retry pretending to know anything
+# about the companies it never visited.
+# ---------------------------------------------------------------------------
+
+def merge_job_rows(
+    previous_jobs: list[dict[str, Any]],
+    fresh_jobs: list[dict[str, Any]],
+    results: list[CompanyResult],
+    previous_counts: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Splice a partial run's job rows into a full run's export, per company.
+
+    The rule per retried company is the database's own, so the export and
+    ``data/jobs.db`` cannot end up disagreeing about the same employer:
+
+    * **Authoritative** (:func:`removal_sync_allowed`) - the scrape succeeded,
+      finished, and did not collapse. Its rows *replace* that company's, which
+      is the only case where a row disappearing is real news rather than a
+      company we failed to read properly.
+    * **Succeeded but not authoritative** - partial again, or a suspicious
+      drop. Its rows are *added* to that company's, keyed on ``job_id``, with
+      the fresh copy winning. This mirrors "upsert, skip the removal sync":
+      what it found is real, what it did not reach is not a closure.
+    * **Failed** - nothing is touched. A company we could not reach this time
+      tells us nothing about the rows it gave us last time.
+
+    Companies the retry never visited are carried through untouched.
+    """
+    fresh_by_company: dict[str, list[dict[str, Any]]] = {}
+    for job in fresh_jobs:
+        fresh_by_company.setdefault(job.get("company"), []).append(job)
+
+    replaced = {
+        result.company for result in results
+        if removal_sync_allowed(result, previous_counts)
+    }
+    # An empty harvest is not evidence every posting closed, so a company that
+    # came back with nothing is "attempted", never "authoritative" - the same
+    # reason sync_completed_companies skips it.
+    attempted = {result.company for result in results}
+
+    merged: list[dict[str, Any]] = []
+    at_id: dict[str, int] = {}
+    for job in previous_jobs:
+        if job.get("company") in replaced:
+            continue
+        if job.get("job_id"):
+            at_id[job["job_id"]] = len(merged)
+        merged.append(job)
+
+    for company in attempted:
+        for job in fresh_by_company.get(company, []):
+            job_id = job.get("job_id")
+            index = at_id.get(job_id) if job_id else None
+            if index is not None:
+                # Same posting, freshly scraped: the new row carries this
+                # run's date, fit score and change status, so it wins.
+                merged[index] = job
+                continue
+            if job_id:
+                at_id[job_id] = len(merged)
+            merged.append(job)
+
+    return merged
+
+
+def merge_run_reports(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Splice a retry's per-company rows into the previous full run's report.
+
+    ``run_id`` and ``generated_at`` stay the *full* run's: they answer "which
+    run produced this picture of the whole workbook, and when did it finish",
+    and a retry of 21 companies did not. The retry identifies itself under
+    ``last_retry`` instead, so the file never claims to be something it is not.
+
+    Counts that describe the whole workbook (``status_counts``,
+    ``companies_attempted``, ``totals.jobs_collected``) are recomputed from the
+    merged rows. Counts that are a *delta* for one run - new, changed, removed,
+    duplicates - are left as the full run wrote them: a retry's deltas are
+    measured against a different baseline and adding them would be arithmetic
+    on two different questions.
+    """
+    fresh_rows = {
+        str(row.get("company")): row for row in (current.get("companies") or [])
+    }
+    rows: list[dict[str, Any]] = [
+        fresh_rows.pop(str(row.get("company")), row)
+        for row in (previous.get("companies") or [])
+    ]
+    # A retried company the previous report never listed (the workbook changed
+    # between runs) is appended rather than dropped on the floor.
+    rows.extend(fresh_rows.values())
+
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        status = row.get("status")
+        if status:
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+    method_counts: dict[str, int] = {}
+    for row in rows:
+        method = row.get("method")
+        if method:
+            method_counts[method] = method_counts.get(method, 0) + 1
+
+    merged = dict(previous)
+    merged["companies"] = rows
+    merged["companies_attempted"] = len(rows)
+    merged["status_counts"] = status_counts
+    merged["method_counts"] = method_counts
+
+    totals = dict(previous.get("totals") or {})
+    totals["jobs_collected"] = sum(int(row.get("jobs") or 0) for row in rows)
+    merged["totals"] = totals
+
+    merged["last_retry"] = {
+        "run_id": current.get("run_id"),
+        "finished_at": current.get("generated_at"),
+        "companies": [str(row.get("company")) for row in (current.get("companies") or [])],
+    }
+    return merged
+
+
 #: Statuses worth a second attempt. ``blocked`` is deliberately absent: the
 #: site issued a challenge or an explicit denial, and asking again is not a fix.
 RETRYABLE_STATUSES = (STATUS_FAILED, STATUS_PARTIAL)
+
+
+def retryable_from_report(report: dict | None) -> list[str]:
+    """The retryable company names inside an already-loaded run report.
+
+    Split out from :func:`retryable_companies` so a caller holding the report
+    - the dashboard, which has read it to draw its tables - asks the same
+    question of the same data instead of keeping a second copy of the rule.
+    """
+    names: list[str] = []
+    for row in (report or {}).get("companies") or []:
+        name = str(row.get("company") or "").strip()
+        if name and row.get("status") in RETRYABLE_STATUSES and name not in names:
+            names.append(name)
+    return names
 
 
 def retryable_companies(report_path: Path) -> list[str]:
@@ -208,12 +378,7 @@ def retryable_companies(report_path: Path) -> list[str]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"{report_path} is not readable JSON: {exc}") from exc
 
-    names: list[str] = []
-    for row in report.get("companies") or []:
-        name = str(row.get("company") or "").strip()
-        if name and row.get("status") in RETRYABLE_STATUSES and name not in names:
-            names.append(name)
-    return names
+    return retryable_from_report(report)
 
 
 #: A harvest this far below the previous run's is treated as a collection
@@ -307,6 +472,25 @@ def slowest_last(plans: list[RoutePlan], costs: dict[str, tuple[bool, float]]) -
     return sorted(plans, key=sort_key)
 
 
+def _read_report(report_path: Path) -> dict[str, Any] | None:
+    """A run report off disk, or ``None`` when there is not a usable one.
+
+    Never raises: every caller here is deciding whether it *has* a baseline,
+    and a missing or half-written report means the same thing to all of them.
+    ``retryable_companies`` is the exception and reads the file itself, because
+    "there is no report" is an answer a person asked for and must be told.
+    """
+    report_path = Path(report_path)
+    if not report_path.exists():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Could not read %s: %s", report_path, exc)
+        return None
+    return report if isinstance(report, dict) else None
+
+
 def previous_job_counts(report_path: Path) -> dict[str, int]:
     """``{company: jobs collected}`` from a previous run's ``last_run.json``.
 
@@ -320,13 +504,8 @@ def previous_job_counts(report_path: Path) -> dict[str, int]:
     to absorb a transient traversal miss, short enough that a real, sustained
     halving is accepted on the next run and the removals go through.
     """
-    report_path = Path(report_path)
-    if not report_path.exists():
-        return {}
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning("Could not read %s for collapse detection: %s", report_path, exc)
+    report = _read_report(report_path)
+    if not report:
         return {}
 
     counts: dict[str, int] = {}
@@ -877,6 +1056,7 @@ def write_outputs(
     raw_jobs: list[dict[str, Any]] | None = None,
     prefix: str = "",
     run_id: str | None = None,
+    carried_failures: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Path]:
     """Write company_jobs.csv / .json and scraper_failures.csv.
 
@@ -885,7 +1065,14 @@ def write_outputs(
     run with its much smaller result set.
 
     ``run_id`` is stamped onto every row so a copy of the spreadsheet still
-    says which run produced it.
+    says which run produced it. Pass ``None`` when the rows already carry the
+    run that produced each of them - a merged export (see
+    :func:`write_merged_outputs`) must not restamp rows it only carried over.
+
+    ``carried_failures`` are failure rows from a previous run to keep
+    alongside this one's. Only a merged export uses it: a retry never visits
+    the blocked companies, and a failures file that quietly dropped them would
+    read as "these are fixed now".
     """
     cfg = settings or load_settings()
     if run_id:
@@ -911,7 +1098,8 @@ def write_outputs(
         json.dump(jobs, handle, indent=2, ensure_ascii=False, default=str)
 
     timestamp = datetime.now(timezone.utc).isoformat()
-    failure_rows = [
+    failure_rows = list(carried_failures or [])
+    failure_rows.extend(
         {
             "company": result.company,
             "url": result.plan.url,
@@ -922,7 +1110,7 @@ def write_outputs(
         }
         for result in results
         if not result.success
-    ]
+    )
     pd.DataFrame(failure_rows, columns=FAILURE_FIELDS).to_csv(
         failures_path, index=False, encoding="utf-8"
     )
@@ -951,6 +1139,85 @@ def write_outputs(
         written["raw"] = raw_path
 
     return written
+
+
+def read_export_rows(path: Path) -> list[dict[str, Any]]:
+    """The job rows of a previous export, or ``[]`` if there is no usable one.
+
+    The JSON export rather than the CSV: it is written from the same list and
+    keeps ``job_id`` and real types, where a CSV round-trip would hand back
+    every field as a string and lose the key the merge is built on.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Could not read %s to merge into: %s", path, exc)
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def read_failure_rows(path: Path) -> list[dict[str, Any]]:
+    """A previous ``scraper_failures.csv`` as row dicts, or ``[]``."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except Exception as exc:  # a truncated or half-written file is not fatal
+        log.warning("Could not read %s to merge into: %s", path, exc)
+        return []
+    return frame.to_dict("records")
+
+
+def write_merged_outputs(
+    jobs: list[dict[str, Any]],
+    results: list[CompanyResult],
+    settings: Settings | None = None,
+    *,
+    raw_jobs: list[dict[str, Any]] | None = None,
+    run_id: str | None = None,
+    previous_counts: dict[str, int] | None = None,
+) -> dict[str, Path]:
+    """Write a partial run's rows *into* the full run's export files.
+
+    Same filenames, same writer, same columns - only the row set differs, and
+    only for the companies this run actually visited. Where there is no
+    previous export to merge into (a first run, a cleared ``output/``) this is
+    exactly :func:`write_outputs`, because an empty base merges to the rows
+    this run produced.
+    """
+    cfg = settings or load_settings()
+    out_dir = cfg.resolve_path("output.directory", "output")
+
+    # Only this run's rows are stamped: a row carried over from the full run
+    # keeps the run_id that actually produced it, which is the whole reason
+    # the column exists.
+    if run_id:
+        for job in jobs:
+            job["run_id"] = run_id
+
+    previous_jobs = read_export_rows(out_dir / cfg.get("output.json", "company_jobs.json"))
+    merged = merge_job_rows(previous_jobs, jobs, results, previous_counts)
+
+    attempted = {result.company for result in results}
+    carried = [
+        row for row in read_failure_rows(
+            out_dir / cfg.get("output.failures", "scraper_failures.csv")
+        )
+        if row.get("company") not in attempted
+    ]
+
+    log.info(
+        "Merging %s row(s) from %s company(ies) into an export of %s -> %s row(s)",
+        len(jobs), len(attempted), len(previous_jobs), len(merged),
+    )
+    return write_outputs(
+        merged, results, cfg,
+        raw_jobs=raw_jobs, prefix="", run_id=None, carried_failures=carried,
+    )
 
 
 def unannounced_matching_jobs(
@@ -1181,6 +1448,18 @@ def verified_repair(result: CompanyResult) -> tuple[str, str, str] | None:
     return (plan.source, plan.raw_url, plan.url)
 
 
+def speaks_for_whole_workbook(output_prefix: str, merge_into_full: bool) -> bool:
+    """May this run act on companies it never visited?
+
+    Only a run that saw every company may send the digest or write a retrieval
+    status back to the workbook - a slice would mark every company it skipped
+    as FALSE, which is a lie rather than a gap. That used to be "the output
+    prefix is empty", which stopped being the same question the moment a
+    merged retry started writing unprefixed files.
+    """
+    return not output_prefix and not merge_into_full
+
+
 def run(
     settings: Settings | None = None,
     *,
@@ -1192,14 +1471,21 @@ def run(
     resolve_pages: bool = True,
     save_raw: bool = False,
     output_prefix: str = "",
+    merge_into_full: bool = False,
     write_back: bool = True,
     notify: bool = True,
 ) -> tuple[RunSummary, list[dict[str, Any]], list[CompanyResult]]:
     """Execute a full scrape and write outputs.
 
+    ``merge_into_full`` writes a partial run's rows into the unprefixed
+    full-run export and report instead of a namespaced copy, per company - see
+    :func:`merge_job_rows`. It is not a full run, so the side effects that only
+    a full run may have (the digest, the workbook write-back) stay off.
+
     Returns ``(summary, final_jobs, company_results)``.
     """
     cfg = settings or load_settings()
+    full_run = speaks_for_whole_workbook(output_prefix, merge_into_full)
     run_id = new_run_id()
     log.info("Run %s starting", run_id)
     companies = load_companies(cfg, excel_path)
@@ -1339,16 +1625,24 @@ def run(
             database, summary, final_jobs, changed_jobs,
         )
 
-    paths = write_outputs(
-        final_jobs, results, cfg,
-        raw_jobs=all_jobs if save_raw else None, prefix=output_prefix,
-        run_id=run_id,
-    )
+    if merge_into_full:
+        paths = write_merged_outputs(
+            final_jobs, results, cfg,
+            raw_jobs=all_jobs if save_raw else None, run_id=run_id,
+            previous_counts=previous_counts,
+        )
+    else:
+        paths = write_outputs(
+            final_jobs, results, cfg,
+            raw_jobs=all_jobs if save_raw else None, prefix=output_prefix,
+            run_id=run_id,
+        )
     # Written after the job files so a reader who sees last_run.json can trust
     # that the spreadsheet it describes is already on disk.
     paths["report"] = write_run_report(
         summary, results, cfg.resolve_path("output.directory", "output"),
         run_id, prefix=output_prefix, previous_counts=previous_counts,
+        merge_into_previous=merge_into_full,
     )
     summary.run_id = run_id
     for label, path in paths.items():
@@ -1357,7 +1651,7 @@ def run(
     # Sent after the outputs exist, so the spreadsheet can be attached. Only on
     # a full run: a --limit or --test-company slice knows nothing about the
     # companies it skipped, so its "new" set is not a real answer.
-    if notify and not output_prefix:
+    if notify and full_run:
         # notifications.email.attach_spreadsheet was defined in settings.yaml
         # and never read - the workbook was attached unconditionally, so
         # turning it off had no effect.
@@ -1379,7 +1673,7 @@ def run(
     }
     summary.discovered_ats_urls = len(discoveries)
 
-    if discoveries and write_back and not output_prefix:
+    if discoveries and write_back and full_run:
         companies_path = resolve_companies_path(cfg, excel_path)
         export_result = write_discovered_urls(companies_path, discoveries)
         summary.ats_urls_written = export_result["updated"]
@@ -1393,7 +1687,7 @@ def run(
         if (repair := verified_repair(result)) is not None
     }
 
-    if repairs and write_back and not output_prefix:
+    if repairs and write_back and full_run:
         companies_path = resolve_companies_path(cfg, excel_path)
         repair_result = write_repaired_urls(companies_path, repairs)
         summary.ats_urls_written += repair_result["updated"]
@@ -1402,7 +1696,7 @@ def run(
     # companies this pipeline can actually reach. Scoped to full runs for the
     # same reason as the ATS write-back: a --limit run would mark every
     # unvisited company FALSE, which would be a lie rather than a gap.
-    if write_back and not output_prefix:
+    if write_back and full_run:
         counts = {
             result.company: (len(result.jobs) if result.success else 0)
             for result in results

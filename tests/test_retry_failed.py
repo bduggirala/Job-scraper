@@ -87,3 +87,78 @@ def test_the_retry_names_every_company_exactly_once(tmp_path):
     retry must still visit it once rather than scraping it twice."""
     path = _report(tmp_path, [("Acme", STATUS_FAILED), ("Acme", STATUS_PARTIAL)])
     assert retryable_companies(path) == ["Acme"]
+
+
+# --- where a retry's rows land ---------------------------------------------
+#
+# A retry is a partial run, but the one partial run that knows exactly which
+# companies it re-ran - so its rows are merged into the full export per company
+# instead of landing in a `retry_*` file nothing else reads. See
+# tests/test_retry_merge.py for the merge rule itself.
+
+def _fake_run(recorder):
+    from pipeline import RunSummary
+
+    def run(settings, **kwargs):
+        recorder.update(kwargs)
+        return RunSummary(), [], []
+
+    return run
+
+
+def _settings(tmp_path):
+    from settings import Settings
+
+    return Settings({"output": {"directory": str(tmp_path)}}, tmp_path / "settings.yaml")
+
+
+def test_a_retry_merges_into_the_full_outputs_rather_than_a_prefixed_copy(
+    tmp_path, monkeypatch, capsys
+):
+    import main
+
+    _report(tmp_path, [("Acme", STATUS_FAILED)])
+    recorded: dict = {}
+    monkeypatch.setattr(main, "run", _fake_run(recorded))
+    args = main.build_parser().parse_args(["--retry-failed", "--no-email"])
+
+    assert main.cmd_scrape(args, _settings(tmp_path)) == 0
+    assert recorded["output_prefix"] == ""
+    assert recorded["merge_into_full"] is True
+    assert recorded["company_names"] == ["Acme"]
+    printed = capsys.readouterr().out
+    assert "(prefixed" not in printed
+    assert "merged into the full outputs" in printed
+
+
+def test_a_limit_run_still_writes_its_own_prefixed_files(tmp_path, monkeypatch):
+    """Only a retry knows which companies it stands for. A --limit slice does
+    not, so it must keep its hands off the full export."""
+    import main
+
+    recorded: dict = {}
+    monkeypatch.setattr(main, "run", _fake_run(recorded))
+    args = main.build_parser().parse_args(["--limit", "5", "--no-email"])
+
+    main.cmd_scrape(args, _settings(tmp_path))
+
+    assert recorded["output_prefix"] == "test_"
+    assert recorded["merge_into_full"] is False
+
+
+def test_a_diagnostic_retry_stays_out_of_the_full_export(tmp_path, monkeypatch):
+    """--test-company narrows the retry to one name, so it no longer stands
+    for the retry list and goes back to being an ordinary test slice."""
+    import main
+
+    _report(tmp_path, [("Acme", STATUS_FAILED)])
+    recorded: dict = {}
+    monkeypatch.setattr(main, "run", _fake_run(recorded))
+    args = main.build_parser().parse_args(
+        ["--retry-failed", "--test-company", "Acme", "--no-email"]
+    )
+
+    main.cmd_scrape(args, _settings(tmp_path))
+
+    assert recorded["output_prefix"] == "test_"
+    assert recorded["merge_into_full"] is False
