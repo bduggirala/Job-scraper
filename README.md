@@ -847,6 +847,18 @@ were lost across 18 companies. Tracking parameters are stripped by
 `normalize.TRACKING_PARAMS` instead, which is narrower and does the job the
 blanket drop was reaching for.
 
+That narrower list has the same failure mode in miniature, so an entry only
+belongs on it once it is known to be redundant *everywhere*. `gh_jid` was on it
+and is not redundant: a Greenhouse board can be configured to point at the
+employer's own careers page, and then the parameter is the entire identity.
+ISNetworld serves all 18 of its postings as
+`isnetworld.com/en/about/careers/jobs?gh_jid=<id>` - stripping it normalized
+every one of them to the same URL and `dedupe_records` reported the board as a
+single job. Tenants whose `absolute_url` already carries the id in its path
+(SoFi, and every board still on `job-boards.greenhouse.io`) were never affected
+and keep their existing ids, because `_PROVIDER_STRATEGIES[GREENHOUSE]` reads
+the path before anything looks at the query.
+
 `job_identity.JOB_ID_SCHEME_VERSION` records the format. When it changes, the
 `jobs` table is cleared on open rather than left holding ids nothing will ever
 match again: such rows are never refreshed and never removed (removal only

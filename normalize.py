@@ -32,9 +32,20 @@ RECORD_FIELDS = (
 )
 
 # Query parameters stripped during URL normalization (tracking / attribution).
+#
+# ``gh_jid`` is deliberately absent, though it looks like it belongs: it is
+# Greenhouse's job id, and on a board that points at the employer's own site it
+# is the *only* thing distinguishing two postings. ISNetworld serves all 18 of
+# its postings as ``isnetworld.com/en/about/careers/jobs?gh_jid=<id>``, so
+# stripping it normalized every one of them to the same URL and
+# :func:`dedupe_records` collapsed the board to a single job. Tenants whose
+# ``absolute_url`` already carries the id in the path (SoFi, and every board
+# left on ``job-boards.greenhouse.io``) are unaffected either way - their
+# identity comes from the path, which is what
+# ``job_identity._PROVIDER_STRATEGIES[GREENHOUSE]`` reads.
 TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
-    "gh_src", "gh_jid", "gclid", "fbclid", "msclkid", "mc_cid", "mc_eid",
+    "gh_src", "gclid", "fbclid", "msclkid", "mc_cid", "mc_eid",
     "src", "source", "ref", "referrer", "referral", "trackingid", "trk",
     "recruiter", "campaign", "cid", "sid", "iis", "iisn", "utm_referrer",
     "applyurl", "from", "jobposition", "cx_source",

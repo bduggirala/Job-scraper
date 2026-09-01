@@ -40,10 +40,14 @@ _WORKDAY_REQ_RE = re.compile(r"_([Rr]\d+(?:-\d+)?)(?:/|$)")
 # ``job`` is Taleo's (``jobdetail.ftl?job=12345``), ``key`` is Infor's
 # (``shorturl.do?key=ZB0``), ``params`` is the opaque blob TEKsystems encodes a
 # whole posting into - all three are the only thing distinguishing one of that
-# platform's postings from another.
+# platform's postings from another. ``gh_jid`` is the same story on a Greenhouse
+# board configured to point at the employer's own careers page: ISNetworld
+# serves every posting at one path and varies only that parameter. It is reached
+# only when the path carries no id of its own, because
+# ``_PROVIDER_STRATEGIES[GREENHOUSE]`` reads the path first.
 _QUERY_ID_KEYS = (
     "jobid", "reqid", "requisitionid", "jobseqno", "opportunityid",
-    "job", "id", "key", "params",
+    "job", "id", "key", "params", "gh_jid",
 )
 
 # A bare trailing numeric or UUID path segment.
