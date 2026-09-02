@@ -41,6 +41,10 @@ companies.xlsx
       │                                                                 │
       │  still nothing                                                  │
       ▼                                                                 │
+  hint? ──▶ remembered JSON endpoint? ─▶ plain HTTP, no browser ────────┤
+      │  ──▶ remembered job-list URL?  ─▶ open it directly (20s) ───────┤
+      │      (either falls through below if it does not pan out)        │
+      ▼                                                                 │
   Playwright ──▶ extract job links                                      │
       ├──▶ nothing? hop to "Search jobs" / "View openings" page         │
       ├──▶ nothing? submit the page's own search box, one query per     │
@@ -100,6 +104,86 @@ the repaired URL is verified by actually returning jobs this run, it replaces
 the *exact* dead value it came from — never a value that isn't the one repair
 just fixed — so later runs start from the live page instead of re-repairing
 the same dead one every time.
+
+### Remembering where the jobs were
+
+The self-healing above solves "which ATS is behind this page". A second
+problem sits next to it: for the companies with **no ATS at all**, every run
+re-derives the same answer to "where on this site is the job list", by hopping
+up to five levels and submitting the site's own search box once per configured
+term — then throws that answer away.
+
+`browser_hints.py` writes it down. Two things are remembered per company, in
+`data/browser_hints.json`:
+
+- **`entry_url`** — the page the winning rows actually came from. The
+  *destination*, never the route. A site that adds a navigation step ahead of
+  its job list does not invalidate a stored destination, because the
+  intermediate steps are never replayed.
+- **`json_endpoint`** — a repeating JSON list call seen in network traffic,
+  kept even when `detect_ats` does not recognise the provider.
+  `_sniff_ats_from_urls` deliberately keeps only *known* providers, so a custom
+  career site's own list API was seen and discarded on every run. A company
+  with one of these leaves the browser tier entirely.
+
+**A hint is a shortcut, never a commitment.** Every path falls through to full
+discovery in the same run when a hint does not pan out, so a stale hint costs
+one short attempt (`hints.attempt_seconds`) and never a company. Deleting
+`data/browser_hints.json` forces full rediscovery and is the supported way to
+start over.
+
+What a failed attempt *means* matters more than that it failed:
+
+| Outcome | Verdict | Why |
+|---------|---------|-----|
+| Loads clean, no rows, and the hint had never served this company | mark `hint_unsupported` | The job list is not reachable by URL at all (POST-only search, or an SPA that keeps search state out of the address bar). Merely discarding it would re-record the same dead URL on the next successful discovery and burn the budget on it every run, forever |
+| Loads clean, no rows, hint had worked before | discard | Genuinely stale; rediscover and replace |
+| Bot challenge (`_looks_blocked`) | keep | A wall says nothing about whether the URL is right |
+| Navigation timeout / crash | keep, count it | The transient class documented under [Reliability](#reliability) |
+| Rows found but under `min_yield_ratio` | keep, count it | Could be a quiet day, not a moved page |
+
+`min_yield_ratio` is strict (0.8) on purpose: **rejecting a hint costs nothing
+but today's behaviour**, since the company simply falls through and is scraped
+as it always was, while accepting a shrunken result silently loses jobs.
+
+`jobs_last_seen` is written *only* by a run that actually collected the
+company, never by a rejection. That asymmetry is what stops a company from
+oscillating between the two paths: one that genuinely shrinks from 400 jobs to
+50 fails its hint once, is rediscovered, records 50, and is stable from then
+on.
+
+Hints expire after `hints.max_age_days`, staggered per company by a hash of
+its name — without the stagger, every hint written on the same first run would
+expire on the same later run and spike it back to a full cold discovery for
+every company at once.
+
+**Measured, cold run against the warm run that followed it** (2026-09-02, 184
+companies, same machine, same day):
+
+| | Cold | Warm |
+|---|---:|---:|
+| Companies served from a hint | 0 | **25** |
+| Their combined scrape time | 771.2s | **377.1s** |
+| Their combined job count | 1,744 | 1,745 |
+| Browser-tier discovery time, all 59 | 28.9 min | **21.2 min** |
+
+**394 seconds (6.6 min) of browser work removed, for +1 job.** Per company the
+wins are large where discovery was the cost — Insight Global 117.9s → 8.3s,
+American Airlines 90.4s → 22.3s, Tyler Technologies 82.3s → 17.5s — and
+roughly neutral where it was not; a handful of companies come out 2-9s slower,
+which is the hint attempt itself on sites that were already cheap to discover.
+
+Two caveats worth knowing:
+
+- **Total run time moves much less than that** (61.2 → 59.4 min of browser-tier
+  wall-clock, 3%). Browser companies vary run to run by more than hints save —
+  the same variance the [Reliability](#reliability) section documents. The
+  per-company comparison above is the honest measure; the aggregate is noise-dominated.
+- **`json_endpoint` is unproven in practice.** Endpoint capture found 3
+  candidates (DXC Technology, FM, Texas Health Resources) and none of them
+  served: two returned non-JSON to a plain HTTP call, one returned JSON with no
+  job-shaped rows in it. The failures cost one GET each and fall through
+  correctly, but no company has yet left the browser tier this way.
 
 ---
 
@@ -174,6 +258,7 @@ python main.py
 | `--retry-failed` | Re-run only the companies `output/last_run.json` recorded as `failed` or `partial`, merging the results back into the full export and report per company. Blocked companies are skipped — a site that issued a challenge is not fixed by asking again. |
 | `--limit N` | Process only the first N companies |
 | `--no-playwright` | Disable browser fallback |
+| `--no-hints` | Ignore remembered job-list URLs and endpoints; rediscover every browser company from its careers page |
 | `--no-resolve` | Skip page resolution and URL repair |
 | `--no-write-back` | Don't write discovered ATS URLs into the workbook |
 | `--no-email` | Don't send the email digest, even on a full run |
@@ -1186,6 +1271,12 @@ one sprawling site cannot burn the per-company timeout:
 
 | Setting | Default | Effect |
 |---------|---------|--------|
+| `hints.enabled` | true | Master switch for the job-list hint cache; false restores pre-hint behaviour exactly |
+| `hints.path` | data/browser_hints.json | Where remembered job lists are stored |
+| `hints.attempt_seconds` | 20 | Budget for one hint attempt before falling through to discovery |
+| `hints.min_yield_ratio` | 0.8 | Rows a hint must return, relative to what the company yielded last run |
+| `hints.max_age_days` | 14 | Force a full rediscovery once a hint reaches this age (staggered per company) |
+| `hints.max_failures` | 2 | Consecutive non-clean failures before a hint is dropped |
 | `playwright.max_hops` | 5 | How many links deep to follow |
 | `playwright.max_hop_visits` | 12 | Total pages rendered per company |
 | `playwright.hop_budget_seconds` | 100 | Wall-clock ceiling for traversal |
@@ -1410,7 +1501,8 @@ returns real jobs through it.
 
 | File | Responsibility |
 |------|----------------|
-| `browser/playwright_scraper.py` | Keyword-search + best-first hop traversal, JSON-LD extraction, cookie dismissal, network sniffing for ATS discovery, stealth, retry with rotated fingerprint |
+| `browser/playwright_scraper.py` | Keyword-search + best-first hop traversal, JSON-LD extraction, cookie dismissal, network sniffing for ATS discovery, stealth, retry with rotated fingerprint. `scrape_entry_url()` is the hint fast path: render a remembered job list and paginate it, with no hopping or searching |
+| `browser_hints.py` | Per-company memory of *where* the browser found a job list (`entry_url`) and *what served it* (`json_endpoint`), plus the rules deciding when a hint is trusted, kept or thrown away |
 
 ### Post-scrape tail (the part you said won't change)
 

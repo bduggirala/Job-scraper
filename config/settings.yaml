@@ -325,6 +325,34 @@ requests:
   # unrelated companies. Set to 0 to disable.
   per_host_rate_per_second: 3.0
 
+# --- Browser hints ---------------------------------------------------------
+# Per-company memory of where the browser found a job list, so the next run can
+# open it directly instead of re-hopping and re-searching to rediscover the
+# same page. Purely an accelerator: every hint falls through to full discovery
+# in the same run when it does not pan out, and deleting the file below
+# restores exactly the behaviour this pipeline had before hints existed.
+hints:
+  enabled: true
+  path: data/browser_hints.json
+  # Budget for one hint attempt. Deliberately small: a hint is a shortcut, not
+  # a commitment, so being wrong has to stay cheap enough that trying is free.
+  attempt_seconds: 20
+  # Rows a hint must return, as a fraction of what the company yielded last
+  # time, before it is trusted. Strict on purpose - rejecting a hint costs
+  # nothing but today's behaviour (the company falls through to full
+  # discovery), while accepting a shrunken result silently loses jobs.
+  min_yield_ratio: 0.8
+  # Force a full rediscovery once a hint reaches this age, so a hint that
+  # still *works* but now points at a stale subset cannot persist forever.
+  # Staggered per company by a hash of its name: without that, every hint
+  # written on the same first run would expire on the same later run and spike
+  # it back to a full cold discovery for every company at once.
+  max_age_days: 14
+  # Consecutive non-clean failures (timeouts, thin results) before a hint is
+  # dropped. A clean failure discards immediately; one bad afternoon on a site
+  # must not throw away good discovery work.
+  max_failures: 2
+
 # --- Concurrency -----------------------------------------------------------
 concurrency:
   http_workers: 10

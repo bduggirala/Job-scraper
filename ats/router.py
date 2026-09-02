@@ -74,6 +74,11 @@ COLLECTORS: dict[str, type[ATSCollector]] = {
 
 METHOD_API = "direct_api"
 METHOD_BROWSER = SCRAPING_METHOD_BROWSER
+#: A remembered job-list URL, opened directly - a browser render, but none of
+#: the hop traversal or search submission that originally found it.
+METHOD_HINT_BROWSER = "browser_hint"
+#: A remembered JSON list endpoint, read over plain HTTP. No browser at all.
+METHOD_HINT_ENDPOINT = "hint_endpoint"
 
 SOURCE_ATS_URL = "ats_url"
 SOURCE_LIVE_PAGE = "live_jobs_page"
@@ -151,6 +156,15 @@ class CompanyResult:
     #: Wall-clock seconds this company took, measured from when it actually
     #: started rather than when it was queued. None when it was never started.
     duration_seconds: float | None = None
+    #: How the rows were *actually* obtained, when that differs from what the
+    #: route plan expected. A remembered hint can serve a company the plan had
+    #: down for a full browser run, and the run report must say which happened
+    #: or a regression in the fast path would be invisible.
+    actual_method: str | None = None
+    #: Where this company's browser time went. Zero for every non-browser path.
+    browser_nav_seconds: float = 0.0
+    browser_discovery_seconds: float = 0.0
+    browser_pagination_seconds: float = 0.0
 
 
 def _good_enough_rows() -> int:
@@ -322,6 +336,20 @@ class BrowserHarvest:
     stop_reason: str | None = None
     #: What the page claimed it had, when a cheap tier read a count off it.
     reported_total: int | None = None
+    #: Which browser path produced these rows: ``playwright`` for a full
+    #: discovery run, ``browser_hint`` for a remembered job-list URL opened
+    #: directly, ``hint_endpoint`` for a remembered JSON API read over plain
+    #: HTTP with no browser at all.
+    method: str = METHOD_BROWSER
+    #: Where the rows came from, and what was learned about how to reach them
+    #: again. Fed back into :mod:`browser_hints` by the caller.
+    entry_url: str | None = None
+    json_endpoint: str | None = None
+    #: Per-phase browser timings, so rediscovery cost can be told apart from
+    #: the cost of actually reading a long list.
+    nav_seconds: float = 0.0
+    discovery_seconds: float = 0.0
+    pagination_seconds: float = 0.0
 
 
 def collect_via_browser(plan: RoutePlan) -> BrowserHarvest:
@@ -350,6 +378,13 @@ def collect_via_browser(plan: RoutePlan) -> BrowserHarvest:
     if not browser_url:
         raise CollectorUnavailable("No URL to open in the browser")
 
+    # A remembered destination is tried first, on its own short budget. It is
+    # a shortcut, never a commitment: anything short of a real result falls
+    # through to the full discovery below, in this same run.
+    hinted = _collect_via_hint(plan)
+    if hinted is not None:
+        return hinted
+
     result = scrape_with_playwright(plan.company, browser_url)
 
     records = []
@@ -370,7 +405,7 @@ def collect_via_browser(plan: RoutePlan) -> BrowserHarvest:
             # only reveals jobs behind a search.
             record["source_query"] = job.get("source_query")
             records.append(record)
-    return BrowserHarvest(
+    harvest = BrowserHarvest(
         records=records,
         discovered_ats_url=result.discovered_ats_url,
         discovered_provider=result.discovered_provider,
@@ -379,6 +414,137 @@ def collect_via_browser(plan: RoutePlan) -> BrowserHarvest:
         # PlaywrightResult predates these fields and must keep working.
         complete=getattr(result, "complete", True),
         stop_reason=getattr(result, "stop_reason", None),
+        entry_url=getattr(result, "entry_url", None),
+        json_endpoint=getattr(result, "json_endpoint", None),
+        nav_seconds=getattr(result, "nav_seconds", 0.0),
+        discovery_seconds=getattr(result, "discovery_seconds", 0.0),
+        pagination_seconds=getattr(result, "pagination_seconds", 0.0),
+    )
+    # Record what this expensive run learned, so the next one can skip it.
+    # Only a run that actually collected the company writes jobs_last_seen -
+    # that is what stops a rejected hint from poisoning the baseline it will
+    # be measured against next time.
+    if records:
+        import browser_hints
+        browser_hints.record_success(
+            plan.company,
+            entry_url=harvest.entry_url,
+            json_endpoint=harvest.json_endpoint,
+            jobs=len(records),
+        )
+    return harvest
+
+
+def _browser_records(plan: RoutePlan, jobs: list[dict], method: str) -> list[dict]:
+    """Normalize raw browser rows into records, whichever path produced them."""
+    records = []
+    for job in jobs:
+        record = build_record(
+            company=plan.company,
+            title=job.get("title"),
+            location=job.get("location"),
+            date_posted=job.get("date_posted"),
+            job_url=job.get("job_url"),
+            employment_type=job.get("employment_type"),
+            description=job.get("description"),
+            ats_provider=plan.provider if plan.provider != UNKNOWN else "unknown",
+            scraping_method=method,
+        )
+        if record:
+            record["source_query"] = job.get("source_query")
+            records.append(record)
+    return records
+
+
+def _collect_via_hint(plan: RoutePlan) -> BrowserHarvest | None:
+    """Try this company's remembered job list. None means "fall through".
+
+    Two shortcuts, cheapest first: a remembered JSON list endpoint read over
+    plain HTTP with no browser at all, then a remembered job-list URL opened
+    directly with no hop traversal and no search submission.
+
+    Every failure path returns None so the caller runs full discovery in the
+    same run. The classification handed to :func:`browser_hints.record_failure`
+    matters more than the failure itself: a bot challenge says nothing about
+    whether the stored URL is right, while a page that loads cleanly and has no
+    list on it is the one outcome that is real evidence against it.
+    """
+    import browser_hints
+
+    hint = browser_hints.get(plan.company)
+    if not hint:
+        return None
+
+    endpoint = hint.get("json_endpoint")
+    if endpoint:
+        try:
+            from ats.framework_data import JsonEndpointCollector
+
+            collected = JsonEndpointCollector(
+                plan.company, {"url": endpoint, "provider": UNKNOWN},
+            ).collect()
+        except Exception as exc:
+            log.debug("%s: hinted endpoint did not serve (%s)", plan.company, exc)
+        else:
+            if len(collected.jobs) >= browser_hints.min_rows(plan.company, hint):
+                browser_hints.note_used()
+                browser_hints.record_success(
+                    plan.company, json_endpoint=endpoint,
+                    jobs=len(collected.jobs), from_hint=True,
+                )
+                log.info("%s: served %s jobs from remembered endpoint (no browser)",
+                         plan.company, len(collected.jobs))
+                return BrowserHarvest(
+                    records=collected.jobs, complete=collected.complete,
+                    stop_reason=collected.stop_reason,
+                    method=METHOD_HINT_ENDPOINT, json_endpoint=endpoint,
+                )
+
+    entry_url = hint.get("entry_url")
+    if not entry_url:
+        return None
+
+    from browser.playwright_scraper import scrape_entry_url
+
+    try:
+        result = scrape_entry_url(plan.company, entry_url)
+    except Exception as exc:
+        # Navigation failure is the transient class the README documents, not
+        # evidence that the destination moved.
+        log.debug("%s: hint attempt failed to navigate (%s)", plan.company, exc)
+        browser_hints.record_failure(plan.company, browser_hints.TRANSIENT)
+        return None
+
+    if result.blocked:
+        browser_hints.record_failure(plan.company, browser_hints.BLOCKED)
+        return None
+
+    records = _browser_records(plan, result.jobs, METHOD_HINT_BROWSER)
+    if not records:
+        browser_hints.record_failure(plan.company, browser_hints.CLEAN_FAILURE)
+        return None
+    if len(records) < browser_hints.min_rows(plan.company, hint):
+        log.info("%s: hint returned %s rows, short of the %s expected; "
+                 "rediscovering", plan.company, len(records),
+                 browser_hints.min_rows(plan.company, hint))
+        browser_hints.record_failure(plan.company, browser_hints.LOW_YIELD)
+        return None
+
+    browser_hints.note_used()
+    browser_hints.record_success(
+        plan.company, entry_url=result.entry_url or entry_url,
+        jobs=len(records), from_hint=True,
+    )
+    log.info("%s: served %s jobs from remembered job list (no discovery)",
+             plan.company, len(records))
+    return BrowserHarvest(
+        records=records,
+        complete=getattr(result, "complete", True),
+        stop_reason=getattr(result, "stop_reason", None),
+        method=METHOD_HINT_BROWSER,
+        entry_url=result.entry_url or entry_url,
+        nav_seconds=getattr(result, "nav_seconds", 0.0),
+        pagination_seconds=getattr(result, "pagination_seconds", 0.0),
     )
 
 
@@ -631,4 +797,8 @@ def fetch_company_jobs(
         # sync must skip it for the same reason.
         complete=harvest.complete, stop_reason=harvest.stop_reason,
         reported_total=harvest.reported_total,
+        actual_method=harvest.method,
+        browser_nav_seconds=harvest.nav_seconds,
+        browser_discovery_seconds=harvest.discovery_seconds,
+        browser_pagination_seconds=harvest.pagination_seconds,
     )

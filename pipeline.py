@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import pandas as pd
 
+import browser_hints
 from ats.base import DESCRIBABLE_STOP_REASONS
 from ats.router import (
     METHOD_API,
@@ -148,7 +149,11 @@ def write_run_report(
     for result in results:
         status = company_status(result)
         status_counts[status] = status_counts.get(status, 0) + 1
-        method = result.plan.method
+        # The plan says how the company was *expected* to be reached; the
+        # result says how it actually was. A remembered hint can serve a
+        # company the plan had down for a full browser run, and reporting
+        # the plan would hide both the win and any regression in it.
+        method = result.actual_method or result.plan.method
         method_counts[method] = method_counts.get(method, 0) + 1
         rows.append({
             "company": result.company,
@@ -178,6 +183,10 @@ def write_run_report(
             "previous_jobs": (previous_counts or {}).get(result.company),
             "discovered_ats_url": result.discovered_ats_url,
             "discovered_provider": result.discovered_provider,
+            "planned_method": result.plan.method,
+            "browser_nav_seconds": round(result.browser_nav_seconds, 2),
+            "browser_discovery_seconds": round(result.browser_discovery_seconds, 2),
+            "browser_pagination_seconds": round(result.browser_pagination_seconds, 2),
         })
 
     report = {
@@ -576,6 +585,11 @@ class RunSummary:
     jobs_removed: int = 0
     discovered_ats_urls: int = 0
     ats_urls_written: int = 0
+    #: Companies served this run from a remembered job list or endpoint,
+    #: and how the hint store changed. See ``browser_hints``.
+    hints_used: int = 0
+    hints_written: int = 0
+    hints_invalidated: int = 0
     hours_old: int = 72
     provider_counts: dict[str, int] = field(default_factory=dict)
     #: Companies whose scrape stopped short of the provider's full job list.
@@ -645,6 +659,12 @@ class RunSummary:
             lines.append(f"ATS discovered via search: {self.discovered_ats_urls:,}")
         if self.ats_urls_written:
             lines.append(f"ATS URLs written to Excel: {self.ats_urls_written:,}")
+        if self.hints_used:
+            lines.append(f"Served from remembered job lists: {self.hints_used:,}")
+        if self.hints_written:
+            lines.append(f"Job-list hints recorded: {self.hints_written:,}")
+        if self.hints_invalidated:
+            lines.append(f"Stale hints discarded: {self.hints_invalidated:,}")
         if self.provider_counts:
             lines.extend(["", "Providers detected:"])
             for provider, count in sorted(
@@ -1488,6 +1508,9 @@ def run(
     full_run = speaks_for_whole_workbook(output_prefix, merge_into_full)
     run_id = new_run_id()
     log.info("Run %s starting", run_id)
+    # Read the hint store up front, on this thread, rather than letting the
+    # browser workers race to be the one that loads it.
+    browser_hints.load()
     companies = load_companies(cfg, excel_path)
 
     if company_filter:
@@ -1639,6 +1662,15 @@ def run(
         )
     # Written after the job files so a reader who sees last_run.json can trust
     # that the spreadsheet it describes is already on disk.
+    # Persist what this run learned about reaching each company again.
+    # Written once, at the end: the browser worker threads accumulate into
+    # the in-memory store under a lock and never touch the filesystem.
+    browser_hints.flush()
+    _hint_stats = browser_hints.stats()
+    summary.hints_used = _hint_stats["used"]
+    summary.hints_written = _hint_stats["written"]
+    summary.hints_invalidated = _hint_stats["invalidated"]
+
     paths["report"] = write_run_report(
         summary, results, cfg.resolve_path("output.directory", "output"),
         run_id, prefix=output_prefix, previous_counts=previous_counts,

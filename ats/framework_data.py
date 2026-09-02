@@ -267,3 +267,76 @@ class FrameworkDataCollector(ATSCollector):
         return CollectionResult(
             jobs=jobs, complete=True, pages_fetched=1, reported_total=total,
         )
+
+
+class JsonEndpointCollector(FrameworkDataCollector):
+    """Collect from a JSON list endpoint remembered by :mod:`browser_hints`.
+
+    Same walker as its parent, different source: the parent digs a hydration
+    payload out of an HTML document, while this one is handed the API URL that
+    document's JavaScript was calling. The browser found that URL by watching
+    network traffic; reading it directly is what lets the company stop needing
+    a browser at all.
+
+    The job-shaped test is doing real work here. A remembered endpoint is only
+    ever a *candidate* - it was recorded because it repeated with varying
+    parameters, not because anyone confirmed it serves jobs - so an endpoint
+    that turns out to return facets, filters or telemetry raises
+    ``CollectorUnavailable`` and the caller falls back to the browser.
+    """
+
+    def collect(self) -> CollectionResult:
+        if not self.url:
+            raise CollectorUnavailable("No endpoint URL for JSON collection")
+
+        try:
+            text = http_client.get_text(
+                self.url, headers={"Accept": "application/json"},
+            )
+        except Exception as exc:
+            raise CollectorUnavailable(
+                f"Hinted endpoint fetch failed for {self.url}: {exc}"
+            ) from exc
+
+        try:
+            payload = json.loads(text)
+        except Exception as exc:
+            raise CollectorUnavailable(
+                f"Hinted endpoint did not return JSON: {exc}"
+            ) from exc
+
+        seen: set[str] = set()
+        records: list[dict | None] = []
+        for node in _walk(payload, [_MAX_NODES]):
+            url = _pick(node, _URL_KEYS)
+            if not isinstance(url, str) or url in seen:
+                continue
+            seen.add(url)
+
+            location = _pick(node, _LOCATION_KEYS)
+            if isinstance(location, dict):
+                location = join_location(
+                    location.get("city"), location.get("state"),
+                    location.get("country"),
+                )
+            elif isinstance(location, list):
+                location = join_location(*[str(x) for x in location[:3]])
+
+            records.append(self.record(
+                title=_pick(node, _TITLE_KEYS),
+                location=location,
+                date_posted=_pick(node, _DATE_KEYS),
+                job_url=url,
+            ))
+
+        jobs = self.finalize([r for r in records if r])
+        if not jobs:
+            raise CollectorUnavailable(
+                f"Hinted endpoint carried no job-shaped rows: {self.url}"
+            )
+        # One page of whatever the endpoint returned. Walking its pagination
+        # would mean reverse-engineering an unknown API; the honest report is
+        # that this is a page, not necessarily the whole list.
+        return CollectionResult(
+            jobs=jobs, complete=True, pages_fetched=1,
+        )

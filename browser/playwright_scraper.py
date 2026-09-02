@@ -313,9 +313,26 @@ class PlaywrightResult:
     complete: bool = True
     #: Why collection stopped, when it stopped short. See ``ats.base``.
     stop_reason: str | None = None
+    #: The page these rows actually came from - the destination, not the route
+    #: that reached it. Recorded so a later run can open it directly instead of
+    #: re-hopping and re-searching to rediscover the same list. See
+    #: ``browser_hints``.
+    entry_url: str | None = None
+    #: A repeating JSON list call seen in network traffic, recorded even when
+    #: its provider is unrecognised. ``_sniff_ats_from_urls`` keeps only known
+    #: providers; this keeps the rest, which is how a custom career site can
+    #: stop needing a browser at all.
+    json_endpoint: str | None = None
+    #: Where this company's browser time went. Reported per company so the
+    #: cost of *finding* the list can be told apart from the cost of reading
+    #: it - the two have completely different fixes.
+    nav_seconds: float = 0.0
+    discovery_seconds: float = 0.0
+    pagination_seconds: float = 0.0
 
 
-def _capped_result(jobs: list[dict[str, Any]], capped: bool) -> PlaywrightResult:
+def _capped_result(jobs: list[dict[str, Any]], capped: bool,
+                   entry_url: str | None = None) -> PlaywrightResult:
     """Wrap rows, recording whether the page cap cut the list short.
 
     ``STOP_BUDGET`` is deliberate rather than a browser-specific reason: this
@@ -329,6 +346,7 @@ def _capped_result(jobs: list[dict[str, Any]], capped: bool) -> PlaywrightResult
         jobs=jobs,
         complete=not capped,
         stop_reason=STOP_BUDGET if capped else None,
+        entry_url=entry_url,
     )
 
 
@@ -827,6 +845,12 @@ def _navigate_to_job_list(
         # is actually present.
         rows = _extract_job_rows(page)
         capped = False
+        # Captured before paginating. Pagination walks the URL forward
+        # (?page=41, &jobOffset=450), and remembering where the walk
+        # *ended* would send the next run straight to the last page of the
+        # list - which returns one page of rows, fails the yield check, and
+        # rediscovers. The useful destination is where the list begins.
+        list_url = page.url
         if rows:
             rows, exhausted = _paginate_and_extract(
                 page, rows, max_pages, timeout_ms,
@@ -838,9 +862,9 @@ def _navigate_to_job_list(
         if len(rows) >= good_enough:
             log.info("%s: found %s jobs at depth %s -> %s",
                      company, len(rows), depth, target[:90])
-            return _capped_result(rows, capped)
+            return _capped_result(rows, capped, list_url)
         if len(rows) > len(best.jobs):
-            best = _capped_result(rows, capped)
+            best = _capped_result(rows, capped, list_url)
 
         # This page may be search-driven: the list renders only after a
         # keyword is submitted. Cheap relative to another navigation.
@@ -1023,6 +1047,52 @@ def _sniff_ats_from_urls(urls: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _sniff_json_endpoint(urls: list[str]) -> str | None:
+    """Pick a repeating JSON *list* call out of captured traffic, if there is one.
+
+    Sibling to :func:`_sniff_ats_from_urls`, which answers a different question:
+    that one asks "is this a provider we have a collector for", and throws away
+    everything else. This one keeps what is left, because a custom career site
+    fetching its own jobs over XHR is exactly the case where a browser is being
+    paid for work plain HTTP could do.
+
+    The bar is *repetition with varying parameters*: a list endpoint gets called
+    again with a different page/offset as the search fallback works through its
+    terms, while one-off calls (config, telemetry, session) do not. Requiring
+    two distinct query strings against the same path is what separates them
+    without needing to understand any site's API.
+
+    Returns the first URL of the best candidate, or None. The caller must still
+    verify it returns real rows before storing it - a URL that merely looks
+    like an API is never recorded.
+    """
+    from collections import defaultdict
+
+    by_path: dict[str, list[str]] = defaultdict(list)
+    for url in urls:
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            continue
+        if not parts.query:
+            continue
+        if not re.search(r"job|requisition|posting|search|career|opening|vacanc",
+                         parts.path, re.I):
+            continue
+        by_path[f"{parts.scheme}://{parts.netloc}{parts.path}"].append(url)
+
+    best: str | None = None
+    best_variants = 0
+    for path, hits in by_path.items():
+        variants = len({urlsplit(u).query for u in hits})
+        if variants >= 2 and variants > best_variants:
+            best, best_variants = hits[0], variants
+    if best:
+        log.debug("Sniffed candidate JSON list endpoint (%s variants): %s",
+                  best_variants, best[:120])
+    return best
+
+
 def _discover_host_based_ats(page) -> PlaywrightResult | None:
     """Recognise an ATS that runs on the company's own domain, by fingerprint.
 
@@ -1094,16 +1164,29 @@ def _search_fallback(
     frame, locator = found
 
     seen_urls: list[str] = []
+    json_calls: list[str] = []
 
     def _record_response(response) -> None:
         # Bounded: a busy page can emit thousands of responses, and only the
         # ATS-shaped ones matter.
         if len(seen_urls) < 400:
             seen_urls.append(response.url)
+        # Separately, keep the JSON ones. _sniff_ats_from_urls below only
+        # accepts a *recognised* provider, so a custom career site's own list
+        # API is seen on every run and discarded on every run. Keeping it is
+        # what lets such a company stop needing a browser at all.
+        if len(json_calls) < 200:
+            try:
+                ctype = (response.headers or {}).get("content-type", "")
+            except Exception:  # pragma: no cover - header access is best effort
+                return
+            if "json" in ctype.lower():
+                json_calls.append(response.url)
 
     merged: dict[str, dict[str, Any]] = {}
     queries_run: list[str] = []
     capped = False
+    searched_url: str | None = None
 
     page.on("response", _record_response)
     try:
@@ -1137,6 +1220,9 @@ def _search_fallback(
                     jobs=list(merged.values()), queries_run=queries_run, blocked=True,
                 )
 
+            # The searched page, before its pagination walks the URL on.
+            if searched_url is None:
+                searched_url = page.url
             rows, exhausted = _paginate_and_extract(
                 page, _extract_job_rows(page),
                 int(cfg.get("playwright.max_pages", 10)), timeout_ms,
@@ -1221,6 +1307,10 @@ def _search_fallback(
         jobs=jobs, discovered_ats_url=discovered_url,
         discovered_provider=discovered_provider, queries_run=queries_run,
         complete=not capped, stop_reason=STOP_BUDGET if capped else None,
+        # The searched page is the destination for these rows: reaching it
+        # again next run is a navigation, not a re-derivation.
+        entry_url=(searched_url or page.url) if jobs else None,
+        json_endpoint=_sniff_json_endpoint(json_calls) if jobs else None,
     )
 
 
@@ -1232,6 +1322,22 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
     page_budget_s = float(cfg.get("playwright.pagination_budget_seconds", 120))
     settle_ms = int(cfg.get("playwright.wait_after_load_ms", 2500))
     search_enabled = bool(cfg.get("playwright.search_fallback.enabled", True))
+
+    started = time.monotonic()
+    phase = {"nav": 0.0, "discovery": 0.0, "pagination": 0.0}
+
+    def _done(result: PlaywrightResult) -> PlaywrightResult:
+        """Stamp phase timings onto whichever result this attempt returns.
+
+        Recorded per company so the cost of *finding* a job list can be told
+        apart from the cost of reading it. Those have different fixes: the
+        first is rediscovery a stored hint removes outright, the second is
+        real work no cache can avoid.
+        """
+        result.nav_seconds = round(phase["nav"], 2)
+        result.discovery_seconds = round(phase["discovery"], 2)
+        result.pagination_seconds = round(phase["pagination"], 2)
+        return result
 
     browser = _get_browser()
     context = None
@@ -1279,20 +1385,21 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         page.wait_for_timeout(settle_ms)
 
         _dismiss_cookie_banner(page)
+        phase["nav"] = time.monotonic() - started
 
         # Stop immediately on a challenge or denial: nothing below can succeed
         # against one, and the retry loop must not treat it as a flaky render.
         if _looks_blocked(page):
             log.warning("%s: %s answered with a challenge or denial",
                         company, urlsplit(page.url).netloc)
-            return PlaywrightResult(blocked=True)
+            return _done(PlaywrightResult(blocked=True))
 
         # A branded-domain ATS (Radancy TalentBrew) is recognised only from the
         # rendered HTML. Detecting it here lets the router self-heal to the real
         # collector instead of scraping an XHR-driven list the DOM cannot show.
         host_based = _discover_host_based_ats(page)
         if host_based is not None:
-            return host_based
+            return _done(host_based)
 
         good_enough = int(cfg.get("playwright.hop_good_enough_rows", 10))
         # Landing pages routinely show a handful of "featured" roles. Taking
@@ -1308,11 +1415,15 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         # clicks left the page with no search input at all.
         jobs = _extract_job_rows(page)
         capped = False
+        # Before pagination: see the note in _navigate_to_job_list.
+        list_url = page.url
         if jobs:
             initial_count = len(jobs)
+            _paginate_started = time.monotonic()
             jobs, exhausted = _paginate_and_extract(
                 page, jobs, max_pages, timeout_ms, page_budget_s,
             )
+            phase["pagination"] += time.monotonic() - _paginate_started
             capped = not exhausted
             if capped:
                 log.warning("%s: pagination stopped at the %s-page/%.0fs cap with "
@@ -1329,19 +1440,22 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
         log.debug("%s: Playwright extracted %s job rows", company, len(jobs))
 
         if len(jobs) >= good_enough:
-            return _capped_result(jobs, capped)
+            return _done(_capped_result(jobs, capped, list_url))
         if len(jobs) > len(best.jobs):
-            best = _capped_result(jobs, capped)
+            best = _capped_result(jobs, capped, list_url)
 
         # Try the search box here first (cheap, no navigation), then hop to a
         # dedicated job-list page.
         landing_url = page.url
+        _discovery_started = time.monotonic()
         if search_enabled:
             result = _search_fallback(company, page, timeout_ms)
+            phase["discovery"] += time.monotonic() - _discovery_started
             if result.discovered_provider:
-                return result
+                return _done(result)
             if len(result.jobs) >= good_enough:
-                return result
+                return _done(result)
+            _discovery_started = time.monotonic()
             if len(result.jobs) > len(best.jobs):
                 best = result
 
@@ -1357,14 +1471,15 @@ def _scrape_once(company: str, url: str, attempt: int) -> PlaywrightResult:
                 log.debug("%s: could not return to %s (%s)", company, landing_url[:80], exc)
 
         hopped = _navigate_to_job_list(company, page, timeout_ms)
+        phase["discovery"] += time.monotonic() - _discovery_started
         if hopped.discovered_provider:
-            return hopped
+            return _done(hopped)
         if len(hopped.jobs) >= good_enough:
-            return hopped
+            return _done(hopped)
         if len(hopped.jobs) > len(best.jobs):
             best = hopped
 
-        return best
+        return _done(best)
 
     finally:
         for closeable in (page, context):
@@ -1450,3 +1565,105 @@ def scrape_with_playwright(company: str, url: str) -> PlaywrightResult:
     if last_empty is not None:
         return last_empty
     raise last_error if last_error else RuntimeError(f"Navigation failed for {url}")
+
+
+def scrape_entry_url(company: str, entry_url: str,
+                     timeout_seconds: float | None = None) -> PlaywrightResult:
+    """Open a remembered job-list URL directly, skipping discovery entirely.
+
+    This is the fast path behind :mod:`browser_hints`. It does exactly what
+    :func:`_scrape_once` does *after* the list has been found - render,
+    extract, paginate - and none of what that function does to find it: no hop
+    traversal, no search-box submission, no ATS sniffing. Those are the steps a
+    stored destination makes unnecessary.
+
+    Deliberately given its own short budget rather than the full per-company
+    one. A hint is a shortcut, never a commitment: when it does not pan out the
+    caller falls through to full discovery *in the same run*, so the wasted
+    time has to stay small enough that being wrong is cheap.
+
+    Returns:
+        A :class:`PlaywrightResult`. Empty ``jobs`` with ``blocked`` unset is a
+        clean failure - the page loaded and simply had no list on it, which is
+        the one outcome that is real evidence the stored URL is wrong.
+
+    Raises:
+        RuntimeError: navigation failed. Transient, and explicitly *not*
+        evidence against the stored URL.
+    """
+    cfg = load_settings()
+    budget_s = float(timeout_seconds if timeout_seconds is not None
+                     else cfg.get("hints.attempt_seconds", 20))
+    timeout_ms = int(min(budget_s * 1000, int(cfg.get("playwright.timeout_ms", 30000))))
+    settle_ms = int(cfg.get("playwright.wait_after_load_ms", 2500))
+    max_pages = int(cfg.get("playwright.max_pages", 5))
+
+    started = time.monotonic()
+    browser = _get_browser()
+    context = None
+    page = None
+    try:
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=cfg.get("playwright.user_agent") or cfg.get("requests.user_agent"),
+            ignore_https_errors=True,
+            java_script_enabled=True,
+            locale="en-US",
+        )
+        context.set_default_timeout(timeout_ms)
+        page = context.new_page()
+
+        def _block(route):
+            if route.request.resource_type in {"image", "media", "font"}:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/*", _block)
+
+        try:
+            page.goto(entry_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        except Exception as exc:
+            raise RuntimeError(f"Hint navigation failed for {entry_url}: {exc}") from exc
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+        except Exception:
+            pass
+        page.wait_for_timeout(min(settle_ms, 2500))
+        _dismiss_cookie_banner(page)
+        nav_seconds = time.monotonic() - started
+
+        if _looks_blocked(page):
+            log.warning("%s: hinted page answered with a challenge", company)
+            result = PlaywrightResult(blocked=True)
+            result.nav_seconds = round(nav_seconds, 2)
+            return result
+
+        jobs = _extract_job_rows(page)
+        capped = False
+        paginate_started = time.monotonic()
+        if jobs:
+            # Whatever budget is left after navigation belongs to pagination.
+            remaining = max(5.0, budget_s - (time.monotonic() - started))
+            jobs, exhausted = _paginate_and_extract(
+                page, jobs, max_pages, timeout_ms, remaining,
+            )
+            capped = not exhausted
+        else:
+            jobs = _extract_jsonld_rows(page)
+
+        result = _capped_result(jobs, capped, page.url)
+        result.nav_seconds = round(nav_seconds, 2)
+        result.pagination_seconds = round(time.monotonic() - paginate_started, 2)
+        log.debug("%s: hint returned %s rows in %.1fs",
+                  company, len(jobs), time.monotonic() - started)
+        return result
+
+    finally:
+        for closeable in (page, context):
+            try:
+                if closeable is not None:
+                    closeable.close()
+            except Exception as exc:  # pragma: no cover - teardown best effort
+                log.debug("%s: hint cleanup failed (%s)", company, exc)

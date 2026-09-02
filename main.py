@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the browser fallback; unresolvable companies are recorded as failures",
     )
     parser.add_argument(
+        "--no-hints", action="store_true",
+        help="Ignore remembered job-list URLs and endpoints; rediscover every "
+             "browser company from its careers page, as runs did before hints",
+    )
+    parser.add_argument(
         "--no-resolve", action="store_true",
         help="Skip page-level ATS resolution; unknown URLs go straight to Playwright",
     )
@@ -252,6 +257,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.no_playwright:
         settings._data.setdefault("playwright", {})["enabled"] = False  # noqa: SLF001
+
+    if args.no_hints:
+        settings._data.setdefault("hints", {})["enabled"] = False  # noqa: SLF001
 
     try:
         if args.dry_run:
