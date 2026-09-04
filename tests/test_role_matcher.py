@@ -123,3 +123,51 @@ def test_readme_documented_cross_segment_example_still_matches(matcher):
     segment even though 'Software Engineer' alone would not - must still
     hold after moving the exclude check to the whole title."""
     assert matcher.matches("Software Engineer, Data Engineering") is True
+
+
+# --- "Vice President" is a bank seniority grade, not a management title -----
+
+@pytest.mark.parametrize("title", [
+    "Senior Data Engineer - Vice President",
+    "Sr. Data Engineer - Assistant Vice President",
+    "Senior Data Engineer - AVP",
+    "Starburst Senior Data Engineer- Vice President",
+    "Data Engineer, VP",
+])
+def test_trailing_vp_grade_is_an_individual_contributor(matcher, title):
+    """At Citi, JPMorgan, Goldman and Morgan Stanley the ladder runs
+    Analyst -> Associate -> AVP -> VP -> SVP -> MD, so a trailing "Vice
+    President" marks a hands-on senior engineer, not a people manager.
+
+    Excluding it anywhere cost 5 real DFW data-engineering roles across three
+    banks, and did it inconsistently: "Senior Data Engineer - AVP" survived
+    because '\bvp\b' finds no word boundary inside "AVP", while the same
+    seniority written out in full was dropped.
+    """
+    assert matcher.matches(title) is True
+
+
+@pytest.mark.parametrize("title", [
+    "Vice President, Data Quality Governance",
+    "VP of Data Engineering",
+    "Senior Vice President, Data Platform",
+    "Vice President- Senior Lead Architect",
+])
+def test_leading_vp_is_still_management_shaped(matcher, title):
+    """A title that opens with the grade is the management case the exclude
+    was written for, and must keep being rejected."""
+    assert matcher.matches(title) is False
+
+
+@pytest.mark.parametrize("title", [
+    "Data Engineering Manager",
+    "Director, Data Engineering",
+    "Head of Data Engineering",
+])
+def test_real_management_titles_are_unaffected(matcher, title):
+    assert matcher.matches(title) is False
+
+
+def test_vp_grade_does_not_rescue_an_otherwise_excluded_role(matcher):
+    """The VP change must not smuggle past a different exclusion."""
+    assert matcher.matches("Data Scientist - Vice President") is False

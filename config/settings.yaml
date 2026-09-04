@@ -158,7 +158,23 @@ exclude_role_patterns:
   # '\b(lead|manager|principal)\b' also rejected "Lead Data Engineer" and
   # "Principal Data Engineer", which are individual-contributor titles at most
   # employers and among the most relevant senior postings there are.
-  - '\b(manager|director|head\s+of|vice\s+president|vp)\b'
+  - '\b(manager|director|head\s+of)\b'
+
+  # "Vice President" only where it *leads* the title. At banks - Citi,
+  # JPMorgan, Goldman Sachs, Morgan Stanley - VP is an individual-contributor
+  # seniority grade (Analyst -> Associate -> AVP -> VP -> SVP -> MD), not a
+  # people-management role, and it is written as a suffix: "Senior Data
+  # Engineer - Vice President" is a hands-on engineer with ten years in.
+  #
+  # Matching it anywhere rejected 5 real DFW data-engineering roles across
+  # Citi, Morgan Stanley and JPMorgan, and did it inconsistently: "Senior Data
+  # Engineer - AVP" passed, because '\bvp\b' finds no word boundary inside
+  # "AVP", while "Sr. Data Engineer - Assistant Vice President" was dropped -
+  # the same seniority written out in full, the opposite outcome.
+  #
+  # A title that *opens* with the grade ("Vice President, Data Quality
+  # Governance") is still management-shaped, and is still excluded.
+  - '^\s*(?:senior\s+|sr\.?\s+|global\s+|regional\s+|executive\s+)?(?:vice\s+president|svp|evp|vp)\b'
   - '\bmanaging\s+consultant\b'
 
 # --- Playwright fallback ---------------------------------------------------

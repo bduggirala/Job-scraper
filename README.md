@@ -1163,6 +1163,35 @@ Everything tunable lives in `config/settings.yaml`: the freshness window
 timeout/retry/backoff, Playwright behaviour (including stealth and the search
 fallback term), and concurrency (`http_workers: 10`, `playwright_workers: 3`).
 
+### "Vice President" is a bank grade, not a management title
+
+`exclude_role_patterns` rejects management by *shape* rather than by seniority
+word — which is why `manager`, `director` and `head of` match anywhere in a
+title while `lead` and `principal` do not (a "Lead Data Engineer" is an
+individual contributor).
+
+Banks need one more distinction. At Citi, JPMorgan, Goldman Sachs and Morgan
+Stanley the ladder runs Analyst → Associate → AVP → **VP** → SVP → MD, so
+"Vice President" written as a *suffix* is a hands-on senior engineer:
+
+| Title | Kept | Why |
+|---|:---:|---|
+| `Senior Data Engineer - Vice President` | ✅ | Grade suffix on an engineering title |
+| `Sr. Data Engineer - Assistant Vice President` | ✅ | Same |
+| `Data Engineer, VP` | ✅ | Same |
+| `Vice President, Data Quality Governance` | ❌ | Opens with the grade — management-shaped |
+| `VP of Data Engineering` | ❌ | Same |
+
+So the VP clause is anchored to the start of the title
+(`^\s*(?:senior\s+|sr\.?\s+|…)?(?:vice\s+president|svp|evp|vp)\b`) rather than
+matching anywhere.
+
+Matching it anywhere cost **5 real DFW data-engineering roles** across Citi,
+Morgan Stanley and JPMorgan — and did it inconsistently: `Senior Data Engineer
+- AVP` survived because `\bvp\b` finds no word boundary inside "AVP", while
+`Sr. Data Engineer - Assistant Vice President` was dropped. Same seniority,
+opposite outcome, decided by whether the title happened to abbreviate.
+
 ### Pagination ceilings
 
 `requests.max_jobs_per_company` (default 10,000) bounds how much any collector
